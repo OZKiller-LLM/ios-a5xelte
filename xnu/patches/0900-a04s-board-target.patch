@@ -58,7 +58,7 @@ index 0000000..61653da
 +
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
-index 9ad7fd6..9b55f65 100644
+index 9ad7fd6..49f0707 100644
 --- a/bsd/dev/a5xelte_emmc.c
 +++ b/bsd/dev/a5xelte_emmc.c
 @@ -7,6 +7,12 @@
@@ -111,7 +111,7 @@ index 9ad7fd6..9b55f65 100644
  #define EMMC_CTRL       0x000u
  #define EMMC_PWREN      0x004u
  #define EMMC_CLKENA     0x010u
-@@ -70,6 +92,18 @@ extern int hz;
+@@ -70,6 +92,19 @@ extern int hz;
                           (1u << 8) | (1u << 7) | (1u << 6) | (1u << 1))
  
  static vm_offset_t emmc_regs;
@@ -121,6 +121,7 @@ index 9ad7fd6..9b55f65 100644
 +static dev_t emmc_bdev;
 +static bool emmc_ready;
 +static uint32_t a04s_writes_refused;
++static uint64_t a04s_reads;
 +#if A04S_EMMC_WRITES
 +static bool emmc_writable;
 +#else
@@ -130,7 +131,7 @@ index 9ad7fd6..9b55f65 100644
  static uint64_t emmc_first_lba, emmc_nsectors;
  static char emmc_partition_name[16] = "SYSTEM";
  static dev_t emmc_bdev;
-@@ -77,9 +111,12 @@ static bool emmc_ready;
+@@ -77,9 +112,12 @@ static bool emmc_ready;
  static bool emmc_writable;
  static uint64_t emmc_log_first_lba, emmc_log_nsectors;
  static bool emmc_log_enabled;
@@ -143,7 +144,7 @@ index 9ad7fd6..9b55f65 100644
  static LCK_GRP_DECLARE(a5xelte_emmc_grp, "a5xelte_emmc");
  static LCK_MTX_DECLARE(a5xelte_emmc_lock, &a5xelte_emmc_grp);
  
-@@ -195,6 +232,7 @@ out:
+@@ -195,6 +233,7 @@ out:
  	return error;
  }
  
@@ -151,7 +152,7 @@ index 9ad7fd6..9b55f65 100644
  static int
  emmc_write_sector(uint32_t lba, const uint8_t *sector)
  {
-@@ -209,6 +247,13 @@ emmc_write_sector(uint32_t lba, const uint8_t *sector)
+@@ -209,6 +248,13 @@ emmc_write_sector(uint32_t lba, const uint8_t *sector)
  	int error = 0;
  
  	uint64_t address = lba;
@@ -165,7 +166,7 @@ index 9ad7fd6..9b55f65 100644
  	bool root_write = emmc_writable && address >= emmc_first_lba &&
  	    address - emmc_first_lba < emmc_nsectors;
  	bool log_write = emmc_log_enabled && address >= emmc_log_first_lba &&
-@@ -216,6 +261,7 @@ emmc_write_sector(uint32_t lba, const uint8_t *sector)
+@@ -216,6 +262,7 @@ emmc_write_sector(uint32_t lba, const uint8_t *sector)
  	if (!root_write && !log_write) {
  		return EROFS;
  	}
@@ -173,7 +174,7 @@ index 9ad7fd6..9b55f65 100644
  	if (width > 2 || ver == 0 || ver == 0xffff ||
  	    !(emmc_rd(EMMC_PWREN) & 1u) || !(emmc_rd(EMMC_CLKENA) & 1u)) {
  		return ENXIO;
-@@ -300,6 +346,7 @@ out:
+@@ -300,6 +347,7 @@ out:
  	emmc_wr(EMMC_INTMASK, ints);
  	return error;
  }
@@ -181,7 +182,7 @@ index 9ad7fd6..9b55f65 100644
  
  static uint32_t
  emmc_le32(const uint8_t *p)
-@@ -326,6 +373,185 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
+@@ -326,6 +374,218 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
  	return crc;
  }
  
@@ -349,12 +350,42 @@ index 9ad7fd6..9b55f65 100644
 +	}
 +}
 +
++/*
++ * No debugger, and the screen is the only output: every 5 s, say that the kernel is alive
++ * and what PID 1 is doing. It only reads counters and saved thread state.
++ */
++extern void sweet_sample_task(const char *name, int pid, task_t task);
++extern uint64_t a04s_svc_count, a04s_user_aborts, a04s_last_abort_addr, a04s_last_abort_pc;
++extern int a04s_last_svc;
++
++static void
++a04s_heartbeat(__unused void *arg, __unused wait_result_t wr)
++{
++	for (unsigned int seconds = 5;; seconds += 5) {
++		IOSleep(5000);
++		kprintf("A04S HB %u S READS %llu REFUSED %u\n", seconds, a04s_reads, a04s_writes_refused);
++		kprintf("SVC %llu LAST %d ABORTS %llu\n", a04s_svc_count, a04s_last_svc, a04s_user_aborts);
++		kprintf("ABORT AT %llx PC %llx\n", a04s_last_abort_addr, a04s_last_abort_pc);
++		proc_t init = proc_find(1);
++		if (init == NULL) {
++			kprintf("NO PID 1\n");
++			continue;
++		}
++		task_t task = proc_task(init);
++		if (task != NULL) {
++			sweet_sample_task("pid1", 1, task);
++		}
++		(void)proc_rele(init);
++	}
++}
++
 +/* Runs straight after the root mount, before any process exists. */
 +void a04s_root_mounted(void);
 +void
 +a04s_root_mounted(void)
 +{
 +	vnode_t root = vfs_rootvnode();
++	thread_t thread;
 +	a04s_mounted = true;
 +	if (root != NULLVP) {
 +		a04s_read_only = vfs_isrdonly(vnode_mount(root)) != 0;
@@ -362,12 +393,15 @@ index 9ad7fd6..9b55f65 100644
 +	}
 +	kprintf("A04S 5C ROOT MOUNTED\n");
 +	a04s_report();
++	if (kernel_thread_start(a04s_heartbeat, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
 +}
 +#else
  static int
  emmc_find_root_partition(void)
  {
-@@ -434,6 +660,7 @@ emmc_find_root_partition(void)
+@@ -434,6 +694,7 @@ emmc_find_root_partition(void)
  	    emmc_writable ? "writable" : "read-only");
  	return 0;
  }
@@ -375,7 +409,7 @@ index 9ad7fd6..9b55f65 100644
  
  static int
  emmc_map_host(void)
-@@ -446,7 +673,7 @@ emmc_map_host(void)
+@@ -446,7 +707,7 @@ emmc_map_host(void)
  	}
  	if (SecureDTLookupEntry(NULL, "/a5xelte-emmc", &node) != kSuccess ||
  	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
@@ -384,7 +418,7 @@ index 9ad7fd6..9b55f65 100644
  		printf("A5XELTE eMMC: missing or unexpected ADT register window\n");
  		return ENXIO;
  	}
-@@ -464,9 +691,19 @@ emmc_map_host(void)
+@@ -464,9 +725,19 @@ emmc_map_host(void)
  void
  a5xelte_emmc_probe(void)
  {
@@ -404,7 +438,7 @@ index 9ad7fd6..9b55f65 100644
  }
  
  static int
-@@ -496,6 +733,9 @@ emmc_strategy(buf_t bp)
+@@ -496,6 +767,9 @@ emmc_strategy(buf_t bp)
  	if (!emmc_ready) {
  		error = ENXIO;
  	} else if (!(buf_flags(bp) & B_READ) && !emmc_writable) {
@@ -414,7 +448,17 @@ index 9ad7fd6..9b55f65 100644
  		error = EROFS;
  	} else if (buf_blkno(bp) < 0) {
  		error = EINVAL;
-@@ -524,6 +764,9 @@ emmc_strategy(buf_t bp)
+@@ -520,10 +794,19 @@ emmc_strategy(buf_t bp)
+ 		uint32_t lba = (uint32_t)(emmc_first_lba + pos / 512u);
+ 		if (buf_flags(bp) & B_READ) {
+ 			error = emmc_read_sector(lba, emmc_bounce);
++#if defined(ARM64_BOARD_CONFIG_A04S)
++			a04s_reads++;
++			if (error) {
++				kprintf("A04S READ ERROR %d LBA %u\n", error, lba);
++			}
++#endif
+ 			if (!error) {
  				memcpy(vaddr + n, emmc_bounce + skip, take);
  			}
  		} else {
@@ -424,7 +468,7 @@ index 9ad7fd6..9b55f65 100644
  			if (skip || take != 512u) {
  				error = emmc_read_sector(lba, emmc_bounce);
  			}
-@@ -531,6 +774,7 @@ emmc_strategy(buf_t bp)
+@@ -531,6 +814,7 @@ emmc_strategy(buf_t bp)
  				memcpy(emmc_bounce + skip, vaddr + n, take);
  				error = emmc_write_sector(lba, emmc_bounce);
  			}
@@ -432,7 +476,7 @@ index 9ad7fd6..9b55f65 100644
  		}
  		if (error) {
  			break;
-@@ -596,6 +840,7 @@ emmc_psize(__unused dev_t dev)
+@@ -596,6 +880,7 @@ emmc_psize(__unused dev_t dev)
  	return emmc_ready ? (int)MIN(emmc_nsectors * 512u / emmc_secsize, INT_MAX) : -1;
  }
  
@@ -440,7 +484,7 @@ index 9ad7fd6..9b55f65 100644
  static int
  emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
  {
-@@ -609,12 +854,15 @@ emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
+@@ -609,12 +894,15 @@ emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
  	    minphys, uio, (int)emmc_secsize) : EROFS;
  }
  
@@ -456,7 +500,7 @@ index 9ad7fd6..9b55f65 100644
  static const struct cdevsw emmc_cdevsw = {
  	.d_open = emmc_open, .d_close = emmc_close, .d_read = emmc_read,
  	.d_write = emmc_write, .d_ioctl = emmc_ioctl, .d_stop = eno_stop,
-@@ -623,6 +871,8 @@ static const struct cdevsw emmc_cdevsw = {
+@@ -623,6 +911,8 @@ static const struct cdevsw emmc_cdevsw = {
  	.d_reserved_2 = eno_putc, .d_type = D_DISK,
  };
  
@@ -465,7 +509,7 @@ index 9ad7fd6..9b55f65 100644
  /* _cnputs may execute in any context. Keep this path free of locks and I/O. */
  void a5xelte_log_append(const char *c, int size);
  void
-@@ -647,6 +897,44 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
+@@ -647,6 +937,44 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
  	*total = os_atomic_load(&emmc_log_total, relaxed);
  }
  
@@ -510,7 +554,7 @@ index 9ad7fd6..9b55f65 100644
  struct a5_log_header {
  	char magic[8];
  	uint32_t version, size;
-@@ -752,4 +1040,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
+@@ -752,4 +1080,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
  	*dev = emmc_bdev;
  	return 0;
  }
@@ -785,6 +829,61 @@ index 6d0b107..2dd9827 100644
  LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY
  ARM64_PLKSEG_ADDR  =0xfffffff004004000
  ARM64_LINK_ADDR    =0xfffffff007004000
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 87fb8a8..9c1dbb2 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -195,6 +195,11 @@ struct proc;
+ 
+ typedef uint32_t arm64_instr_t;
+ 
++#if defined(ARM64_BOARD_CONFIG_A04S)
++uint64_t a04s_svc_count, a04s_user_aborts, a04s_last_abort_addr, a04s_last_abort_pc;
++int a04s_last_svc;
++#endif
++
+ extern void
+ unix_syscall(struct arm_saved_state * regs, thread_t thread_act, struct proc * proc);
+ 
+@@ -1362,6 +1367,11 @@ handle_user_abort(arm_saved_state_t *state, uint32_t esr, vm_offset_t fault_addr
+ 	mach_msg_type_number_t     numcodes = 2;
+ 	thread_t                   thread   = current_thread();
+ 
++#if defined(ARM64_BOARD_CONFIG_A04S)
++	a04s_user_aborts++;
++	a04s_last_abort_addr = fault_addr;
++	a04s_last_abort_pc = get_saved_state_pc(state);
++#endif
+ 	(void)esr;
+ 	(void)expected_fault_handler;
+ 
+@@ -1644,6 +1654,11 @@ handle_svc(arm_saved_state_t *state)
+ 	thread_t thread  = current_thread();
+ 	struct   proc *p;
+ 
++#if defined(ARM64_BOARD_CONFIG_A04S)
++	a04s_svc_count++;
++	a04s_last_svc = trap_no;
++#endif
++
+ #define handle_svc_kprintf(x...) /* kprintf("handle_svc: " x) */
+ 
+ #define TRACE_SYSCALL 1
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 76d70b9..bd43b1e 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1045,6 +1045,10 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 			fp = frame[0];
+ 		}
+ 		printf("%s\n", line);
++#if defined(ARM64_BOARD_CONFIG_A04S)
++		printf("SMP ST %x EV %llx CONT %llx U %u M %u\n", thread->state, (uint64_t)thread->wait_event,
++		    (uint64_t)VM_KERNEL_UNSLIDE((vm_offset_t)thread->continuation), thread->syscalls_unix, thread->syscalls_mach);
++#endif
+ 	}
+ 	task_unlock(task);
+ }
 diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
 index 8f9c8a2..22cef31 100644
 --- a/pexpert/pexpert/arm64/A5XELTE.h
