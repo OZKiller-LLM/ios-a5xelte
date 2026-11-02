@@ -58,7 +58,7 @@ index 0000000..61653da
 +
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
-index 9ad7fd6..49f0707 100644
+index 9ad7fd6..a4bf0ef 100644
 --- a/bsd/dev/a5xelte_emmc.c
 +++ b/bsd/dev/a5xelte_emmc.c
 @@ -7,6 +7,12 @@
@@ -182,7 +182,7 @@ index 9ad7fd6..49f0707 100644
  
  static uint32_t
  emmc_le32(const uint8_t *p)
-@@ -326,6 +374,218 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
+@@ -326,6 +374,231 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
  	return crc;
  }
  
@@ -351,10 +351,10 @@ index 9ad7fd6..49f0707 100644
 +}
 +
 +/*
-+ * No debugger, and the screen is the only output: every 5 s, say that the kernel is alive
-+ * and what PID 1 is doing. It only reads counters and saved thread state.
++ * No debugger, and the screen is the only output. Two threads, so a stuck sample can't
++ * hide that the kernel is alive: this one takes no locks and only reads counters.
 + */
-+extern void sweet_sample_task(const char *name, int pid, task_t task);
++extern void a04s_sample_task(task_t task);
 +extern uint64_t a04s_svc_count, a04s_user_aborts, a04s_last_abort_addr, a04s_last_abort_pc;
 +extern int a04s_last_svc;
 +
@@ -366,14 +366,24 @@ index 9ad7fd6..49f0707 100644
 +		kprintf("A04S HB %u S READS %llu REFUSED %u\n", seconds, a04s_reads, a04s_writes_refused);
 +		kprintf("SVC %llu LAST %d ABORTS %llu\n", a04s_svc_count, a04s_last_svc, a04s_user_aborts);
 +		kprintf("ABORT AT %llx PC %llx\n", a04s_last_abort_addr, a04s_last_abort_pc);
++	}
++}
++
++/* What PID 1's threads are doing. It may block on proc_find, but the heartbeat carries on. */
++static void
++a04s_sampler(__unused void *arg, __unused wait_result_t wr)
++{
++	for (unsigned int sample = 0;; sample++) {
++		IOSleep(7000);
 +		proc_t init = proc_find(1);
 +		if (init == NULL) {
-+			kprintf("NO PID 1\n");
++			kprintf("SAMPLE %u NO PID 1\n", sample);
 +			continue;
 +		}
 +		task_t task = proc_task(init);
++		kprintf("SAMPLE %u\n", sample);
 +		if (task != NULL) {
-+			sweet_sample_task("pid1", 1, task);
++			a04s_sample_task(task);
 +		}
 +		(void)proc_rele(init);
 +	}
@@ -396,12 +406,15 @@ index 9ad7fd6..49f0707 100644
 +	if (kernel_thread_start(a04s_heartbeat, NULL, &thread) == KERN_SUCCESS) {
 +		thread_deallocate(thread);
 +	}
++	if (kernel_thread_start(a04s_sampler, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
 +}
 +#else
  static int
  emmc_find_root_partition(void)
  {
-@@ -434,6 +694,7 @@ emmc_find_root_partition(void)
+@@ -434,6 +707,7 @@ emmc_find_root_partition(void)
  	    emmc_writable ? "writable" : "read-only");
  	return 0;
  }
@@ -409,7 +422,7 @@ index 9ad7fd6..49f0707 100644
  
  static int
  emmc_map_host(void)
-@@ -446,7 +707,7 @@ emmc_map_host(void)
+@@ -446,7 +720,7 @@ emmc_map_host(void)
  	}
  	if (SecureDTLookupEntry(NULL, "/a5xelte-emmc", &node) != kSuccess ||
  	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
@@ -418,7 +431,7 @@ index 9ad7fd6..49f0707 100644
  		printf("A5XELTE eMMC: missing or unexpected ADT register window\n");
  		return ENXIO;
  	}
-@@ -464,9 +725,19 @@ emmc_map_host(void)
+@@ -464,9 +738,19 @@ emmc_map_host(void)
  void
  a5xelte_emmc_probe(void)
  {
@@ -438,7 +451,7 @@ index 9ad7fd6..49f0707 100644
  }
  
  static int
-@@ -496,6 +767,9 @@ emmc_strategy(buf_t bp)
+@@ -496,6 +780,9 @@ emmc_strategy(buf_t bp)
  	if (!emmc_ready) {
  		error = ENXIO;
  	} else if (!(buf_flags(bp) & B_READ) && !emmc_writable) {
@@ -448,7 +461,7 @@ index 9ad7fd6..49f0707 100644
  		error = EROFS;
  	} else if (buf_blkno(bp) < 0) {
  		error = EINVAL;
-@@ -520,10 +794,19 @@ emmc_strategy(buf_t bp)
+@@ -520,10 +807,19 @@ emmc_strategy(buf_t bp)
  		uint32_t lba = (uint32_t)(emmc_first_lba + pos / 512u);
  		if (buf_flags(bp) & B_READ) {
  			error = emmc_read_sector(lba, emmc_bounce);
@@ -468,7 +481,7 @@ index 9ad7fd6..49f0707 100644
  			if (skip || take != 512u) {
  				error = emmc_read_sector(lba, emmc_bounce);
  			}
-@@ -531,6 +814,7 @@ emmc_strategy(buf_t bp)
+@@ -531,6 +827,7 @@ emmc_strategy(buf_t bp)
  				memcpy(emmc_bounce + skip, vaddr + n, take);
  				error = emmc_write_sector(lba, emmc_bounce);
  			}
@@ -476,7 +489,7 @@ index 9ad7fd6..49f0707 100644
  		}
  		if (error) {
  			break;
-@@ -596,6 +880,7 @@ emmc_psize(__unused dev_t dev)
+@@ -596,6 +893,7 @@ emmc_psize(__unused dev_t dev)
  	return emmc_ready ? (int)MIN(emmc_nsectors * 512u / emmc_secsize, INT_MAX) : -1;
  }
  
@@ -484,7 +497,7 @@ index 9ad7fd6..49f0707 100644
  static int
  emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
  {
-@@ -609,12 +894,15 @@ emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
+@@ -609,12 +907,15 @@ emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
  	    minphys, uio, (int)emmc_secsize) : EROFS;
  }
  
@@ -500,7 +513,7 @@ index 9ad7fd6..49f0707 100644
  static const struct cdevsw emmc_cdevsw = {
  	.d_open = emmc_open, .d_close = emmc_close, .d_read = emmc_read,
  	.d_write = emmc_write, .d_ioctl = emmc_ioctl, .d_stop = eno_stop,
-@@ -623,6 +911,8 @@ static const struct cdevsw emmc_cdevsw = {
+@@ -623,6 +924,8 @@ static const struct cdevsw emmc_cdevsw = {
  	.d_reserved_2 = eno_putc, .d_type = D_DISK,
  };
  
@@ -509,7 +522,7 @@ index 9ad7fd6..49f0707 100644
  /* _cnputs may execute in any context. Keep this path free of locks and I/O. */
  void a5xelte_log_append(const char *c, int size);
  void
-@@ -647,6 +937,44 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
+@@ -647,6 +950,44 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
  	*total = os_atomic_load(&emmc_log_total, relaxed);
  }
  
@@ -554,7 +567,7 @@ index 9ad7fd6..49f0707 100644
  struct a5_log_header {
  	char magic[8];
  	uint32_t version, size;
-@@ -752,4 +1080,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
+@@ -752,4 +1093,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
  	*dev = emmc_bdev;
  	return 0;
  }
@@ -870,20 +883,59 @@ index 87fb8a8..9c1dbb2 100644
  
  #define TRACE_SYSCALL 1
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index 76d70b9..bd43b1e 100644
+index 76d70b9..552e163 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -1045,6 +1045,10 @@ sweet_sample_task(const char *name, int pid, task_t task)
- 			fp = frame[0];
- 		}
- 		printf("%s\n", line);
-+#if defined(ARM64_BOARD_CONFIG_A04S)
-+		printf("SMP ST %x EV %llx CONT %llx U %u M %u\n", thread->state, (uint64_t)thread->wait_event,
-+		    (uint64_t)VM_KERNEL_UNSLIDE((vm_offset_t)thread->continuation), thread->syscalls_unix, thread->syscalls_mach);
-+#endif
- 	}
+@@ -1049,6 +1049,49 @@ sweet_sample_task(const char *name, int pid, task_t task)
  	task_unlock(task);
  }
+ 
++#if defined(ARM64_BOARD_CONFIG_A04S)
++void a04s_sample_task(task_t task);
++
++void
++a04s_sample_task(task_t task)
++{
++	thread_t thread;
++
++	if (!task_lock_try(task)) {
++		kprintf("PID1 TASK LOCKED\n");
++		return;
++	}
++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		arm_saved_state_t *ss = find_user_regs(thread);
++
++		kprintf("T ST %x EV %llx U %u M %u\n", thread->state, (uint64_t)thread->wait_event,
++		    thread->syscalls_unix, thread->syscalls_mach);
++		kprintf("CONT %llx\n", (uint64_t)VM_KERNEL_UNSLIDE((vm_offset_t)thread->continuation));
++		if (ss != NULL && is_saved_state64(ss)) {
++			kprintf("UPC %llx\n", (uint64_t)get_saved_state_pc(ss));
++			kprintf("ULR %llx\n", (uint64_t)get_saved_state_lr(ss));
++		}
++		if (thread->kernel_stack != 0) {
++			arm_kernel_saved_state_t *state = (arm_kernel_saved_state_t *)thread->machine.kstackptr;
++			uint64_t low = thread->kernel_stack, high = low + kernel_stack_size;
++			uint64_t fp = state->fp;
++
++			kprintf("K %llx\n", (uint64_t)VM_KERNEL_UNSLIDE((vm_offset_t)state->lr));
++			for (int i = 0; i < 12 && fp >= low && fp + 16 <= high && (fp & 7) == 0; i++) {
++				const uint64_t *frame = (const uint64_t *)fp;
++
++				kprintf("K %llx\n", (uint64_t)VM_KERNEL_UNSLIDE((vm_offset_t)frame[1]));
++				if (frame[0] <= fp) {
++					break;
++				}
++				fp = frame[0];
++			}
++		}
++	}
++	task_unlock(task);
++}
++#endif /* ARM64_BOARD_CONFIG_A04S */
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET || ARM64_BOARD_CONFIG_A5XELTE */
+ 
+ kern_return_t
 diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
 index 8f9c8a2..22cef31 100644
 --- a/pexpert/pexpert/arm64/A5XELTE.h
