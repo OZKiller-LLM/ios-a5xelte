@@ -11,6 +11,290 @@ index 7dee125..cc95042 100644
  SWEET_PTHREAD_ROOT = $(SRCROOT)/bsd/pthread/sweet_libpthread
  SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
  sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
+index 9ad7fd6..10f3ecd 100644
+--- a/bsd/dev/a5xelte_emmc.c
++++ b/bsd/dev/a5xelte_emmc.c
+@@ -7,6 +7,10 @@
+  * first 4 MiB + 512 bytes of the GPT-verified SYSTEM partition.
+  * The host register map and FIFO width rules follow the working downstream
+  * dw_mmc / dw_mmc-exynos driver for the SM-A510F.
++ *
++ * A04S (Exynos 850) builds only the read path: S-Boot leaves this host at 50 MHz
++ * 8-bit DDR with the same register map. Its write protection covers LDFW, CPEFS,
++ * TZSW and TZAR, but not efs, so the card will not stop a bad write there.
+  */
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include <sys/param.h>
+@@ -33,6 +37,12 @@ extern int hz;
+ #define A5_LOG_SIZE   (4u << 20)
+ #define A5_LOG_SECTORS (1u + A5_LOG_SIZE / 512u)
+ 
++#if defined(ARM64_BOARD_CONFIG_A04S)
++#define EMMC_HOST_PA    0x12100000u /* dwmmc0, the eMMC. dwmmc2 is the SD slot. */
++#else
++#define EMMC_HOST_PA    0x13540000u
++#endif
++
+ #define EMMC_CTRL       0x000u
+ #define EMMC_PWREN      0x004u
+ #define EMMC_CLKENA     0x010u
+@@ -70,6 +80,7 @@ extern int hz;
+                          (1u << 8) | (1u << 7) | (1u << 6) | (1u << 1))
+ 
+ static vm_offset_t emmc_regs;
++#if !defined(ARM64_BOARD_CONFIG_A04S)
+ static uint64_t emmc_first_lba, emmc_nsectors;
+ static char emmc_partition_name[16] = "SYSTEM";
+ static dev_t emmc_bdev;
+@@ -77,11 +88,14 @@ static bool emmc_ready;
+ static bool emmc_writable;
+ static uint64_t emmc_log_first_lba, emmc_log_nsectors;
+ static bool emmc_log_enabled;
++#endif
+ static char emmc_log_ring[A5_LOG_SIZE];
+ static uint64_t _Atomic emmc_log_total;
++#if !defined(ARM64_BOARD_CONFIG_A04S)
+ static int emmc_log_chan;
+ static LCK_GRP_DECLARE(a5xelte_emmc_grp, "a5xelte_emmc");
+ static LCK_MTX_DECLARE(a5xelte_emmc_lock, &a5xelte_emmc_grp);
++#endif
+ 
+ static inline uint32_t
+ emmc_rd(uint32_t off)
+@@ -195,6 +209,7 @@ out:
+ 	return error;
+ }
+ 
++#if !defined(ARM64_BOARD_CONFIG_A04S)
+ static int
+ emmc_write_sector(uint32_t lba, const uint8_t *sector)
+ {
+@@ -300,6 +315,7 @@ out:
+ 	emmc_wr(EMMC_INTMASK, ints);
+ 	return error;
+ }
++#endif /* !A04S */
+ 
+ static uint32_t
+ emmc_le32(const uint8_t *p)
+@@ -326,6 +342,147 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
+ 	return crc;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_A04S)
++/*
++ * Stage 5a: prove the read path against answers taken from Android. CMD17 is the only
++ * data command in this build. It reads the two partition tables and the start of
++ * recovery, and stays out of efs, the key partitions and userdata.
++ */
++#define A04S_CRC_SECTORS 32768u /* 16 MiB of recovery, compared with the backup */
++#define A04S_TICKS_PER_S 26000000ull
++
++extern uint64_t mach_absolute_time(void);
++
++static const char *a04s_step = "HOST";
++static int a04s_error = -1;
++static uint32_t a04s_header_crc, a04s_entries_crc, a04s_used, a04s_entries;
++static uint32_t a04s_alternate, a04s_recovery_crc, a04s_kbps;
++
++static int
++a04s_read_test(void)
++{
++	uint8_t sector[512];
++	uint64_t recovery_first = 0, recovery_sectors = 0;
++
++	a04s_step = "GPT HEADER";
++	int error = emmc_read_sector(1, sector);
++	if (error) {
++		return error;
++	}
++	uint32_t header_size = emmc_le32(sector + 12);
++	if (memcmp(sector, "EFI PART", 8) || header_size < 92 || header_size > 512 ||
++	    emmc_le64(sector + 24) != 1) {
++		return ENXIO;
++	}
++	uint32_t stored_crc = emmc_le32(sector + 16);
++	uint64_t alternate = emmc_le64(sector + 32);
++	uint64_t entry_lba = emmc_le64(sector + 72);
++	uint32_t count = emmc_le32(sector + 80);
++	uint32_t entry_size = emmc_le32(sector + 84);
++	uint32_t stored_entries_crc = emmc_le32(sector + 88);
++	memset(sector + 16, 0, 4);
++	a04s_header_crc = emmc_crc32(~0u, sector, header_size) ^ ~0u;
++	if (a04s_header_crc != stored_crc) {
++		return EIO;
++	}
++	if (entry_lba < 2 || entry_lba > 1024 || count == 0 || count > 128 ||
++	    (count & 3u) || entry_size != 128 || alternate < 2 || alternate > UINT32_MAX) {
++		return ENXIO;
++	}
++
++	a04s_step = "GPT ENTRIES";
++	uint32_t crc = ~0u;
++	for (uint32_t s = 0; s < count / 4; s++) {
++		error = emmc_read_sector((uint32_t)entry_lba + s, sector);
++		if (error) {
++			return error;
++		}
++		crc = emmc_crc32(crc, sector, 512);
++		for (uint32_t j = 0; j < 4; j++) {
++			const uint8_t *p = sector + j * 128;
++			char name[16] = { 0 };
++			bool used = false;
++			for (unsigned k = 0; k < 16; k++) {
++				used = used || p[k];
++			}
++			if (!used) {
++				continue;
++			}
++			a04s_used++;
++			for (unsigned k = 0; k < sizeof(name) - 1 && p[56 + k * 2]; k++) {
++				name[k] = (char)p[56 + k * 2];
++			}
++			uint64_t first = emmc_le64(p + 32);
++			uint64_t last = emmc_le64(p + 40);
++			if (first > last) {
++				return EINVAL;
++			}
++			kprintf("P%u %s %llu %llu\n", s * 4 + j + 1, name, first, last - first + 1);
++			if (!strcmp(name, "recovery")) {
++				recovery_first = first;
++				recovery_sectors = last - first + 1;
++			}
++		}
++	}
++	a04s_entries = count;
++	a04s_entries_crc = crc ^ ~0u;
++	if (a04s_entries_crc != stored_entries_crc) {
++		return EIO;
++	}
++
++	/* The last sector on the card, so a pass covers the whole address range. */
++	a04s_step = "GPT BACKUP";
++	error = emmc_read_sector((uint32_t)alternate, sector);
++	if (error) {
++		return error;
++	}
++	if (memcmp(sector, "EFI PART", 8)) {
++		return ENXIO;
++	}
++	a04s_alternate = (uint32_t)alternate;
++
++	a04s_step = "RECOVERY";
++	if (recovery_sectors < A04S_CRC_SECTORS ||
++	    recovery_first + A04S_CRC_SECTORS > alternate) {
++		return ENXIO;
++	}
++	uint64_t ticks = 0;
++	crc = ~0u;
++	for (uint32_t s = 0; s < A04S_CRC_SECTORS; s++) {
++		uint64_t start = mach_absolute_time();
++		error = emmc_read_sector((uint32_t)recovery_first + s, sector);
++		ticks += mach_absolute_time() - start;
++		if (error) {
++			return error;
++		}
++		crc = emmc_crc32(crc, sector, 512);
++		if ((s & 8191u) == 0) {
++			kprintf("RECOVERY %u/%u\n", s, A04S_CRC_SECTORS);
++		}
++	}
++	a04s_recovery_crc = crc ^ ~0u;
++	a04s_kbps = ticks ? (uint32_t)(A04S_CRC_SECTORS / 2 * A04S_TICKS_PER_S / ticks) : 0;
++	a04s_step = "DONE";
++	return 0;
++}
++
++/* Short lines, repeated, so the answer stays readable after the screen console wraps. */
++void a04s_emmc_summary(unsigned int seconds);
++void
++a04s_emmc_summary(unsigned int seconds)
++{
++	kprintf("A04S 5A READ ONLY, %u S\n", seconds);
++	if (a04s_error) {
++		kprintf("STOPPED AT %s ERROR %d\n", a04s_step, a04s_error);
++	} else {
++		kprintf("ALL READS DONE\n");
++	}
++	kprintf("GPT %08X %08X\n", a04s_header_crc, a04s_entries_crc);
++	kprintf("USED %u OF %u\n", a04s_used, a04s_entries);
++	kprintf("BACKUP %u\n", a04s_alternate);
++	kprintf("REC %08X %u KB/S\n", a04s_recovery_crc, a04s_kbps);
++}
++#else
+ static int
+ emmc_find_root_partition(void)
+ {
+@@ -434,6 +591,7 @@ emmc_find_root_partition(void)
+ 	    emmc_writable ? "writable" : "read-only");
+ 	return 0;
+ }
++#endif /* A04S */
+ 
+ static int
+ emmc_map_host(void)
+@@ -446,7 +604,7 @@ emmc_map_host(void)
+ 	}
+ 	if (SecureDTLookupEntry(NULL, "/a5xelte-emmc", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+-	    size < 2 * sizeof(uintptr_t) || reg[0] != 0x13540000u || reg[1] < 0x2000u) {
++	    size < 2 * sizeof(uintptr_t) || reg[0] != EMMC_HOST_PA || reg[1] < 0x2000u) {
+ 		printf("A5XELTE eMMC: missing or unexpected ADT register window\n");
+ 		return ENXIO;
+ 	}
+@@ -464,11 +622,22 @@ emmc_map_host(void)
+ void
+ a5xelte_emmc_probe(void)
+ {
++#if defined(ARM64_BOARD_CONFIG_A04S)
++	a04s_error = emmc_map_host();
++	if (!a04s_error) {
++		kprintf("VER %x HCON %x CTRL %x\n", emmc_rd(EMMC_VERID), emmc_rd(EMMC_HCON), emmc_rd(EMMC_CTRL));
++		kprintf("CLKSEL %x CTYPE %x UHS %x\n", emmc_rd(EMMC_CLKSEL), emmc_rd(0x018u), emmc_rd(0x074u));
++		kprintf("BMOD %x FIFOTH %x\n", emmc_rd(0x080u), emmc_rd(0x04cu));
++		a04s_error = a04s_read_test();
++	}
++#else
+ 	if (!emmc_map_host()) {
+ 		(void)emmc_find_root_partition();
+ 	}
++#endif
+ }
+ 
++#if !defined(ARM64_BOARD_CONFIG_A04S)
+ static int
+ emmc_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
+ {
+@@ -623,6 +792,8 @@ static const struct cdevsw emmc_cdevsw = {
+ 	.d_reserved_2 = eno_putc, .d_type = D_DISK,
+ };
+ 
++#endif /* !A04S */
++
+ /* _cnputs may execute in any context. Keep this path free of locks and I/O. */
+ void a5xelte_log_append(const char *c, int size);
+ void
+@@ -647,6 +818,13 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
+ 	*total = os_atomic_load(&emmc_log_total, relaxed);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_A04S)
++int
++a5xelte_emmc_rootdev(__unused dev_t *dev)
++{
++	return ENXIO; /* No block device yet: stage 5a only reads and reports. */
++}
++#else
+ struct a5_log_header {
+ 	char magic[8];
+ 	uint32_t version, size;
+@@ -752,4 +930,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
+ 	*dev = emmc_bdev;
+ 	return 0;
+ }
++#endif /* A04S */
+ #endif /* ARM64_BOARD_CONFIG_A5XELTE */
 diff --git a/config/MASTER.arm64.a04s b/config/MASTER.arm64.a04s
 new file mode 100644
 index 0000000..e3b8eb3
@@ -155,21 +439,26 @@ index d1099ff..a1349e4 100644
      "   {"
      "     'IOClass'         = SweetBattery;"
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
-index 10449ab..e030224 100644
+index 10449ab..38a02f4 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -771,6 +771,16 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+@@ -771,6 +771,21 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  		}
  	}
  
 +#if defined(ARM64_BOARD_CONFIG_A04S)
 +	/*
-+	 * Stage 4 ends here on purpose. No driver, storage or root code exists for
-+	 * this phone yet. The rising count shows the timer and GIC interrupts work.
++	 * Stage 5a ends here on purpose: read the eMMC, report, stop. This build has no
++	 * eMMC write code, and no other driver or root code runs on this phone yet.
++	 * The rising count shows the timer and GIC interrupts still work after the reads.
 +	 */
++	{
++	extern void a04s_emmc_summary(unsigned int seconds);
++	a5xelte_emmc_probe();
 +	for (volatile unsigned int a04s_seconds = 0;; a04s_seconds += 5) {
-+		kprintf("A04S STAGE 4 OK: ROOT SEARCH REACHED, NO STORAGE USED, %u S\n", a04s_seconds);
++		a04s_emmc_summary(a04s_seconds);
 +		IOSleep(5000);
++	}
 +	}
 +#endif
  #if defined(ARM64_BOARD_CONFIG_A5XELTE)

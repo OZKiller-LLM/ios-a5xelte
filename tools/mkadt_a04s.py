@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Build the stage 4 ADT for the Galaxy A04s (SM-A047F, Exynos 850).
+"""Build the stage 5a ADT for the Galaxy A04s (SM-A047F, Exynos 850).
 
-Entry only: CPUs, memory, the GIC and the screen S-Boot leaves running. It has no
-storage, display service, GPU, touch or sensor nodes, so nothing can bind to them.
-Values come from this phone's live device tree and the boot probe.
+CPUs, memory, the GIC, the screen S-Boot leaves running and the eMMC host's registers,
+which the kernel uses read-only. It has no display service, GPU, touch or sensor nodes,
+so nothing can bind to them. Values come from this phone's live device tree and the
+boot probe.
 """
 import argparse
 import os
@@ -17,6 +18,7 @@ DRAM_BASE, DRAM_SIZE = 0x92000000, 0x20000000
 GICD, GICD_SIZE = 0x12a01000, 0x1000
 GICC, GICC_SIZE = 0x12a02000, 0x2000
 FB, FB_W, FB_H = 0xfa000000, 720, 1600
+EMMC, EMMC_SIZE = 0x12100000, 0x2000
 TIMEBASE = 26000000
 CPU_HZ = 2000000000
 
@@ -49,8 +51,8 @@ def build(seed=None):
     chosen = child(root, 'chosen')
     set_prop(chosen, 'dram-base', mkadt.u64(DRAM_BASE))
     set_prop(chosen, 'dram-size', mkadt.u64(DRAM_SIZE))
-    set_prop(chosen, 'firmware-version', mkadt.cstr('a04s-stage4'))
-    set_prop(chosen, 'system-firmware-version', mkadt.cstr('a04s-stage4'))
+    set_prop(chosen, 'firmware-version', mkadt.cstr('a04s-stage5a'))
+    set_prop(chosen, 'system-firmware-version', mkadt.cstr('a04s-stage5a'))
 
     # Two clusters of four: MPIDR 0..3 and 0x100..0x103. cpus=1 selects only the first.
     cpus = child(root, 'cpus')
@@ -104,6 +106,10 @@ def build(seed=None):
         ('width', mkadt.u32(FB_W)),
         ('height', mkadt.u32(FB_H)),
         ('stride', mkadt.u32(FB_W * 4)),
+    ]))
+    # The shared eMMC driver looks this node up by name, and checks the address.
+    root.children.append(mkadt.node('a5xelte-emmc', [
+        ('reg', mkadt.u64(EMMC, EMMC_SIZE)),
     ]))
     return root
 
