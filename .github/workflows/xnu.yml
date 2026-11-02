@@ -50,29 +50,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The volume the A04S kernel mounts for stage 5b. It runs first, so a failure here
-      # shows up in seconds. It holds a known test pattern and no Apple files.
-      - name: Build the A04S test volume
-        if: env.MACHINE_CONFIG == 'A04S'
-        run: |
-          set -euo pipefail
-          hdiutil create -size 10m -fs "Case-sensitive Journaled HFS+" \
-            -volname A04STEST -layout NONE -type UDIF -o a04stest
-          dev=$(hdiutil attach -nobrowse -owners on a04stest.dmg | awk '/A04STEST/ {print $1}')
-          vol=/Volumes/A04STEST
-          sudo mkdir -p "$vol/a04s"
-          python3 -c 'import sys; sys.stdout.buffer.write(bytes((i * 31 + (i >> 8)) & 255 for i in range(1 << 20)))' \
-            | sudo tee "$vol/a04s/known.bin" >/dev/null
-          ls -la "$vol/a04s"
-          hdiutil detach "$dev"
-          hdiutil convert a04stest.dmg -format UDTO -o a04stest
-          mkdir -p out
-          mv a04stest.cdr out/a04stest.img
-          # Raw HFSX: volume header signature "HX" at byte 1024.
-          test "$(dd if=out/a04stest.img bs=1 skip=1024 count=2 2>/dev/null)" = "HX"
-          test "$(stat -f%z out/a04stest.img)" = 10485760
-          shasum -a 256 out/a04stest.img
-
       - name: Fetch build script
         run: |
           git init -q dxb
@@ -124,6 +101,13 @@ jobs:
         run: |
           set -o pipefail
           bash build.sh 2>&1 | tee ../build.log
+
+      # The kernel's own guard header, against this phone's whole partition table.
+      - name: Test the A04S eMMC write guard
+        if: env.MACHINE_CONFIG == 'A04S'
+        run: |
+          clang -Wall -Wextra -Werror -Idxb/xnu/bsd/dev -o a04s-guard-test tools/a04s-guard-test.c
+          ./a04s-guard-test
 
       # Logs need a GitHub sign-in to read; check-run annotations are public.
       # Publish the first errors and the log tail so failures can be read
@@ -199,7 +183,7 @@ jobs:
           mkdir -p out
           cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
           ls -la out
-          (cd out && shasum -a 256 kernel.* a04stest.img > SHA256SUMS) || true
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
       - uses: actions/upload-artifact@v4
         if: always()

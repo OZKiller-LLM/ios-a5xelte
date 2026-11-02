@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the stage 5b ADT for the Galaxy A04s (SM-A047F, Exynos 850).
+"""Build the stage 5c ADT for the Galaxy A04s (SM-A047F, Exynos 850).
 
 CPUs, memory, the GIC, the screen S-Boot leaves running and the eMMC host's registers,
 which the kernel uses read-only. It has no display service, GPU, touch or sensor nodes,
@@ -14,7 +14,8 @@ import adt
 import mkadt
 
 SOC_BASE = 0x10000000
-DRAM_BASE, DRAM_SIZE = 0x92000000, 0x20000000
+# 672 MiB, the most of the first free RAM window at 32 MiB alignment. It ends below secure firmware.
+DRAM_BASE, DRAM_SIZE = 0x92000000, 0x2A000000
 GICD, GICD_SIZE = 0x12a01000, 0x1000
 GICC, GICC_SIZE = 0x12a02000, 0x2000
 FB, FB_W, FB_H = 0xfa000000, 720, 1600
@@ -51,8 +52,8 @@ def build(seed=None):
     chosen = child(root, 'chosen')
     set_prop(chosen, 'dram-base', mkadt.u64(DRAM_BASE))
     set_prop(chosen, 'dram-size', mkadt.u64(DRAM_SIZE))
-    set_prop(chosen, 'firmware-version', mkadt.cstr('a04s-stage5b'))
-    set_prop(chosen, 'system-firmware-version', mkadt.cstr('a04s-stage5b'))
+    set_prop(chosen, 'firmware-version', mkadt.cstr('a04s-stage5c'))
+    set_prop(chosen, 'system-firmware-version', mkadt.cstr('a04s-stage5c'))
 
     # Two clusters of four: MPIDR 0..3 and 0x100..0x103. cpus=1 selects only the first.
     cpus = child(root, 'cpus')
