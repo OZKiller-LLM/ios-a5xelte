@@ -12,10 +12,10 @@ index 7dee125..cc95042 100644
  SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
  sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
 diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
-index 9ad7fd6..10f3ecd 100644
+index 9ad7fd6..1b270ed 100644
 --- a/bsd/dev/a5xelte_emmc.c
 +++ b/bsd/dev/a5xelte_emmc.c
-@@ -7,6 +7,10 @@
+@@ -7,6 +7,11 @@
   * first 4 MiB + 512 bytes of the GPT-verified SYSTEM partition.
   * The host register map and FIFO width rules follow the working downstream
   * dw_mmc / dw_mmc-exynos driver for the SM-A510F.
@@ -23,15 +23,35 @@ index 9ad7fd6..10f3ecd 100644
 + * A04S (Exynos 850) builds only the read path: S-Boot leaves this host at 50 MHz
 + * 8-bit DDR with the same register map. Its write protection covers LDFW, CPEFS,
 + * TZSW and TZAR, but not efs, so the card will not stop a bad write there.
++ * Its block device covers only a test volume inside the boot partition.
   */
  #if defined(ARM64_BOARD_CONFIG_A5XELTE)
  #include <sys/param.h>
-@@ -33,6 +37,12 @@ extern int hz;
+@@ -17,6 +22,11 @@
+ #include <sys/errno.h>
+ #include <sys/proc.h>
+ #include <sys/uio.h>
++#if defined(ARM64_BOARD_CONFIG_A04S)
++#include <sys/fcntl.h>
++#include <sys/mount.h>
++#include <sys/vnode.h>
++#endif
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+ #include <kern/sched_prim.h>
+@@ -33,6 +43,19 @@ extern int hz;
  #define A5_LOG_SIZE   (4u << 20)
  #define A5_LOG_SECTORS (1u + A5_LOG_SIZE / 512u)
  
 +#if defined(ARM64_BOARD_CONFIG_A04S)
 +#define EMMC_HOST_PA    0x12100000u /* dwmmc0, the eMMC. dwmmc2 is the SD slot. */
++#define A04S_BOOT_FIRST     282624u
++#define A04S_BOOT_SECTORS   90112u
++/* 10 MiB, 20 MiB into the kernel slot, which follows the 4-sector boot header. */
++#define A04S_VOLUME_FIRST   (A04S_BOOT_FIRST + 4u + 40960u)
++#define A04S_VOLUME_SECTORS 20480u
++_Static_assert(A04S_VOLUME_FIRST + A04S_VOLUME_SECTORS <= A04S_BOOT_FIRST + A04S_BOOT_SECTORS,
++    "the test volume must stay inside the boot partition");
 +#else
 +#define EMMC_HOST_PA    0x13540000u
 +#endif
@@ -39,15 +59,21 @@ index 9ad7fd6..10f3ecd 100644
  #define EMMC_CTRL       0x000u
  #define EMMC_PWREN      0x004u
  #define EMMC_CLKENA     0x010u
-@@ -70,6 +80,7 @@ extern int hz;
+@@ -70,6 +93,13 @@ extern int hz;
                           (1u << 8) | (1u << 7) | (1u << 6) | (1u << 1))
  
  static vm_offset_t emmc_regs;
-+#if !defined(ARM64_BOARD_CONFIG_A04S)
++#if defined(ARM64_BOARD_CONFIG_A04S)
++/* Constants: the block device can reach this window of the boot partition and nothing else. */
++static const uint64_t emmc_first_lba = A04S_VOLUME_FIRST, emmc_nsectors = A04S_VOLUME_SECTORS;
++static dev_t emmc_bdev;
++static bool emmc_ready;
++#define emmc_writable false
++#else
  static uint64_t emmc_first_lba, emmc_nsectors;
  static char emmc_partition_name[16] = "SYSTEM";
  static dev_t emmc_bdev;
-@@ -77,11 +88,14 @@ static bool emmc_ready;
+@@ -77,9 +107,12 @@ static bool emmc_ready;
  static bool emmc_writable;
  static uint64_t emmc_log_first_lba, emmc_log_nsectors;
  static bool emmc_log_enabled;
@@ -56,13 +82,11 @@ index 9ad7fd6..10f3ecd 100644
  static uint64_t _Atomic emmc_log_total;
 +#if !defined(ARM64_BOARD_CONFIG_A04S)
  static int emmc_log_chan;
++#endif
  static LCK_GRP_DECLARE(a5xelte_emmc_grp, "a5xelte_emmc");
  static LCK_MTX_DECLARE(a5xelte_emmc_lock, &a5xelte_emmc_grp);
-+#endif
  
- static inline uint32_t
- emmc_rd(uint32_t off)
-@@ -195,6 +209,7 @@ out:
+@@ -195,6 +228,7 @@ out:
  	return error;
  }
  
@@ -70,7 +94,7 @@ index 9ad7fd6..10f3ecd 100644
  static int
  emmc_write_sector(uint32_t lba, const uint8_t *sector)
  {
-@@ -300,6 +315,7 @@ out:
+@@ -300,6 +334,7 @@ out:
  	emmc_wr(EMMC_INTMASK, ints);
  	return error;
  }
@@ -78,31 +102,38 @@ index 9ad7fd6..10f3ecd 100644
  
  static uint32_t
  emmc_le32(const uint8_t *p)
-@@ -326,6 +342,147 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
+@@ -326,6 +361,209 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
  	return crc;
  }
  
 +#if defined(ARM64_BOARD_CONFIG_A04S)
 +/*
-+ * Stage 5a: prove the read path against answers taken from Android. CMD17 is the only
-+ * data command in this build. It reads the two partition tables and the start of
-+ * recovery, and stays out of efs, the key partitions and userdata.
++ * Stage 5b: prove the read path against answers taken from Android, then mount a test
++ * volume. CMD17 is the only data command in this build. It reads the two partition
++ * tables, the start of recovery and the volume, and stays out of efs, the key partitions
++ * and userdata.
 + */
 +#define A04S_CRC_SECTORS 32768u /* 16 MiB of recovery, compared with the backup */
 +#define A04S_TICKS_PER_S 26000000ull
++#define A04S_TEST_PATH   "/a04s/known.bin"
 +
 +extern uint64_t mach_absolute_time(void);
++extern void IOSleep(unsigned int milliseconds);
 +
 +static const char *a04s_step = "HOST";
 +static int a04s_error = -1;
 +static uint32_t a04s_header_crc, a04s_entries_crc, a04s_used, a04s_entries;
 +static uint32_t a04s_alternate, a04s_recovery_crc, a04s_kbps;
++static uint32_t a04s_file_bytes, a04s_file_crc, a04s_writes_refused;
++static bool a04s_mounted, a04s_read_only;
++static uint8_t a04s_file_buffer[65536];
 +
 +static int
 +a04s_read_test(void)
 +{
 +	uint8_t sector[512];
 +	uint64_t recovery_first = 0, recovery_sectors = 0;
++	bool boot_as_expected = false;
 +
 +	a04s_step = "GPT HEADER";
 +	int error = emmc_read_sector(1, sector);
@@ -162,12 +193,20 @@ index 9ad7fd6..10f3ecd 100644
 +				recovery_first = first;
 +				recovery_sectors = last - first + 1;
 +			}
++			if (!strcmp(name, "boot")) {
++				boot_as_expected = first == A04S_BOOT_FIRST &&
++				    last - first + 1 == A04S_BOOT_SECTORS;
++			}
 +		}
 +	}
 +	a04s_entries = count;
 +	a04s_entries_crc = crc ^ ~0u;
 +	if (a04s_entries_crc != stored_entries_crc) {
 +		return EIO;
++	}
++	/* The test volume's address assumes this layout, so it has to hold. */
++	if (!boot_as_expected) {
++		return ENXIO;
 +	}
 +
 +	/* The last sector on the card, so a pass covers the whole address range. */
@@ -206,27 +245,74 @@ index 9ad7fd6..10f3ecd 100644
 +	return 0;
 +}
 +
-+/* Short lines, repeated, so the answer stays readable after the screen console wraps. */
-+void a04s_emmc_summary(unsigned int seconds);
++/* Report and never return. Short lines, repeated, stay readable after the console wraps. */
++void a04s_stop(int error);
 +void
-+a04s_emmc_summary(unsigned int seconds)
++a04s_stop(int error)
 +{
-+	kprintf("A04S 5A READ ONLY, %u S\n", seconds);
-+	if (a04s_error) {
-+		kprintf("STOPPED AT %s ERROR %d\n", a04s_step, a04s_error);
-+	} else {
-+		kprintf("ALL READS DONE\n");
++	a04s_error = error;
++	for (volatile unsigned int seconds = 0;; seconds += 5) {
++		kprintf("A04S 5B READ ONLY, %u S\n", seconds);
++		if (a04s_error) {
++			kprintf("STOPPED AT %s ERROR %d\n", a04s_step, a04s_error);
++		} else {
++			kprintf("ALL READS DONE\n");
++		}
++		kprintf("MOUNTED %s\n", !a04s_mounted ? "NO" : a04s_read_only ? "READ ONLY" : "WRITABLE");
++		kprintf("FILE %u %08X\n", a04s_file_bytes, a04s_file_crc);
++		kprintf("WRITES REFUSED %u\n", a04s_writes_refused);
++		kprintf("GPT %08X %08X\n", a04s_header_crc, a04s_entries_crc);
++		kprintf("USED %u OF %u\n", a04s_used, a04s_entries);
++		kprintf("BACKUP %u\n", a04s_alternate);
++		kprintf("REC %08X %u KB/S\n", a04s_recovery_crc, a04s_kbps);
++		IOSleep(5000);
 +	}
-+	kprintf("GPT %08X %08X\n", a04s_header_crc, a04s_entries_crc);
-+	kprintf("USED %u OF %u\n", a04s_used, a04s_entries);
-+	kprintf("BACKUP %u\n", a04s_alternate);
-+	kprintf("REC %08X %u KB/S\n", a04s_recovery_crc, a04s_kbps);
++}
++
++/* Runs straight after the root mount, before any process exists, and never returns. */
++void a04s_root_test(void);
++void
++a04s_root_test(void)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	uint32_t crc = ~0u;
++	off_t offset = 0;
++
++	vnode_t root = vfs_rootvnode();
++	a04s_mounted = true;
++	if (root != NULLVP) {
++		a04s_read_only = vfs_isrdonly(vnode_mount(root)) != 0;
++		(void)vnode_put(root);
++	}
++	a04s_step = "TEST FILE";
++	int error = vnode_open(A04S_TEST_PATH, FREAD, 0, 0, &vp, ctx);
++	if (!error) {
++		for (;;) {
++			int resid = 0;
++			error = vn_rdwr(UIO_READ, vp, (caddr_t)a04s_file_buffer, (int)sizeof(a04s_file_buffer),
++			    offset, UIO_SYSSPACE, IO_NODELOCKED, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++			int got = (int)sizeof(a04s_file_buffer) - resid;
++			if (error || got <= 0) {
++				break;
++			}
++			crc = emmc_crc32(crc, a04s_file_buffer, (size_t)got);
++			offset += got;
++		}
++		(void)vnode_close(vp, FREAD, ctx);
++	}
++	a04s_file_bytes = (uint32_t)offset;
++	a04s_file_crc = crc ^ ~0u;
++	if (!error) {
++		a04s_step = "DONE";
++	}
++	a04s_stop(error);
 +}
 +#else
  static int
  emmc_find_root_partition(void)
  {
-@@ -434,6 +591,7 @@ emmc_find_root_partition(void)
+@@ -434,6 +672,7 @@ emmc_find_root_partition(void)
  	    emmc_writable ? "writable" : "read-only");
  	return 0;
  }
@@ -234,7 +320,7 @@ index 9ad7fd6..10f3ecd 100644
  
  static int
  emmc_map_host(void)
-@@ -446,7 +604,7 @@ emmc_map_host(void)
+@@ -446,7 +685,7 @@ emmc_map_host(void)
  	}
  	if (SecureDTLookupEntry(NULL, "/a5xelte-emmc", &node) != kSuccess ||
  	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
@@ -243,7 +329,7 @@ index 9ad7fd6..10f3ecd 100644
  		printf("A5XELTE eMMC: missing or unexpected ADT register window\n");
  		return ENXIO;
  	}
-@@ -464,11 +622,22 @@ emmc_map_host(void)
+@@ -464,9 +703,19 @@ emmc_map_host(void)
  void
  a5xelte_emmc_probe(void)
  {
@@ -262,11 +348,60 @@ index 9ad7fd6..10f3ecd 100644
 +#endif
  }
  
+ static int
+@@ -496,6 +745,9 @@ emmc_strategy(buf_t bp)
+ 	if (!emmc_ready) {
+ 		error = ENXIO;
+ 	} else if (!(buf_flags(bp) & B_READ) && !emmc_writable) {
++#if defined(ARM64_BOARD_CONFIG_A04S)
++		a04s_writes_refused++;
++#endif
+ 		error = EROFS;
+ 	} else if (buf_blkno(bp) < 0) {
+ 		error = EINVAL;
+@@ -524,6 +776,9 @@ emmc_strategy(buf_t bp)
+ 				memcpy(vaddr + n, emmc_bounce + skip, take);
+ 			}
+ 		} else {
++#if defined(ARM64_BOARD_CONFIG_A04S)
++			error = EROFS;
++#else
+ 			if (skip || take != 512u) {
+ 				error = emmc_read_sector(lba, emmc_bounce);
+ 			}
+@@ -531,6 +786,7 @@ emmc_strategy(buf_t bp)
+ 				memcpy(emmc_bounce + skip, vaddr + n, take);
+ 				error = emmc_write_sector(lba, emmc_bounce);
+ 			}
++#endif
+ 		}
+ 		if (error) {
+ 			break;
+@@ -596,6 +852,7 @@ emmc_psize(__unused dev_t dev)
+ 	return emmc_ready ? (int)MIN(emmc_nsectors * 512u / emmc_secsize, INT_MAX) : -1;
+ }
+ 
 +#if !defined(ARM64_BOARD_CONFIG_A04S)
  static int
- emmc_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
+ emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
  {
-@@ -623,6 +792,8 @@ static const struct cdevsw emmc_cdevsw = {
+@@ -609,12 +866,15 @@ emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
+ 	    minphys, uio, (int)emmc_secsize) : EROFS;
+ }
+ 
++#endif /* !A04S */
++
+ static const struct bdevsw emmc_bdevsw = {
+ 	.d_open = emmc_open, .d_close = emmc_close, .d_strategy = emmc_strategy,
+ 	.d_ioctl = emmc_ioctl, .d_dump = eno_dump, .d_psize = emmc_psize,
+ 	.d_type = D_DISK,
+ };
+ 
++#if !defined(ARM64_BOARD_CONFIG_A04S)
+ static const struct cdevsw emmc_cdevsw = {
+ 	.d_open = emmc_open, .d_close = emmc_close, .d_read = emmc_read,
+ 	.d_write = emmc_write, .d_ioctl = emmc_ioctl, .d_stop = eno_stop,
+@@ -623,6 +883,8 @@ static const struct cdevsw emmc_cdevsw = {
  	.d_reserved_2 = eno_putc, .d_type = D_DISK,
  };
  
@@ -275,26 +410,79 @@ index 9ad7fd6..10f3ecd 100644
  /* _cnputs may execute in any context. Keep this path free of locks and I/O. */
  void a5xelte_log_append(const char *c, int size);
  void
-@@ -647,6 +818,13 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
+@@ -647,6 +909,38 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
  	*total = os_atomic_load(&emmc_log_total, relaxed);
  }
  
 +#if defined(ARM64_BOARD_CONFIG_A04S)
 +int
-+a5xelte_emmc_rootdev(__unused dev_t *dev)
++a5xelte_emmc_rootdev(dev_t *dev)
 +{
-+	return ENXIO; /* No block device yet: stage 5a only reads and reports. */
++	if (!emmc_ready) {
++		uint8_t sector[512];
++		a5xelte_emmc_probe();
++		if (a04s_error) {
++			return a04s_error;
++		}
++		a04s_step = "VOLUME";
++		int error = emmc_read_sector(A04S_VOLUME_FIRST + 2u, sector);
++		if (error) {
++			return error;
++		}
++		/* HFSX volume header. */
++		if (sector[0] != 'H' || sector[1] != 'X') {
++			return ENXIO;
++		}
++		int bmajor = bdevsw_add(-1, &emmc_bdevsw);
++		if (bmajor < 0) {
++			return ENXIO;
++		}
++		emmc_bdev = makedev(bmajor, 0);
++		devfs_make_node(emmc_bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "emmcroot0");
++		emmc_ready = true;
++		a04s_step = "MOUNT";
++	}
++	*dev = emmc_bdev;
++	return 0;
 +}
 +#else
  struct a5_log_header {
  	char magic[8];
  	uint32_t version, size;
-@@ -752,4 +930,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
+@@ -752,4 +1046,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
  	*dev = emmc_bdev;
  	return 0;
  }
 +#endif /* A04S */
  #endif /* ARM64_BOARD_CONFIG_A5XELTE */
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 37b738a..55dcbde 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -897,6 +897,10 @@ bsd_init(void)
+ 		}
+ #endif
+ 		printf("cannot mount root, errno = %d\n", err);
++#if defined(ARM64_BOARD_CONFIG_A04S)
++		extern void a04s_stop(int error);
++		a04s_stop(err);
++#endif
+ 	}
+ 
+ 	IOSecureBSDRoot(rootdevice);
+@@ -955,6 +959,12 @@ bsd_init(void)
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_A04S)
++	/* Stage 5b ends here on purpose: read a known file, report, stop. No process starts. */
++	extern void a04s_root_test(void);
++	a04s_root_test();
++#endif
++
+ 
+ #if CONFIG_NETBOOT
+ 	if (netboot) {
 diff --git a/config/MASTER.arm64.a04s b/config/MASTER.arm64.a04s
 new file mode 100644
 index 0000000..e3b8eb3
@@ -439,26 +627,30 @@ index d1099ff..a1349e4 100644
      "   {"
      "     'IOClass'         = SweetBattery;"
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
-index 10449ab..38a02f4 100644
+index 10449ab..e0cc54a 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -771,6 +771,21 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+@@ -771,6 +771,25 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  		}
  	}
  
 +#if defined(ARM64_BOARD_CONFIG_A04S)
 +	/*
-+	 * Stage 5a ends here on purpose: read the eMMC, report, stop. This build has no
-+	 * eMMC write code, and no other driver or root code runs on this phone yet.
-+	 * The rising count shows the timer and GIC interrupts still work after the reads.
++	 * Stage 5b: root is the read-only test volume in the boot partition. This build
++	 * has no eMMC write code, and no other driver code runs on this phone yet.
 +	 */
 +	{
-+	extern void a04s_emmc_summary(unsigned int seconds);
-+	a5xelte_emmc_probe();
-+	for (volatile unsigned int a04s_seconds = 0;; a04s_seconds += 5) {
-+		a04s_emmc_summary(a04s_seconds);
-+		IOSleep(5000);
++	extern int a5xelte_emmc_rootdev(dev_t *dev);
++	extern void a04s_stop(int error);
++	OSSafeReleaseNULL(matching);
++	int a04s_error = a5xelte_emmc_rootdev(root);
++	if (a04s_error) {
++		a04s_stop(a04s_error);
 +	}
++	strlcpy(rootName, "emmcroot0", rootNameSize);
++	IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++	*oflags = 0;
++	goto iofrootx;
 +	}
 +#endif
  #if defined(ARM64_BOARD_CONFIG_A5XELTE)
