@@ -58,7 +58,7 @@ index 0000000..61653da
 +
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
-index 9ad7fd6..a4bf0ef 100644
+index 9ad7fd6..5b1ac26 100644
 --- a/bsd/dev/a5xelte_emmc.c
 +++ b/bsd/dev/a5xelte_emmc.c
 @@ -7,6 +7,12 @@
@@ -182,7 +182,7 @@ index 9ad7fd6..a4bf0ef 100644
  
  static uint32_t
  emmc_le32(const uint8_t *p)
-@@ -326,6 +374,231 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
+@@ -326,6 +374,232 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
  	return crc;
  }
  
@@ -355,6 +355,7 @@ index 9ad7fd6..a4bf0ef 100644
 + * hide that the kernel is alive: this one takes no locks and only reads counters.
 + */
 +extern void a04s_sample_task(task_t task);
++extern void a04s_print_faults(void);
 +extern uint64_t a04s_svc_count, a04s_user_aborts, a04s_last_abort_addr, a04s_last_abort_pc;
 +extern int a04s_last_svc;
 +
@@ -365,7 +366,7 @@ index 9ad7fd6..a4bf0ef 100644
 +		IOSleep(5000);
 +		kprintf("A04S HB %u S READS %llu REFUSED %u\n", seconds, a04s_reads, a04s_writes_refused);
 +		kprintf("SVC %llu LAST %d ABORTS %llu\n", a04s_svc_count, a04s_last_svc, a04s_user_aborts);
-+		kprintf("ABORT AT %llx PC %llx\n", a04s_last_abort_addr, a04s_last_abort_pc);
++		a04s_print_faults();
 +	}
 +}
 +
@@ -414,7 +415,7 @@ index 9ad7fd6..a4bf0ef 100644
  static int
  emmc_find_root_partition(void)
  {
-@@ -434,6 +707,7 @@ emmc_find_root_partition(void)
+@@ -434,6 +708,7 @@ emmc_find_root_partition(void)
  	    emmc_writable ? "writable" : "read-only");
  	return 0;
  }
@@ -422,7 +423,7 @@ index 9ad7fd6..a4bf0ef 100644
  
  static int
  emmc_map_host(void)
-@@ -446,7 +720,7 @@ emmc_map_host(void)
+@@ -446,7 +721,7 @@ emmc_map_host(void)
  	}
  	if (SecureDTLookupEntry(NULL, "/a5xelte-emmc", &node) != kSuccess ||
  	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
@@ -431,7 +432,7 @@ index 9ad7fd6..a4bf0ef 100644
  		printf("A5XELTE eMMC: missing or unexpected ADT register window\n");
  		return ENXIO;
  	}
-@@ -464,9 +738,19 @@ emmc_map_host(void)
+@@ -464,9 +739,19 @@ emmc_map_host(void)
  void
  a5xelte_emmc_probe(void)
  {
@@ -451,7 +452,7 @@ index 9ad7fd6..a4bf0ef 100644
  }
  
  static int
-@@ -496,6 +780,9 @@ emmc_strategy(buf_t bp)
+@@ -496,6 +781,9 @@ emmc_strategy(buf_t bp)
  	if (!emmc_ready) {
  		error = ENXIO;
  	} else if (!(buf_flags(bp) & B_READ) && !emmc_writable) {
@@ -461,7 +462,7 @@ index 9ad7fd6..a4bf0ef 100644
  		error = EROFS;
  	} else if (buf_blkno(bp) < 0) {
  		error = EINVAL;
-@@ -520,10 +807,19 @@ emmc_strategy(buf_t bp)
+@@ -520,10 +808,19 @@ emmc_strategy(buf_t bp)
  		uint32_t lba = (uint32_t)(emmc_first_lba + pos / 512u);
  		if (buf_flags(bp) & B_READ) {
  			error = emmc_read_sector(lba, emmc_bounce);
@@ -481,7 +482,7 @@ index 9ad7fd6..a4bf0ef 100644
  			if (skip || take != 512u) {
  				error = emmc_read_sector(lba, emmc_bounce);
  			}
-@@ -531,6 +827,7 @@ emmc_strategy(buf_t bp)
+@@ -531,6 +828,7 @@ emmc_strategy(buf_t bp)
  				memcpy(emmc_bounce + skip, vaddr + n, take);
  				error = emmc_write_sector(lba, emmc_bounce);
  			}
@@ -489,7 +490,7 @@ index 9ad7fd6..a4bf0ef 100644
  		}
  		if (error) {
  			break;
-@@ -596,6 +893,7 @@ emmc_psize(__unused dev_t dev)
+@@ -596,6 +894,7 @@ emmc_psize(__unused dev_t dev)
  	return emmc_ready ? (int)MIN(emmc_nsectors * 512u / emmc_secsize, INT_MAX) : -1;
  }
  
@@ -497,7 +498,7 @@ index 9ad7fd6..a4bf0ef 100644
  static int
  emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
  {
-@@ -609,12 +907,15 @@ emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
+@@ -609,12 +908,15 @@ emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
  	    minphys, uio, (int)emmc_secsize) : EROFS;
  }
  
@@ -513,7 +514,7 @@ index 9ad7fd6..a4bf0ef 100644
  static const struct cdevsw emmc_cdevsw = {
  	.d_open = emmc_open, .d_close = emmc_close, .d_read = emmc_read,
  	.d_write = emmc_write, .d_ioctl = emmc_ioctl, .d_stop = eno_stop,
-@@ -623,6 +924,8 @@ static const struct cdevsw emmc_cdevsw = {
+@@ -623,6 +925,8 @@ static const struct cdevsw emmc_cdevsw = {
  	.d_reserved_2 = eno_putc, .d_type = D_DISK,
  };
  
@@ -522,7 +523,7 @@ index 9ad7fd6..a4bf0ef 100644
  /* _cnputs may execute in any context. Keep this path free of locks and I/O. */
  void a5xelte_log_append(const char *c, int size);
  void
-@@ -647,6 +950,44 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
+@@ -647,6 +951,44 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
  	*total = os_atomic_load(&emmc_log_total, relaxed);
  }
  
@@ -567,7 +568,7 @@ index 9ad7fd6..a4bf0ef 100644
  struct a5_log_header {
  	char magic[8];
  	uint32_t version, size;
-@@ -752,4 +1093,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
+@@ -752,4 +1094,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
  	*dev = emmc_bdev;
  	return 0;
  }
@@ -843,34 +844,70 @@ index 6d0b107..2dd9827 100644
  ARM64_PLKSEG_ADDR  =0xfffffff004004000
  ARM64_LINK_ADDR    =0xfffffff007004000
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 87fb8a8..9c1dbb2 100644
+index 87fb8a8..223f4ac 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
-@@ -195,6 +195,11 @@ struct proc;
+@@ -195,6 +195,33 @@ struct proc;
  
  typedef uint32_t arm64_instr_t;
  
 +#if defined(ARM64_BOARD_CONFIG_A04S)
 +uint64_t a04s_svc_count, a04s_user_aborts, a04s_last_abort_addr, a04s_last_abort_pc;
 +int a04s_last_svc;
++
++/* The newest user faults. Result stays PENDING until the fault returns, so a stuck one shows. */
++#define A04S_FAULTS 16
++#define A04S_FAULT_PENDING (-1)
++static struct {
++	uint64_t addr, pc;
++	uint32_t esr;
++	int result;
++} a04s_faults[A04S_FAULTS];
++
++/* Takes no locks and touches only this table, so the heartbeat can always call it. */
++void a04s_print_faults(void);
++void
++a04s_print_faults(void)
++{
++	uint64_t total = a04s_user_aborts;
++	for (uint64_t n = total, shown = 0; n > 0 && shown < 12; n--, shown++) {
++		unsigned slot = (unsigned)((n - 1) % A04S_FAULTS);
++		kprintf("F %llu %llx %llx %x %d\n", n, a04s_faults[slot].addr, a04s_faults[slot].pc,
++		    a04s_faults[slot].esr, a04s_faults[slot].result);
++	}
++}
 +#endif
 +
  extern void
  unix_syscall(struct arm_saved_state * regs, thread_t thread_act, struct proc * proc);
  
-@@ -1362,6 +1367,11 @@ handle_user_abort(arm_saved_state_t *state, uint32_t esr, vm_offset_t fault_addr
+@@ -1362,6 +1389,15 @@ handle_user_abort(arm_saved_state_t *state, uint32_t esr, vm_offset_t fault_addr
  	mach_msg_type_number_t     numcodes = 2;
  	thread_t                   thread   = current_thread();
  
 +#if defined(ARM64_BOARD_CONFIG_A04S)
-+	a04s_user_aborts++;
++	unsigned a04s_slot = (unsigned)(a04s_user_aborts++ % A04S_FAULTS);
 +	a04s_last_abort_addr = fault_addr;
 +	a04s_last_abort_pc = get_saved_state_pc(state);
++	a04s_faults[a04s_slot].addr = fault_addr;
++	a04s_faults[a04s_slot].pc = get_saved_state_pc(state);
++	a04s_faults[a04s_slot].esr = esr;
++	a04s_faults[a04s_slot].result = A04S_FAULT_PENDING;
 +#endif
  	(void)esr;
  	(void)expected_fault_handler;
  
-@@ -1644,6 +1654,11 @@ handle_svc(arm_saved_state_t *state)
+@@ -1402,6 +1438,9 @@ handle_user_abort(arm_saved_state_t *state, uint32_t esr, vm_offset_t fault_addr
+ 				    /* caller_pmap */ NULL, /* caller_pmap_addr */ 0);
+ 			}
+ 		}
++#if defined(ARM64_BOARD_CONFIG_A04S)
++		a04s_faults[a04s_slot].result = result;
++#endif
+ 		if (thread->t_rr_state.trr_fault_state != TRR_FAULT_NONE) {
+ 			thread_reset_pcs_done_faulting(thread);
+ 		}
+@@ -1644,6 +1683,11 @@ handle_svc(arm_saved_state_t *state)
  	thread_t thread  = current_thread();
  	struct   proc *p;
  
