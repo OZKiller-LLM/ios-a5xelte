@@ -10,8 +10,8 @@ on:
         description: RELEASE / DEVELOPMENT / DEBUG
         default: DEVELOPMENT
       machine_config:
-        description: xnu MACHINE_CONFIG (HEROLTE = Galaxy S7, A5XELTE, SWEET)
-        default: HEROLTE
+        description: xnu MACHINE_CONFIG (A04S = Galaxy A04s, HEROLTE = Galaxy S7, A5XELTE, SWEET)
+        default: A04S
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
@@ -19,7 +19,7 @@ on:
         description: GitHub runner image (empty = macos-15-intel)
         default: ""
   push:
-    branches: [main, herolte, codex/a5xelte-bringup]
+    branches: [main, herolte, a04s, codex/a5xelte-bringup]
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
@@ -33,7 +33,7 @@ env:
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
-  MACHINE_CONFIG: ${{ inputs.machine_config || 'HEROLTE' }}
+  MACHINE_CONFIG: ${{ inputs.machine_config || 'A04S' }}
 
 jobs:
   build:
@@ -58,14 +58,14 @@ jobs:
           # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
           cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
           # libfirehose_kernel is built arm64e-only; these kernels are plain arm64.
-          # Cortex-A53 boards (A5XELTE, HEROLTE) also need it without ARMv8.1
-          # LSE atomics: same flags as tools/a5xelte-build-firehose.sh.
+          # Boards built for the Cortex-A53 baseline (A5XELTE, HEROLTE, A04S) also
+          # need it without ARMv8.1 LSE atomics: same flags as tools/a5xelte-build-firehose.sh.
           python3 - dxb/build.sh "$MACHINE_CONFIG" <<'PY'
           import sys
           from pathlib import Path
           path, config = Path(sys.argv[1]), sys.argv[2]
           old = 'ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"'
-          if config in ('A5XELTE', 'HEROLTE'):
+          if config in ('A5XELTE', 'HEROLTE', 'A04S'):
               new = ('ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-mkernel -nostdinc '
                      '-Wno-packed -mcpu=cortex-a53 -march=armv8-a+crypto"')
           else:
@@ -186,7 +186,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Check Cortex-A53 compatibility (no ARMv8.1 LSE atomics)
-        if: env.MACHINE_CONFIG == 'A5XELTE' || env.MACHINE_CONFIG == 'HEROLTE'
+        if: env.MACHINE_CONFIG == 'A5XELTE' || env.MACHINE_CONFIG == 'HEROLTE' || env.MACHINE_CONFIG == 'A04S'
         run: |
           kernel="out/kernel.$(echo "$KERNEL_CONFIG" | tr A-Z a-z).$(echo "$MACHINE_CONFIG" | tr A-Z a-z)"
           test -f "$kernel"
