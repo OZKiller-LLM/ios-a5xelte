@@ -11,6 +11,255 @@ index 7dee125..cc95042 100644
  SWEET_PTHREAD_ROOT = $(SRCROOT)/bsd/pthread/sweet_libpthread
  SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
  sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+diff --git a/bsd/conf/files b/bsd/conf/files
+index a16d8e0..0e9f87d 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@ bsd/dev/random/randomdev.c		standard
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/a5xelte_emmc.c			standard
++bsd/dev/a04s_acpm.c			standard
+ bsd/dev/herolte_ufs.c			standard
+ bsd/dev/herolte_touch.c			standard
+ bsd/dev/herolte_battery.c		standard
+diff --git a/bsd/dev/a04s_acpm.c b/bsd/dev/a04s_acpm.c
+new file mode 100644
+index 0000000..eb0d679
+--- /dev/null
++++ b/bsd/dev/a04s_acpm.c
+@@ -0,0 +1,231 @@
++/*
++ * Galaxy A04s: reads over ACPM, the mailbox protocol of the APM core, from the S2MPU12 PMIC
++ * and the AUD3004X codec on the same bus. A write there can change a supply voltage, so this
++ * stage builds read commands only, and tools/check_acpm_source.py refuses anything else.
++ * The protocol follows Samsung's drivers/soc/samsung/acpm (acpm_ipc.c, acpm_mfd.c).
++ */
++#if defined(ARM64_BOARD_CONFIG_A04S)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <stdbool.h>
++#include <kern/locks.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern uint64_t mach_absolute_time(void);
++
++#define ACPM_MBOX_PA            0x11900000u     /* acpm_ipc reg 0 */
++#define ACPM_MBOX_SIZE          0x1000u
++#define ACPM_SRAM_PA            0x02039000u     /* acpm_ipc reg 1 */
++#define ACPM_SRAM_SIZE          0x30000u
++#define ACPM_INITDATA           0x7000u         /* acpm_ipc initdata-base */
++#define ACPM_MFD_CHANNEL        2u              /* s2mpu12mfd acpm-ipc-channel */
++#define ACPM_TICKS_PER_MS       26000u
++#define ACPM_TIMEOUT_MS         50u
++
++/* Mailbox registers: INTGR0 rings the APM, INTSR1/INTCR1 are its replies to the AP. */
++#define INTGR0                  0x0008u
++#define INTCR1                  0x0020u
++#define INTSR1                  0x0028u
++
++/* struct acpm_framework, fw_header/framework.h: the two fields used. */
++#define FW_IPC_CHANNELS         0x08u
++#define FW_IPC_AP_MAX           0x18u
++/* struct ipc_channel: id, field, owner, type, struct channel_info, ap_poll. */
++#define CH_SIZE                 0x48u
++#define CH_ID                   0x00u
++#define CH_IN_REAR              0x10u           /* channel_info.rx_*: what the APM receives */
++#define CH_IN_FRONT             0x14u
++#define CH_IN_BASE              0x18u
++#define CH_OUT_REAR             0x28u           /* channel_info.tx_*: its replies */
++#define CH_OUT_FRONT            0x2cu
++#define CH_OUT_BASE             0x30u
++#define CH_Q_LEN                0x34u
++#define CH_Q_ELEM_SIZE          0x38u
++#define CH_AP_POLL              0x44u
++
++/* cmd[0]: register, bus address, bus channel, sequence. cmd[1]: function, then the reply. */
++#define ACPM_SEQ_SHIFT          16
++#define ACPM_FUNC_READ          0u              /* acpm_mfd.h FUNC_READ, the only function built */
++#define ACPM_DEST(word)         (((word) >> 8) & 0xffu)
++#define ACPM_RETURN(word)       (((word) >> 24) & 0xffu)
++
++struct a04s_acpm_queue {
++	uint32_t rear, front, base;
++};
++
++static vm_offset_t acpm_mbox, acpm_sram;
++static uint32_t acpm_id, acpm_len, acpm_elem, acpm_seq;
++static struct a04s_acpm_queue acpm_in, acpm_out;
++static int acpm_error = -1;
++
++/* What 6b-1 reads, shown by the heartbeat: the PMIC's revision and two codec mic registers. */
++static uint8_t acpm_pmic_rev, acpm_mic_bias, acpm_mic_gain;
++
++static inline uint32_t
++sram_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(acpm_sram + off);
++}
++
++static inline void
++sram_wr(uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(acpm_sram + off) = value;
++}
++
++static inline uint32_t
++mbox_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(acpm_mbox + off);
++}
++
++static inline void
++mbox_wr(uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(acpm_mbox + off) = value;
++}
++
++static int
++acpm_setup(void)
++{
++	acpm_mbox = ml_io_map(ACPM_MBOX_PA, ACPM_MBOX_SIZE);
++	acpm_sram = ml_io_map(ACPM_SRAM_PA, ACPM_SRAM_SIZE);
++	if (!acpm_mbox || !acpm_sram) {
++		return ENOMEM;
++	}
++	uint32_t table = sram_rd(ACPM_INITDATA + FW_IPC_CHANNELS);
++	uint32_t count = sram_rd(ACPM_INITDATA + FW_IPC_AP_MAX);
++	if (count == 0 || count > 32 || table == 0 || table + count * CH_SIZE > ACPM_SRAM_SIZE) {
++		return ENXIO;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t ch = table + i * CH_SIZE;
++		if (sram_rd(ch + CH_ID) != ACPM_MFD_CHANNEL) {
++			continue;
++		}
++		/* Samsung's driver polls this channel; an interrupt channel would need a handler. */
++		if (!sram_rd(ch + CH_AP_POLL)) {
++			return ENOTSUP;
++		}
++		acpm_id = ACPM_MFD_CHANNEL;
++		acpm_len = sram_rd(ch + CH_Q_LEN);
++		acpm_elem = sram_rd(ch + CH_Q_ELEM_SIZE);
++		acpm_in = (struct a04s_acpm_queue){ sram_rd(ch + CH_IN_REAR), sram_rd(ch + CH_IN_FRONT), sram_rd(ch + CH_IN_BASE) };
++		acpm_out = (struct a04s_acpm_queue){ sram_rd(ch + CH_OUT_REAR), sram_rd(ch + CH_OUT_FRONT), sram_rd(ch + CH_OUT_BASE) };
++		if (acpm_len < 2 || acpm_len > 64 || acpm_elem < 16 || acpm_elem > 64 ||
++		    acpm_in.base + acpm_len * acpm_elem > ACPM_SRAM_SIZE ||
++		    acpm_out.base + acpm_len * acpm_elem > ACPM_SRAM_SIZE ||
++		    acpm_in.front >= ACPM_SRAM_SIZE || acpm_in.rear >= ACPM_SRAM_SIZE ||
++		    acpm_out.front >= ACPM_SRAM_SIZE || acpm_out.rear >= ACPM_SRAM_SIZE) {
++			return ENXIO;
++		}
++		return 0;
++	}
++	return ENOENT;
++}
++
++static bool
++acpm_timed_out(uint64_t start)
++{
++	return mach_absolute_time() - start > (uint64_t)ACPM_TICKS_PER_MS * ACPM_TIMEOUT_MS;
++}
++
++/* Queue one command, ring the APM, and wait for the reply with the same sequence number. */
++static int
++acpm_transfer(uint32_t cmd[4])
++{
++	uint32_t front = sram_rd(acpm_in.front), next = (front + 1) % acpm_len;
++	uint64_t start = mach_absolute_time();
++	while (next == sram_rd(acpm_in.rear)) {
++		if (acpm_timed_out(start)) {
++			return EBUSY;
++		}
++	}
++	if (++acpm_seq == 64) {
++		acpm_seq = 1;
++	}
++	cmd[0] |= acpm_seq << ACPM_SEQ_SHIFT;
++	for (uint32_t w = 0; w < acpm_elem / 4; w++) {
++		sram_wr(acpm_in.base + front * acpm_elem + w * 4, w < 4 ? cmd[w] : 0);
++	}
++	sram_wr(acpm_in.front, next);
++	mbox_wr(INTGR0, (1u << acpm_id) << 16);
++
++	start = mach_absolute_time();
++	for (;;) {
++		if (mbox_rd(INTSR1) & (1u << acpm_id)) {
++			uint32_t rear = sram_rd(acpm_out.rear), last = sram_rd(acpm_out.front);
++			for (uint32_t i = rear; i != last; i = (i + 1) % acpm_len) {
++				uint32_t at = acpm_out.base + i * acpm_elem;
++				if (((sram_rd(at) >> ACPM_SEQ_SHIFT) & 0x3fu) != acpm_seq) {
++					continue;
++				}
++				for (uint32_t w = 0; w < 4; w++) {
++					cmd[w] = sram_rd(at + w * 4);
++				}
++				/* As Samsung's driver: the oldest reply moves into the slot taken. */
++				if (i != rear) {
++					for (uint32_t w = 0; w < acpm_elem / 4; w++) {
++						sram_wr(at + w * 4, sram_rd(acpm_out.base + rear * acpm_elem + w * 4));
++					}
++				}
++				rear = (rear + 1) % acpm_len;
++				sram_wr(acpm_out.rear, rear);
++				if (rear == sram_rd(acpm_out.front)) {
++					mbox_wr(INTCR1, 1u << acpm_id);
++				}
++				return 0;
++			}
++		}
++		if (acpm_timed_out(start)) {
++			return ETIMEDOUT;
++		}
++	}
++}
++
++/* One register from a device on the PMIC's bus. The only kind of command this file builds. */
++static int
++acpm_read(uint32_t bus_addr, uint32_t reg, uint8_t *value)
++{
++	uint32_t cmd[4] = { 0 };
++	cmd[0] = (reg & 0xffu) | ((bus_addr & 0xfu) << 8);
++	cmd[1] = ACPM_FUNC_READ;
++	int error = acpm_transfer(cmd);
++	if (error) {
++		return error;
++	}
++	if (ACPM_RETURN(cmd[1])) {
++		return EIO;
++	}
++	*value = (uint8_t)ACPM_DEST(cmd[1]);
++	return 0;
++}
++
++/* The registers Samsung's own drivers read first: s2mpu12-core.c, then aud3004x.c. */
++void a04s_acpm_probe(void);
++void
++a04s_acpm_probe(void)
++{
++	acpm_error = acpm_setup();
++	if (!acpm_error) {
++		acpm_error = acpm_read(0x00, 0x04, &acpm_pmic_rev);     /* S2MPU12_PMIC_CHIPID */
++	}
++	if (!acpm_error) {
++		acpm_error = acpm_read(0x08, 0x10, &acpm_mic_bias);     /* AUD3004X_110_PD_REF */
++	}
++	if (!acpm_error) {
++		acpm_error = acpm_read(0x08, 0x34, &acpm_mic_gain);     /* AUD3004X_134_VOL_AD1 */
++	}
++}
++
++void a04s_acpm_report(void);
++void
++a04s_acpm_report(void)
++{
++	kprintf("ACPM ERR %d LEN %u ELEM %u PMIC %02x MIC %02x %02x\n", acpm_error, acpm_len, acpm_elem,
++	    acpm_pmic_rev, acpm_mic_bias, acpm_mic_gain);
++}
++#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_emmc_guard.h b/bsd/dev/a04s_emmc_guard.h
 new file mode 100644
 index 0000000..61653da
@@ -58,7 +307,7 @@ index 0000000..61653da
 +
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
-index 9ad7fd6..07dcdc5 100644
+index 9ad7fd6..6c17549 100644
 --- a/bsd/dev/a5xelte_emmc.c
 +++ b/bsd/dev/a5xelte_emmc.c
 @@ -7,6 +7,12 @@
@@ -252,7 +501,7 @@ index 9ad7fd6..07dcdc5 100644
  
  static uint32_t
  emmc_le32(const uint8_t *p)
-@@ -326,6 +402,351 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
+@@ -326,6 +402,355 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
  	return crc;
  }
  
@@ -555,6 +804,8 @@ index 9ad7fd6..07dcdc5 100644
 +		kprintf("EMMC BUSY %llu RETRY %llu RERR %u WERR %u\n", a04s_busy_waits, a04s_retries,
 +		    a04s_read_errors, a04s_write_errors);
 +		kprintf("SVC %llu LAST %d ABORTS %llu\n", a04s_svc_count, a04s_last_svc, a04s_user_aborts);
++		extern void a04s_acpm_report(void);
++		a04s_acpm_report();
 +		a04s_print_faults();
 +	}
 +}
@@ -592,6 +843,8 @@ index 9ad7fd6..07dcdc5 100644
 +		(void)vnode_put(root);
 +	}
 +	kprintf("A04S 5C ROOT MOUNTED\n");
++	extern void a04s_acpm_probe(void);
++	a04s_acpm_probe();
 +	a04s_report();
 +	if (kernel_thread_start(a04s_heartbeat, NULL, &thread) == KERN_SUCCESS) {
 +		thread_deallocate(thread);
@@ -604,7 +857,7 @@ index 9ad7fd6..07dcdc5 100644
  static int
  emmc_find_root_partition(void)
  {
-@@ -434,6 +855,7 @@ emmc_find_root_partition(void)
+@@ -434,6 +859,7 @@ emmc_find_root_partition(void)
  	    emmc_writable ? "writable" : "read-only");
  	return 0;
  }
@@ -612,7 +865,7 @@ index 9ad7fd6..07dcdc5 100644
  
  static int
  emmc_map_host(void)
-@@ -446,7 +868,7 @@ emmc_map_host(void)
+@@ -446,7 +872,7 @@ emmc_map_host(void)
  	}
  	if (SecureDTLookupEntry(NULL, "/a5xelte-emmc", &node) != kSuccess ||
  	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
@@ -621,7 +874,7 @@ index 9ad7fd6..07dcdc5 100644
  		printf("A5XELTE eMMC: missing or unexpected ADT register window\n");
  		return ENXIO;
  	}
-@@ -464,9 +886,19 @@ emmc_map_host(void)
+@@ -464,9 +890,19 @@ emmc_map_host(void)
  void
  a5xelte_emmc_probe(void)
  {
@@ -641,7 +894,7 @@ index 9ad7fd6..07dcdc5 100644
  }
  
  static int
-@@ -496,6 +928,9 @@ emmc_strategy(buf_t bp)
+@@ -496,6 +932,9 @@ emmc_strategy(buf_t bp)
  	if (!emmc_ready) {
  		error = ENXIO;
  	} else if (!(buf_flags(bp) & B_READ) && !emmc_writable) {
@@ -651,7 +904,7 @@ index 9ad7fd6..07dcdc5 100644
  		error = EROFS;
  	} else if (buf_blkno(bp) < 0) {
  		error = EINVAL;
-@@ -519,11 +954,31 @@ emmc_strategy(buf_t bp)
+@@ -519,11 +958,31 @@ emmc_strategy(buf_t bp)
  		uint32_t take = MIN(count - n, 512u - skip);
  		uint32_t lba = (uint32_t)(emmc_first_lba + pos / 512u);
  		if (buf_flags(bp) & B_READ) {
@@ -683,7 +936,7 @@ index 9ad7fd6..07dcdc5 100644
  			if (skip || take != 512u) {
  				error = emmc_read_sector(lba, emmc_bounce);
  			}
-@@ -531,6 +986,8 @@ emmc_strategy(buf_t bp)
+@@ -531,6 +990,8 @@ emmc_strategy(buf_t bp)
  				memcpy(emmc_bounce + skip, vaddr + n, take);
  				error = emmc_write_sector(lba, emmc_bounce);
  			}
@@ -692,7 +945,7 @@ index 9ad7fd6..07dcdc5 100644
  		}
  		if (error) {
  			break;
-@@ -596,6 +1053,7 @@ emmc_psize(__unused dev_t dev)
+@@ -596,6 +1057,7 @@ emmc_psize(__unused dev_t dev)
  	return emmc_ready ? (int)MIN(emmc_nsectors * 512u / emmc_secsize, INT_MAX) : -1;
  }
  
@@ -700,7 +953,7 @@ index 9ad7fd6..07dcdc5 100644
  static int
  emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
  {
-@@ -609,12 +1067,15 @@ emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
+@@ -609,12 +1071,15 @@ emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
  	    minphys, uio, (int)emmc_secsize) : EROFS;
  }
  
@@ -716,7 +969,7 @@ index 9ad7fd6..07dcdc5 100644
  static const struct cdevsw emmc_cdevsw = {
  	.d_open = emmc_open, .d_close = emmc_close, .d_read = emmc_read,
  	.d_write = emmc_write, .d_ioctl = emmc_ioctl, .d_stop = eno_stop,
-@@ -623,6 +1084,8 @@ static const struct cdevsw emmc_cdevsw = {
+@@ -623,6 +1088,8 @@ static const struct cdevsw emmc_cdevsw = {
  	.d_reserved_2 = eno_putc, .d_type = D_DISK,
  };
  
@@ -725,7 +978,7 @@ index 9ad7fd6..07dcdc5 100644
  /* _cnputs may execute in any context. Keep this path free of locks and I/O. */
  void a5xelte_log_append(const char *c, int size);
  void
-@@ -647,6 +1110,46 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
+@@ -647,6 +1114,46 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
  	*total = os_atomic_load(&emmc_log_total, relaxed);
  }
  
@@ -772,7 +1025,7 @@ index 9ad7fd6..07dcdc5 100644
  struct a5_log_header {
  	char magic[8];
  	uint32_t version, size;
-@@ -752,4 +1255,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
+@@ -752,4 +1259,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
  	*dev = emmc_bdev;
  	return 0;
  }
