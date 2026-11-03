@@ -315,10 +315,10 @@ index 0000000..6214122
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_acpm_guard.h b/bsd/dev/a04s_acpm_guard.h
 new file mode 100644
-index 0000000..6b07ccc
+index 0000000..b5308db
 --- /dev/null
 +++ b/bsd/dev/a04s_acpm_guard.h
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,46 @@
 +/*
 + * Galaxy A04s: the only registers a kernel may write over ACPM. The same bus carries the
 + * S2MPU12 PMIC's regulators: its top and PMIC pages (bus addresses 0x00 and 0x01) set supply
@@ -331,8 +331,11 @@ index 0000000..6b07ccc
 +#ifndef A04S_ACPM_GUARD_H
 +#define A04S_ACPM_GUARD_H
 +
-+/* [bus address][register / 32], bit register % 32. */
-+const uint32_t a04s_acpm_writable[16][8] __attribute__((used)) = {
++/*
++ * [bus address][register / 32], bit register % 32. Volatile, so every check reads the table:
++ * constant, the compiler worked out each check at build time and left none in the kernel.
++ */
++const volatile uint32_t a04s_acpm_writable[16][8] __attribute__((used)) = {
 +	/* 0x07: 10 CLKGATE0, 11 CLKGATE1, 12 CLKGATE2, 14 RESETB0, 16 CLK_MODE_SEL, 18 PWAUTO_AD, 1E CHOP1, 1F CHOP2, 20 IF_FORM1, 21 IF_FORM2, 22 IF_FORM3, 23 IF_FORM4, 24 IF_FORM5, 29 IF_FORM6, 30 ADC1, 31 ADC2, 32 ADC3, 33 ADC4, 34 AD_VOLL, 35 AD_VOLR, 37 AD_HPF, C5 ACTR_MCB3, C6 ACTR_MCB4 */
 +	[0x07] = { 0xc1570000u, 0x00bf021fu, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000060u, 0x00000000u },
 +	/* 0x08: 02 CLK3_COD, 06 DSM_AD, 07 LPF_AD, 10 PD_REF, 11 PD_AD1, 12 PD_AD2, 13 PD_AD3, 17 CTRL_REF, 30 MIX_AD1, 34 VOL_AD1, 35 VOL_AD2, 36 VOL_AD3 */
