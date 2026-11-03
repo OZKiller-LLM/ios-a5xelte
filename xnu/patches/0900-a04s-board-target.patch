@@ -58,7 +58,7 @@ index 0000000..61653da
 +
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
-index 9ad7fd6..2b1bc5c 100644
+index 9ad7fd6..ecb7e7a 100644
 --- a/bsd/dev/a5xelte_emmc.c
 +++ b/bsd/dev/a5xelte_emmc.c
 @@ -7,6 +7,12 @@
@@ -111,7 +111,7 @@ index 9ad7fd6..2b1bc5c 100644
  #define EMMC_CTRL       0x000u
  #define EMMC_PWREN      0x004u
  #define EMMC_CLKENA     0x010u
-@@ -70,6 +92,19 @@ extern int hz;
+@@ -70,6 +92,25 @@ extern int hz;
                           (1u << 8) | (1u << 7) | (1u << 6) | (1u << 1))
  
  static vm_offset_t emmc_regs;
@@ -122,6 +122,12 @@ index 9ad7fd6..2b1bc5c 100644
 +static bool emmc_ready;
 +static uint32_t a04s_writes_refused;
 +static uint64_t a04s_reads, a04s_writes;
++/* The controller at the last failed sector command, for the retry report. All zero: the
++ * command never started (host unavailable, or the FIFO reset timed out). */
++static uint32_t a04s_last_rint, a04s_last_status, a04s_last_words;
++#define A04S_NOTE_FAILURE(rint, words) do { \
++	a04s_last_rint = (rint); a04s_last_status = emmc_rd(EMMC_STATUS); a04s_last_words = (words); \
++} while (0)
 +#if A04S_EMMC_WRITES
 +static bool emmc_writable;
 +#else
@@ -131,7 +137,7 @@ index 9ad7fd6..2b1bc5c 100644
  static uint64_t emmc_first_lba, emmc_nsectors;
  static char emmc_partition_name[16] = "SYSTEM";
  static dev_t emmc_bdev;
-@@ -77,9 +112,12 @@ static bool emmc_ready;
+@@ -77,9 +118,12 @@ static bool emmc_ready;
  static bool emmc_writable;
  static uint64_t emmc_log_first_lba, emmc_log_nsectors;
  static bool emmc_log_enabled;
@@ -144,7 +150,27 @@ index 9ad7fd6..2b1bc5c 100644
  static LCK_GRP_DECLARE(a5xelte_emmc_grp, "a5xelte_emmc");
  static LCK_MTX_DECLARE(a5xelte_emmc_lock, &a5xelte_emmc_grp);
  
-@@ -195,6 +233,7 @@ out:
+@@ -149,6 +193,9 @@ emmc_read_sector(uint32_t lba, uint8_t *sector)
+ 	for (unsigned i = 0; i < 4000000; i++) {
+ 		uint32_t pending = emmc_rd(EMMC_RINTSTS);
+ 		if (pending & INT_ERRORS) {
++#if defined(ARM64_BOARD_CONFIG_A04S)
++			A04S_NOTE_FAILURE(pending, read_words);
++#endif
+ 			printf("A5XELTE eMMC: CMD17 error rint=%x status=%x words=%u/%u first=%llx tcbc=%u tbbc=%u\n",
+ 			    pending, emmc_rd(EMMC_STATUS), read_words, words, data[0],
+ 			    emmc_rd(EMMC_TCBCNT), emmc_rd(EMMC_TBBCNT));
+@@ -180,6 +227,9 @@ emmc_read_sector(uint32_t lba, uint8_t *sector)
+ 			break;
+ 		}
+ 		if (i == 3999999) {
++#if defined(ARM64_BOARD_CONFIG_A04S)
++			A04S_NOTE_FAILURE(pending, read_words);
++#endif
+ 			printf("A5XELTE eMMC: CMD17 timeout rint=%x words=%u/%u first=%llx tcbc=%u tbbc=%u\n",
+ 			    pending, read_words, words, data[0],
+ 			    emmc_rd(EMMC_TCBCNT), emmc_rd(EMMC_TBBCNT));
+@@ -195,6 +245,7 @@ out:
  	return error;
  }
  
@@ -152,7 +178,7 @@ index 9ad7fd6..2b1bc5c 100644
  static int
  emmc_write_sector(uint32_t lba, const uint8_t *sector)
  {
-@@ -209,6 +248,13 @@ emmc_write_sector(uint32_t lba, const uint8_t *sector)
+@@ -209,6 +260,13 @@ emmc_write_sector(uint32_t lba, const uint8_t *sector)
  	int error = 0;
  
  	uint64_t address = lba;
@@ -166,7 +192,7 @@ index 9ad7fd6..2b1bc5c 100644
  	bool root_write = emmc_writable && address >= emmc_first_lba &&
  	    address - emmc_first_lba < emmc_nsectors;
  	bool log_write = emmc_log_enabled && address >= emmc_log_first_lba &&
-@@ -216,6 +262,7 @@ emmc_write_sector(uint32_t lba, const uint8_t *sector)
+@@ -216,6 +274,7 @@ emmc_write_sector(uint32_t lba, const uint8_t *sector)
  	if (!root_write && !log_write) {
  		return EROFS;
  	}
@@ -174,7 +200,7 @@ index 9ad7fd6..2b1bc5c 100644
  	if (width > 2 || ver == 0 || ver == 0xffff ||
  	    !(emmc_rd(EMMC_PWREN) & 1u) || !(emmc_rd(EMMC_CLKENA) & 1u)) {
  		return ENXIO;
-@@ -243,6 +290,13 @@ emmc_write_sector(uint32_t lba, const uint8_t *sector)
+@@ -243,6 +302,13 @@ emmc_write_sector(uint32_t lba, const uint8_t *sector)
  	emmc_wr(EMMC_BYTCNT, 512);
  	emmc_wr(EMMC_RINTSTS, 0xffffffffu);
  	emmc_wr(EMMC_CMDARG, lba);
@@ -188,7 +214,37 @@ index 9ad7fd6..2b1bc5c 100644
  	uint32_t command = CMD_START | CMD_WAIT_DATA | CMD_DATA | CMD_WRITE |
  	    CMD_RESP_CRC | CMD_RESP | 24u;
  	if ((emmc_rd(EMMC_CLKSEL) >> 16) & 7u) {
-@@ -300,6 +354,7 @@ out:
+@@ -252,6 +318,9 @@ emmc_write_sector(uint32_t lba, const uint8_t *sector)
+ 	for (unsigned i = 0; i < 4000000; i++) {
+ 		uint32_t pending = emmc_rd(EMMC_RINTSTS);
+ 		if (pending & INT_ERRORS) {
++#if defined(ARM64_BOARD_CONFIG_A04S)
++			A04S_NOTE_FAILURE(pending, written);
++#endif
+ 			printf("A5XELTE eMMC: CMD24 error lba=%u rint=%x status=%x words=%u/%u\n",
+ 			    lba, pending, emmc_rd(EMMC_STATUS), written, words);
+ 			error = EIO;
+@@ -280,6 +349,9 @@ emmc_write_sector(uint32_t lba, const uint8_t *sector)
+ 			break;
+ 		}
+ 		if (i == 3999999) {
++#if defined(ARM64_BOARD_CONFIG_A04S)
++			A04S_NOTE_FAILURE(pending, written);
++#endif
+ 			printf("A5XELTE eMMC: CMD24 timeout lba=%u rint=%x words=%u/%u tcbc=%u\n",
+ 			    lba, pending, written, words, emmc_rd(EMMC_TCBCNT));
+ 			error = ETIMEDOUT;
+@@ -292,6 +364,9 @@ emmc_write_sector(uint32_t lba, const uint8_t *sector)
+ 		}
+ 		if (i == 3999999) {
+ 			error = ETIMEDOUT;
++#if defined(ARM64_BOARD_CONFIG_A04S)
++			A04S_NOTE_FAILURE(0, written);
++#endif
+ 			printf("A5XELTE eMMC: CMD24 card busy after data lba=%u\n", lba);
+ 		}
+ 	}
+@@ -300,6 +375,7 @@ out:
  	emmc_wr(EMMC_INTMASK, ints);
  	return error;
  }
@@ -196,7 +252,7 @@ index 9ad7fd6..2b1bc5c 100644
  
  static uint32_t
  emmc_le32(const uint8_t *p)
-@@ -326,6 +381,330 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
+@@ -326,6 +402,333 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
  	return crc;
  }
  
@@ -260,6 +316,7 @@ index 9ad7fd6..2b1bc5c 100644
 +{
 +	a04s_console_urgent = 1;
 +	kprintf("A04S %s ERR %d LBA %u\n", what, error, lba);
++	kprintf("RINT %x STATUS %x WORDS %u\n", a04s_last_rint, a04s_last_status, a04s_last_words);
 +	kprintf("EMMC BUSY %llu RETRY %llu RERR %u WERR %u\n", a04s_busy_waits, a04s_retries,
 +	    a04s_read_errors, a04s_write_errors);
 +	a04s_console_urgent = 0;
@@ -282,6 +339,7 @@ index 9ad7fd6..2b1bc5c 100644
 +		if (attempt) {
 +			a04s_count_retry("READ RETRY", error, lba);
 +		}
++		A04S_NOTE_FAILURE(0, 0);
 +		error = a04s_card_idle() ? emmc_read_sector(lba, sector) : EBUSY;
 +		if (!error) {
 +			return 0;
@@ -301,6 +359,7 @@ index 9ad7fd6..2b1bc5c 100644
 +		if (attempt) {
 +			a04s_count_retry("WRITE RETRY", error, lba);
 +		}
++		A04S_NOTE_FAILURE(0, 0);
 +		error = a04s_card_idle() ? emmc_write_sector(lba, sector) : EBUSY;
 +		/* A refusal is the guard's answer, and the same request gets the same one. */
 +		if (!error || error == EROFS || error == ENXIO) {
@@ -527,7 +586,7 @@ index 9ad7fd6..2b1bc5c 100644
  static int
  emmc_find_root_partition(void)
  {
-@@ -434,6 +813,7 @@ emmc_find_root_partition(void)
+@@ -434,6 +837,7 @@ emmc_find_root_partition(void)
  	    emmc_writable ? "writable" : "read-only");
  	return 0;
  }
@@ -535,7 +594,7 @@ index 9ad7fd6..2b1bc5c 100644
  
  static int
  emmc_map_host(void)
-@@ -446,7 +826,7 @@ emmc_map_host(void)
+@@ -446,7 +850,7 @@ emmc_map_host(void)
  	}
  	if (SecureDTLookupEntry(NULL, "/a5xelte-emmc", &node) != kSuccess ||
  	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
@@ -544,7 +603,7 @@ index 9ad7fd6..2b1bc5c 100644
  		printf("A5XELTE eMMC: missing or unexpected ADT register window\n");
  		return ENXIO;
  	}
-@@ -464,9 +844,19 @@ emmc_map_host(void)
+@@ -464,9 +868,19 @@ emmc_map_host(void)
  void
  a5xelte_emmc_probe(void)
  {
@@ -564,7 +623,7 @@ index 9ad7fd6..2b1bc5c 100644
  }
  
  static int
-@@ -496,6 +886,9 @@ emmc_strategy(buf_t bp)
+@@ -496,6 +910,9 @@ emmc_strategy(buf_t bp)
  	if (!emmc_ready) {
  		error = ENXIO;
  	} else if (!(buf_flags(bp) & B_READ) && !emmc_writable) {
@@ -574,7 +633,7 @@ index 9ad7fd6..2b1bc5c 100644
  		error = EROFS;
  	} else if (buf_blkno(bp) < 0) {
  		error = EINVAL;
-@@ -519,11 +912,31 @@ emmc_strategy(buf_t bp)
+@@ -519,11 +936,31 @@ emmc_strategy(buf_t bp)
  		uint32_t take = MIN(count - n, 512u - skip);
  		uint32_t lba = (uint32_t)(emmc_first_lba + pos / 512u);
  		if (buf_flags(bp) & B_READ) {
@@ -606,7 +665,7 @@ index 9ad7fd6..2b1bc5c 100644
  			if (skip || take != 512u) {
  				error = emmc_read_sector(lba, emmc_bounce);
  			}
-@@ -531,6 +944,8 @@ emmc_strategy(buf_t bp)
+@@ -531,6 +968,8 @@ emmc_strategy(buf_t bp)
  				memcpy(emmc_bounce + skip, vaddr + n, take);
  				error = emmc_write_sector(lba, emmc_bounce);
  			}
@@ -615,7 +674,7 @@ index 9ad7fd6..2b1bc5c 100644
  		}
  		if (error) {
  			break;
-@@ -596,6 +1011,7 @@ emmc_psize(__unused dev_t dev)
+@@ -596,6 +1035,7 @@ emmc_psize(__unused dev_t dev)
  	return emmc_ready ? (int)MIN(emmc_nsectors * 512u / emmc_secsize, INT_MAX) : -1;
  }
  
@@ -623,7 +682,7 @@ index 9ad7fd6..2b1bc5c 100644
  static int
  emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
  {
-@@ -609,12 +1025,15 @@ emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
+@@ -609,12 +1049,15 @@ emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
  	    minphys, uio, (int)emmc_secsize) : EROFS;
  }
  
@@ -639,7 +698,7 @@ index 9ad7fd6..2b1bc5c 100644
  static const struct cdevsw emmc_cdevsw = {
  	.d_open = emmc_open, .d_close = emmc_close, .d_read = emmc_read,
  	.d_write = emmc_write, .d_ioctl = emmc_ioctl, .d_stop = eno_stop,
-@@ -623,6 +1042,8 @@ static const struct cdevsw emmc_cdevsw = {
+@@ -623,6 +1066,8 @@ static const struct cdevsw emmc_cdevsw = {
  	.d_reserved_2 = eno_putc, .d_type = D_DISK,
  };
  
@@ -648,7 +707,7 @@ index 9ad7fd6..2b1bc5c 100644
  /* _cnputs may execute in any context. Keep this path free of locks and I/O. */
  void a5xelte_log_append(const char *c, int size);
  void
-@@ -647,6 +1068,46 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
+@@ -647,6 +1092,46 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
  	*total = os_atomic_load(&emmc_log_total, relaxed);
  }
  
@@ -695,7 +754,7 @@ index 9ad7fd6..2b1bc5c 100644
  struct a5_log_header {
  	char magic[8];
  	uint32_t version, size;
-@@ -752,4 +1213,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
+@@ -752,4 +1237,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
  	*dev = emmc_bdev;
  	return 0;
  }
