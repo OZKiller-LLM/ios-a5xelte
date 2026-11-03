@@ -58,7 +58,7 @@ index 0000000..61653da
 +
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
-index 9ad7fd6..ecb7e7a 100644
+index 9ad7fd6..07dcdc5 100644
 --- a/bsd/dev/a5xelte_emmc.c
 +++ b/bsd/dev/a5xelte_emmc.c
 @@ -7,6 +7,12 @@
@@ -252,7 +252,7 @@ index 9ad7fd6..ecb7e7a 100644
  
  static uint32_t
  emmc_le32(const uint8_t *p)
-@@ -326,6 +402,333 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
+@@ -326,6 +402,351 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
  	return crc;
  }
  
@@ -283,6 +283,14 @@ index 9ad7fd6..ecb7e7a 100644
 + */
 +#define A04S_CARD_WAIT_MS 2000u
 +#define A04S_SECTOR_TRIES 4u
++
++/*
++ * The PIO loop has to drain the FIFO as the card fills it. Preempted mid-sector, it left the
++ * card clock stopped until the host timeout (RINT 0x424: HTO, 9 of 64 words read). A sector
++ * takes microseconds, so no other thread runs during one.
++ */
++extern void _disable_preemption(void);
++extern void _enable_preemption(void);
 +
 +static uint64_t a04s_busy_waits, a04s_retries;
 +static uint32_t a04s_read_errors, a04s_write_errors;
@@ -340,7 +348,12 @@ index 9ad7fd6..ecb7e7a 100644
 +			a04s_count_retry("READ RETRY", error, lba);
 +		}
 +		A04S_NOTE_FAILURE(0, 0);
-+		error = a04s_card_idle() ? emmc_read_sector(lba, sector) : EBUSY;
++		error = EBUSY;
++		if (a04s_card_idle()) {
++			_disable_preemption();
++			error = emmc_read_sector(lba, sector);
++			_enable_preemption();
++		}
 +		if (!error) {
 +			return 0;
 +		}
@@ -360,7 +373,12 @@ index 9ad7fd6..ecb7e7a 100644
 +			a04s_count_retry("WRITE RETRY", error, lba);
 +		}
 +		A04S_NOTE_FAILURE(0, 0);
-+		error = a04s_card_idle() ? emmc_write_sector(lba, sector) : EBUSY;
++		error = EBUSY;
++		if (a04s_card_idle()) {
++			_disable_preemption();
++			error = emmc_write_sector(lba, sector);
++			_enable_preemption();
++		}
 +		/* A refusal is the guard's answer, and the same request gets the same one. */
 +		if (!error || error == EROFS || error == ENXIO) {
 +			return error;
@@ -586,7 +604,7 @@ index 9ad7fd6..ecb7e7a 100644
  static int
  emmc_find_root_partition(void)
  {
-@@ -434,6 +837,7 @@ emmc_find_root_partition(void)
+@@ -434,6 +855,7 @@ emmc_find_root_partition(void)
  	    emmc_writable ? "writable" : "read-only");
  	return 0;
  }
@@ -594,7 +612,7 @@ index 9ad7fd6..ecb7e7a 100644
  
  static int
  emmc_map_host(void)
-@@ -446,7 +850,7 @@ emmc_map_host(void)
+@@ -446,7 +868,7 @@ emmc_map_host(void)
  	}
  	if (SecureDTLookupEntry(NULL, "/a5xelte-emmc", &node) != kSuccess ||
  	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
@@ -603,7 +621,7 @@ index 9ad7fd6..ecb7e7a 100644
  		printf("A5XELTE eMMC: missing or unexpected ADT register window\n");
  		return ENXIO;
  	}
-@@ -464,9 +868,19 @@ emmc_map_host(void)
+@@ -464,9 +886,19 @@ emmc_map_host(void)
  void
  a5xelte_emmc_probe(void)
  {
@@ -623,7 +641,7 @@ index 9ad7fd6..ecb7e7a 100644
  }
  
  static int
-@@ -496,6 +910,9 @@ emmc_strategy(buf_t bp)
+@@ -496,6 +928,9 @@ emmc_strategy(buf_t bp)
  	if (!emmc_ready) {
  		error = ENXIO;
  	} else if (!(buf_flags(bp) & B_READ) && !emmc_writable) {
@@ -633,7 +651,7 @@ index 9ad7fd6..ecb7e7a 100644
  		error = EROFS;
  	} else if (buf_blkno(bp) < 0) {
  		error = EINVAL;
-@@ -519,11 +936,31 @@ emmc_strategy(buf_t bp)
+@@ -519,11 +954,31 @@ emmc_strategy(buf_t bp)
  		uint32_t take = MIN(count - n, 512u - skip);
  		uint32_t lba = (uint32_t)(emmc_first_lba + pos / 512u);
  		if (buf_flags(bp) & B_READ) {
@@ -665,7 +683,7 @@ index 9ad7fd6..ecb7e7a 100644
  			if (skip || take != 512u) {
  				error = emmc_read_sector(lba, emmc_bounce);
  			}
-@@ -531,6 +968,8 @@ emmc_strategy(buf_t bp)
+@@ -531,6 +986,8 @@ emmc_strategy(buf_t bp)
  				memcpy(emmc_bounce + skip, vaddr + n, take);
  				error = emmc_write_sector(lba, emmc_bounce);
  			}
@@ -674,7 +692,7 @@ index 9ad7fd6..ecb7e7a 100644
  		}
  		if (error) {
  			break;
-@@ -596,6 +1035,7 @@ emmc_psize(__unused dev_t dev)
+@@ -596,6 +1053,7 @@ emmc_psize(__unused dev_t dev)
  	return emmc_ready ? (int)MIN(emmc_nsectors * 512u / emmc_secsize, INT_MAX) : -1;
  }
  
@@ -682,7 +700,7 @@ index 9ad7fd6..ecb7e7a 100644
  static int
  emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
  {
-@@ -609,12 +1049,15 @@ emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
+@@ -609,12 +1067,15 @@ emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
  	    minphys, uio, (int)emmc_secsize) : EROFS;
  }
  
@@ -698,7 +716,7 @@ index 9ad7fd6..ecb7e7a 100644
  static const struct cdevsw emmc_cdevsw = {
  	.d_open = emmc_open, .d_close = emmc_close, .d_read = emmc_read,
  	.d_write = emmc_write, .d_ioctl = emmc_ioctl, .d_stop = eno_stop,
-@@ -623,6 +1066,8 @@ static const struct cdevsw emmc_cdevsw = {
+@@ -623,6 +1084,8 @@ static const struct cdevsw emmc_cdevsw = {
  	.d_reserved_2 = eno_putc, .d_type = D_DISK,
  };
  
@@ -707,7 +725,7 @@ index 9ad7fd6..ecb7e7a 100644
  /* _cnputs may execute in any context. Keep this path free of locks and I/O. */
  void a5xelte_log_append(const char *c, int size);
  void
-@@ -647,6 +1092,46 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
+@@ -647,6 +1110,46 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
  	*total = os_atomic_load(&emmc_log_total, relaxed);
  }
  
@@ -754,7 +772,7 @@ index 9ad7fd6..ecb7e7a 100644
  struct a5_log_header {
  	char magic[8];
  	uint32_t version, size;
-@@ -752,4 +1237,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
+@@ -752,4 +1255,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
  	*dev = emmc_bdev;
  	return 0;
  }
