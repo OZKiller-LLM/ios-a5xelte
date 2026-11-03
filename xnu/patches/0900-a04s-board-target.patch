@@ -25,10 +25,10 @@ index a16d8e0..0e9f87d 100644
  bsd/dev/herolte_battery.c		standard
 diff --git a/bsd/dev/a04s_acpm.c b/bsd/dev/a04s_acpm.c
 new file mode 100644
-index 0000000..6214122
+index 0000000..c891d34
 --- /dev/null
 +++ b/bsd/dev/a04s_acpm.c
-@@ -0,0 +1,284 @@
+@@ -0,0 +1,305 @@
 +/*
 + * Galaxy A04s: ACPM, the mailbox protocol of the APM core, to the S2MPU12 PMIC and the
 + * AUD3004X codec on the same bus. A write there can change a supply voltage, so this file
@@ -98,7 +98,7 @@ index 0000000..6214122
 +
 +/* Shown by the heartbeat: the PMIC's revision, codec registers, and the guarded write test. */
 +static uint8_t acpm_pmic_rev, acpm_mic_bias, acpm_mic_gain;
-+static uint8_t acpm_codec[4];
++static uint8_t acpm_codec[4], acpm_otp[4], acpm_set_back;
 +static bool acpm_guard_ok, acpm_writes_ok;
 +static int acpm_write_test = -1;
 +static uint32_t acpm_refused;
@@ -289,16 +289,35 @@ index 0000000..6214122
 +	for (unsigned i = 0; i < 4 && !acpm_error; i++) {
 +		acpm_error = acpm_read(0x07, codec_regs[i], &acpm_codec[i]);
 +	}
-+	/* The write test puts back the value AUD3004X_34_AD_VOLL already holds, so nothing changes. */
++	/* Factory current-reference trims in the codec's OTP block: zero on a calibrated part is unlikely. */
++	static const uint8_t otp_regs[4] = { 0xA2, 0xA3, 0xA4, 0xA6 };  /* AUD3004X_2A2..2A6_CTRL_IREF */
++	for (unsigned i = 0; i < 4 && !acpm_error; i++) {
++		acpm_error = acpm_read(0x03, otp_regs[i], &acpm_otp[i]);
++	}
++	/*
++	 * The write test: AUD3004X_34_AD_VOLL, the digital volume of an ADC that is off, set to a
++	 * value it doesn't hold and read back, then its own value put back. A register that stores
++	 * what is written gives the new value; nothing behind the address gives the old one.
++	 */
 +	acpm_writes_ok = !acpm_error && want_writes == 1 && acpm_guard_ok;
 +	if (acpm_writes_ok) {
-+		uint8_t again = 0;
-+		acpm_write_test = acpm_write(0x07, 0x34, acpm_codec[2]);
++		uint8_t again = 0, probe = acpm_codec[2] ^ 0x5au;
++		acpm_write_test = acpm_write(0x07, 0x34, probe);
 +		if (!acpm_write_test) {
-+			acpm_write_test = acpm_read(0x07, 0x34, &again);
++			acpm_write_test = acpm_read(0x07, 0x34, &acpm_set_back);
 +		}
-+		if (!acpm_write_test && again != acpm_codec[2]) {
-+			acpm_write_test = EIO;
++		int restore = acpm_write(0x07, 0x34, acpm_codec[2]);
++		if (!restore) {
++			restore = acpm_read(0x07, 0x34, &again);
++		}
++		if (!restore && again != acpm_codec[2]) {
++			restore = EIO;
++		}
++		if (!acpm_write_test && acpm_set_back != probe) {
++			acpm_write_test = ENODEV;           /* written, not stored */
++		}
++		if (!acpm_write_test && restore) {
++			acpm_write_test = 100 + restore;    /* stored, not put back */
 +		}
 +	}
 +}
@@ -311,6 +330,8 @@ index 0000000..6214122
 +	kprintf("CODEC %02x %02x %02x %02x GUARD %s WR %s TEST %d REF %u\n", acpm_codec[0], acpm_codec[1],
 +	    acpm_codec[2], acpm_codec[3], acpm_guard_ok ? "OK" : "FAILED", acpm_writes_ok ? "ON" : "OFF",
 +	    acpm_write_test, acpm_refused);
++	kprintf("OTP %02x %02x %02x %02x SET %02x BACK %02x\n", acpm_otp[0], acpm_otp[1], acpm_otp[2], acpm_otp[3],
++	    (uint8_t)(acpm_codec[2] ^ 0x5au), acpm_set_back);
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_acpm_guard.h b/bsd/dev/a04s_acpm_guard.h
