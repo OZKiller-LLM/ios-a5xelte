@@ -1021,6 +1021,25 @@ index 76d70b9..552e163 100644
  #endif /* ARM64_BOARD_CONFIG_SWEET || ARM64_BOARD_CONFIG_A5XELTE */
  
  kern_return_t
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index ed7dccd..aad5a7b 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -761,6 +761,14 @@ fbcon_transmit_ready(void)
+ static void
+ fbcon_transmit_data(uint8_t c)
+ {
++#if defined(ARM64_BOARD_CONFIG_A04S)
++	extern int sweet_console_muted;        /* osfmk/console/serial_console.c */
++
++	/* kprintf draws here past the console mute: once iOS presents, only a panic draws. */
++	if (sweet_console_muted && !panic_active()) {
++		return;
++	}
++#endif
+ 	if (c == '\r') {
+ 		fbcon_col = 0;
+ 		return;
 diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
 index 8f9c8a2..22cef31 100644
 --- a/pexpert/pexpert/arm64/A5XELTE.h

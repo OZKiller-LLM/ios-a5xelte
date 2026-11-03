@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Build the stage 5c ADT for the Galaxy A04s (SM-A047F, Exynos 850).
+"""Build the stage 6a ADT for the Galaxy A04s (SM-A047F, Exynos 850).
 
-CPUs, memory, the GIC, the screen S-Boot leaves running and the eMMC host's registers,
-which the kernel uses read-only. It has no display service, GPU, touch or sensor nodes,
-so nothing can bind to them. Values come from this phone's live device tree and the
-boot probe.
+CPUs, memory, the GIC, the screen S-Boot leaves running, the eMMC host's registers and
+the iOS display service for that screen (CPU copies only, no display registers). It has
+no GPU, touch or sensor nodes, so nothing can bind to them. Values come from this phone's
+live device tree and the boot probe.
 """
 import argparse
 import os
@@ -52,8 +52,19 @@ def build(seed=None):
     chosen = child(root, 'chosen')
     set_prop(chosen, 'dram-base', mkadt.u64(DRAM_BASE))
     set_prop(chosen, 'dram-size', mkadt.u64(DRAM_SIZE))
-    set_prop(chosen, 'firmware-version', mkadt.cstr('a04s-stage5c'))
-    set_prop(chosen, 'system-firmware-version', mkadt.cstr('a04s-stage5c'))
+    set_prop(chosen, 'firmware-version', mkadt.cstr('a04s-stage6a'))
+    set_prop(chosen, 'system-firmware-version', mkadt.cstr('a04s-stage6a'))
+    # The A5-family display service presents the panel 1:1, so the screen is 720x1600 pixels,
+    # 360x800 points at @2x. No iPhone has that size, so UIKit draws its red placeholder status bar.
+    # The artwork values are the iPhone XR's, the @2x notched iPhone (as mkadt_herolte.py --scale2).
+    set_prop(chosen, 'display-scale', mkadt.u32(2))
+    product = child(root, 'product')
+    set_prop(product, 'artwork-device-subtype', mkadt.u32(1792))
+    set_prop(product, 'artwork-scale-factor', mkadt.u32(2))
+    # MobileGestalt derives the UDID from these; without them SpringBoard stays on the boot logo.
+    # Synthetic, locally administered addresses, not the phone's.
+    for name, last in (('wifi0', 1), ('bluetooth0', 2), ('ethernet0', 3)):
+        set_prop(chosen, f'mac-address-{name}', bytes((0x02, 0x41, 0x30, 0x34, 0x53, last)))
 
     # Two clusters of four: MPIDR 0..3 and 0x100..0x103. cpus=1 selects only the first.
     cpus = child(root, 'cpus')
@@ -97,6 +108,14 @@ def build(seed=None):
         ('interrupt-controller', mkadt.cstr('master')),
         ('virtual-timer-intid', mkadt.u32(27)),
         ('reg', mkadt.u64(GICD - SOC_BASE, GICD_SIZE, GICC - SOC_BASE, GICC_SIZE)),
+    ]))
+    # AppleCLCD (SweetFramebuffer.cpp) matches the compatible string. backboardd sizes its
+    # surfaces from the canvas, which must equal the panel here.
+    arm_io.children.append(mkadt.node('disp0', [
+        ('device_type', mkadt.cstr('display-subsystem')),
+        ('compatible', mkadt.cstr('samsung,a5xelte-display')),
+        ('canvas-width', mkadt.u32(FB_W)),
+        ('canvas-height', mkadt.u32(FB_H)),
     ]))
 
     root.children = [n for n in root.children if n.prop('name') not in
