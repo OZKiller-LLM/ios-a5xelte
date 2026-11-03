@@ -58,7 +58,7 @@ index 0000000..61653da
 +
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
-index 9ad7fd6..d2fc3fe 100644
+index 9ad7fd6..2b1bc5c 100644
 --- a/bsd/dev/a5xelte_emmc.c
 +++ b/bsd/dev/a5xelte_emmc.c
 @@ -7,6 +7,12 @@
@@ -196,7 +196,7 @@ index 9ad7fd6..d2fc3fe 100644
  
  static uint32_t
  emmc_le32(const uint8_t *p)
-@@ -326,6 +381,233 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
+@@ -326,6 +381,330 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
  	return crc;
  }
  
@@ -217,6 +217,101 @@ index 9ad7fd6..d2fc3fe 100644
 +static uint32_t a04s_header_crc, a04s_entries_crc, a04s_used, a04s_entries;
 +static uint32_t a04s_alternate, a04s_recovery_crc, a04s_kbps;
 +static bool a04s_mounted, a04s_read_only;
++
++/*
++ * After a write the card stays busy while it programs, at times for its own housekeeping too.
++ * A sector command sent then failed at once, and a failed page-in kills the process with
++ * SIGBUS: backboardd and SpringBoard, 2026-11-03. So wait for the card, and send a failed
++ * sector again. A read changes nothing, and a write puts the same data in the same place,
++ * through the same guard.
++ */
++#define A04S_CARD_WAIT_MS 2000u
++#define A04S_SECTOR_TRIES 4u
++
++static uint64_t a04s_busy_waits, a04s_retries;
++static uint32_t a04s_read_errors, a04s_write_errors;
++/* pexpert/arm/pe_serial.c draws kprintf past the console mute while this is set. */
++int a04s_console_urgent;
++
++static bool
++a04s_card_idle(void)
++{
++	if (!(emmc_rd(EMMC_STATUS) & (1u << 9))) {
++		return true;
++	}
++	a04s_busy_waits++;
++	uint64_t start = mach_absolute_time();
++	while (emmc_rd(EMMC_STATUS) & (1u << 9)) {
++		uint64_t waited = mach_absolute_time() - start;
++		if (waited > A04S_TICKS_PER_S / 1000u * A04S_CARD_WAIT_MS) {
++			return false;
++		}
++		/* Spin for the first millisecond, then let other threads run. */
++		if (waited > A04S_TICKS_PER_S / 1000u) {
++			IOSleep(1);
++		}
++	}
++	return true;
++}
++
++/* Storage trouble draws even over iOS: the first retries, then every failure. */
++static void
++a04s_storage_report(const char *what, int error, uint32_t lba)
++{
++	a04s_console_urgent = 1;
++	kprintf("A04S %s ERR %d LBA %u\n", what, error, lba);
++	kprintf("EMMC BUSY %llu RETRY %llu RERR %u WERR %u\n", a04s_busy_waits, a04s_retries,
++	    a04s_read_errors, a04s_write_errors);
++	a04s_console_urgent = 0;
++}
++
++static void
++a04s_count_retry(const char *what, int error, uint32_t lba)
++{
++	a04s_retries++;
++	if ((a04s_retries & (a04s_retries - 1)) == 0) {
++		a04s_storage_report(what, error, lba);
++	}
++}
++
++static int
++a04s_read_sector(uint32_t lba, uint8_t *sector)
++{
++	int error = 0;
++	for (unsigned attempt = 0; attempt < A04S_SECTOR_TRIES; attempt++) {
++		if (attempt) {
++			a04s_count_retry("READ RETRY", error, lba);
++		}
++		error = a04s_card_idle() ? emmc_read_sector(lba, sector) : EBUSY;
++		if (!error) {
++			return 0;
++		}
++	}
++	a04s_read_errors++;
++	a04s_storage_report("READ FAILED", error, lba);
++	return error;
++}
++
++#if A04S_EMMC_WRITES
++static int
++a04s_write_sector(uint32_t lba, const uint8_t *sector)
++{
++	int error = 0;
++	for (unsigned attempt = 0; attempt < A04S_SECTOR_TRIES; attempt++) {
++		if (attempt) {
++			a04s_count_retry("WRITE RETRY", error, lba);
++		}
++		error = a04s_card_idle() ? emmc_write_sector(lba, sector) : EBUSY;
++		/* A refusal is the guard's answer, and the same request gets the same one. */
++		if (!error || error == EROFS || error == ENXIO) {
++			return error;
++		}
++	}
++	a04s_write_errors++;
++	a04s_storage_report("WRITE FAILED", error, lba);
++	return error;
++}
++#endif
 +
 +static int
 +a04s_read_test(void)
@@ -380,6 +475,8 @@ index 9ad7fd6..d2fc3fe 100644
 +		IOSleep(5000);
 +		kprintf("A04S HB %u S READS %llu\n", seconds, a04s_reads);
 +		kprintf("WRITES %llu REFUSED %u\n", a04s_writes, a04s_writes_refused);
++		kprintf("EMMC BUSY %llu RETRY %llu RERR %u WERR %u\n", a04s_busy_waits, a04s_retries,
++		    a04s_read_errors, a04s_write_errors);
 +		kprintf("SVC %llu LAST %d ABORTS %llu\n", a04s_svc_count, a04s_last_svc, a04s_user_aborts);
 +		a04s_print_faults();
 +	}
@@ -430,7 +527,7 @@ index 9ad7fd6..d2fc3fe 100644
  static int
  emmc_find_root_partition(void)
  {
-@@ -434,6 +716,7 @@ emmc_find_root_partition(void)
+@@ -434,6 +813,7 @@ emmc_find_root_partition(void)
  	    emmc_writable ? "writable" : "read-only");
  	return 0;
  }
@@ -438,7 +535,7 @@ index 9ad7fd6..d2fc3fe 100644
  
  static int
  emmc_map_host(void)
-@@ -446,7 +729,7 @@ emmc_map_host(void)
+@@ -446,7 +826,7 @@ emmc_map_host(void)
  	}
  	if (SecureDTLookupEntry(NULL, "/a5xelte-emmc", &node) != kSuccess ||
  	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
@@ -447,7 +544,7 @@ index 9ad7fd6..d2fc3fe 100644
  		printf("A5XELTE eMMC: missing or unexpected ADT register window\n");
  		return ENXIO;
  	}
-@@ -464,9 +747,19 @@ emmc_map_host(void)
+@@ -464,9 +844,19 @@ emmc_map_host(void)
  void
  a5xelte_emmc_probe(void)
  {
@@ -467,7 +564,7 @@ index 9ad7fd6..d2fc3fe 100644
  }
  
  static int
-@@ -496,6 +789,9 @@ emmc_strategy(buf_t bp)
+@@ -496,6 +886,9 @@ emmc_strategy(buf_t bp)
  	if (!emmc_ready) {
  		error = ENXIO;
  	} else if (!(buf_flags(bp) & B_READ) && !emmc_writable) {
@@ -477,15 +574,15 @@ index 9ad7fd6..d2fc3fe 100644
  		error = EROFS;
  	} else if (buf_blkno(bp) < 0) {
  		error = EINVAL;
-@@ -520,17 +816,34 @@ emmc_strategy(buf_t bp)
+@@ -519,11 +912,31 @@ emmc_strategy(buf_t bp)
+ 		uint32_t take = MIN(count - n, 512u - skip);
  		uint32_t lba = (uint32_t)(emmc_first_lba + pos / 512u);
  		if (buf_flags(bp) & B_READ) {
- 			error = emmc_read_sector(lba, emmc_bounce);
 +#if defined(ARM64_BOARD_CONFIG_A04S)
++			error = a04s_read_sector(lba, emmc_bounce);
 +			a04s_reads++;
-+			if (error) {
-+				kprintf("A04S READ ERROR %d LBA %u\n", error, lba);
-+			}
++#else
+ 			error = emmc_read_sector(lba, emmc_bounce);
 +#endif
  			if (!error) {
  				memcpy(vaddr + n, emmc_bounce + skip, take);
@@ -494,25 +591,31 @@ index 9ad7fd6..d2fc3fe 100644
 +#if defined(ARM64_BOARD_CONFIG_A04S) && !A04S_EMMC_WRITES
 +			error = EROFS;
 +#else
++#if defined(ARM64_BOARD_CONFIG_A04S)
++			if (skip || take != 512u) {
++				error = a04s_read_sector(lba, emmc_bounce);
++			}
++			if (!error) {
++				memcpy(emmc_bounce + skip, vaddr + n, take);
++				error = a04s_write_sector(lba, emmc_bounce);
++				if (!error) {
++					a04s_writes++;
++				}
++			}
++#else
  			if (skip || take != 512u) {
  				error = emmc_read_sector(lba, emmc_bounce);
  			}
- 			if (!error) {
+@@ -531,6 +944,8 @@ emmc_strategy(buf_t bp)
  				memcpy(emmc_bounce + skip, vaddr + n, take);
  				error = emmc_write_sector(lba, emmc_bounce);
-+#if defined(ARM64_BOARD_CONFIG_A04S)
-+				if (error) {
-+					kprintf("A04S WRITE ERROR %d LBA %u\n", error, lba);
-+				} else {
-+					a04s_writes++;
-+				}
-+#endif
  			}
++#endif
 +#endif
  		}
  		if (error) {
  			break;
-@@ -596,6 +909,7 @@ emmc_psize(__unused dev_t dev)
+@@ -596,6 +1011,7 @@ emmc_psize(__unused dev_t dev)
  	return emmc_ready ? (int)MIN(emmc_nsectors * 512u / emmc_secsize, INT_MAX) : -1;
  }
  
@@ -520,7 +623,7 @@ index 9ad7fd6..d2fc3fe 100644
  static int
  emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
  {
-@@ -609,12 +923,15 @@ emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
+@@ -609,12 +1025,15 @@ emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
  	    minphys, uio, (int)emmc_secsize) : EROFS;
  }
  
@@ -536,7 +639,7 @@ index 9ad7fd6..d2fc3fe 100644
  static const struct cdevsw emmc_cdevsw = {
  	.d_open = emmc_open, .d_close = emmc_close, .d_read = emmc_read,
  	.d_write = emmc_write, .d_ioctl = emmc_ioctl, .d_stop = eno_stop,
-@@ -623,6 +940,8 @@ static const struct cdevsw emmc_cdevsw = {
+@@ -623,6 +1042,8 @@ static const struct cdevsw emmc_cdevsw = {
  	.d_reserved_2 = eno_putc, .d_type = D_DISK,
  };
  
@@ -545,7 +648,7 @@ index 9ad7fd6..d2fc3fe 100644
  /* _cnputs may execute in any context. Keep this path free of locks and I/O. */
  void a5xelte_log_append(const char *c, int size);
  void
-@@ -647,6 +966,46 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
+@@ -647,6 +1068,46 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
  	*total = os_atomic_load(&emmc_log_total, relaxed);
  }
  
@@ -592,7 +695,7 @@ index 9ad7fd6..d2fc3fe 100644
  struct a5_log_header {
  	char magic[8];
  	uint32_t version, size;
-@@ -752,4 +1111,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
+@@ -752,4 +1213,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
  	*dev = emmc_bdev;
  	return 0;
  }
@@ -1022,18 +1125,19 @@ index 76d70b9..552e163 100644
  
  kern_return_t
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
-index ed7dccd..aad5a7b 100644
+index ed7dccd..16e7ce6 100644
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -761,6 +761,14 @@ fbcon_transmit_ready(void)
+@@ -761,6 +761,15 @@ fbcon_transmit_ready(void)
  static void
  fbcon_transmit_data(uint8_t c)
  {
 +#if defined(ARM64_BOARD_CONFIG_A04S)
 +	extern int sweet_console_muted;        /* osfmk/console/serial_console.c */
++	extern int a04s_console_urgent;        /* bsd/dev/a5xelte_emmc.c */
 +
-+	/* kprintf draws here past the console mute: once iOS presents, only a panic draws. */
-+	if (sweet_console_muted && !panic_active()) {
++	/* kprintf draws here past the console mute: once iOS presents, only a panic or storage trouble draws. */
++	if (sweet_console_muted && !panic_active() && !a04s_console_urgent) {
 +		return;
 +	}
 +#endif
