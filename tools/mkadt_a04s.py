@@ -19,6 +19,9 @@ DRAM_BASE, DRAM_SIZE = 0x92000000, 0x2A000000
 GICD, GICD_SIZE = 0x12a01000, 0x1000
 GICC, GICC_SIZE = 0x12a02000, 0x2000
 FB, FB_W, FB_H = 0xfa000000, 720, 1600
+# The screen iOS is given: the iPhone X's 375x812 points at @2x. The kernel shows its centered
+# 720x1600, 15 pixels in from each side and 12 from the top and bottom.
+CANVAS_W, CANVAS_H = 750, 1624
 EMMC, EMMC_SIZE = 0x12100000, 0x2000
 TIMEBASE = 26000000
 CPU_HZ = 2000000000
@@ -52,14 +55,13 @@ def build(seed=None):
     chosen = child(root, 'chosen')
     set_prop(chosen, 'dram-base', mkadt.u64(DRAM_BASE))
     set_prop(chosen, 'dram-size', mkadt.u64(DRAM_SIZE))
-    set_prop(chosen, 'firmware-version', mkadt.cstr('a04s-stage6a'))
-    set_prop(chosen, 'system-firmware-version', mkadt.cstr('a04s-stage6a'))
-    # The A5-family display service presents the panel 1:1, so the screen is 720x1600 pixels,
-    # 360x800 points at @2x. No iPhone has that size, so UIKit draws its red placeholder status bar.
-    # The artwork values are the iPhone XR's, the @2x notched iPhone (as mkadt_herolte.py --scale2).
+    set_prop(chosen, 'firmware-version', mkadt.cstr('a04s-stage6a-3'))
+    set_prop(chosen, 'system-firmware-version', mkadt.cstr('a04s-stage6a-3'))
+    # The panel's own 360x800 points match no iPhone, and UIKit draws a red placeholder status
+    # bar for them. 375x812 points are the iPhone X's; the artwork is the iPhone X's, at @2x.
     set_prop(chosen, 'display-scale', mkadt.u32(2))
     product = child(root, 'product')
-    set_prop(product, 'artwork-device-subtype', mkadt.u32(1792))
+    set_prop(product, 'artwork-device-subtype', mkadt.u32(2436))
     set_prop(product, 'artwork-scale-factor', mkadt.u32(2))
     # MobileGestalt derives the UDID from these; without them SpringBoard stays on the boot logo.
     # Synthetic, locally administered addresses, not the phone's.
@@ -110,12 +112,12 @@ def build(seed=None):
         ('reg', mkadt.u64(GICD - SOC_BASE, GICD_SIZE, GICC - SOC_BASE, GICC_SIZE)),
     ]))
     # AppleCLCD (SweetFramebuffer.cpp) matches the compatible string. backboardd sizes its
-    # surfaces from the canvas, which must equal the panel here.
+    # surfaces from the canvas, and the A04S kernel presents the canvas it finds here.
     arm_io.children.append(mkadt.node('disp0', [
         ('device_type', mkadt.cstr('display-subsystem')),
         ('compatible', mkadt.cstr('samsung,a5xelte-display')),
-        ('canvas-width', mkadt.u32(FB_W)),
-        ('canvas-height', mkadt.u32(FB_H)),
+        ('canvas-width', mkadt.u32(CANVAS_W)),
+        ('canvas-height', mkadt.u32(CANVAS_H)),
     ]))
 
     root.children = [n for n in root.children if n.prop('name') not in

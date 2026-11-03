@@ -925,6 +925,123 @@ index 0000000..e3b8eb3
 +
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f1e25f9..c4cb21e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -267,6 +267,22 @@ AppleCLCD::start(IOService *provider)
+ 		PE_parse_boot_argn("sweetfb_gpu", &gpu, sizeof(gpu));
+ 		fGpu = gpu != 0;
+ 	}
++#elif defined(ARM64_BOARD_CONFIG_A04S)
++	/* An ADT canvas a little larger than the panel is presented, and its centered part
++	 * shown: 750x1624 loses 15 pixels at each side and 12 at the top and bottom. */
++	{
++		OSData *cw = OSDynamicCast(OSData, provider->getProperty("canvas-width"));
++		OSData *ch = OSDynamicCast(OSData, provider->getProperty("canvas-height"));
++		uint32_t cwv = 0, chv = 0;
++		if (cw != NULL && ch != NULL && cw->getLength() == 4 && ch->getLength() == 4) {
++			memcpy(&cwv, cw->getBytesNoCopy(), 4);
++			memcpy(&chv, ch->getBytesNoCopy(), 4);
++		}
++		if (cwv >= fWidth && chv >= fHeight && cwv <= fWidth + 64 && chv <= fHeight + 64) {
++			fLogicalW = cwv;
++			fLogicalH = chv;
++		}
++	}
+ #elif !defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+@@ -288,6 +304,16 @@ AppleCLCD::start(IOService *provider)
+ 		SweetSurface *panel = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 		fPixels = panel != NULL ? panel->kernelAddress() : 0;
+ 	} else
++#endif
++#if defined(ARM64_BOARD_CONFIG_A04S)
++	/* Larger than the panel, the default surface has its own memory, and present() copies
++	 * it like any other surface. */
++	if (fLogicalW != fWidth || fLogicalH != fHeight) {
++		fSurface = sweet_surface_create_kernel(fLogicalW, fLogicalH, (fLogicalW * 4 + 63) & ~63u,
++		    SWEET_FB_FORMAT_BGRA);
++		SweetSurface *panel = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
++		fPixels = panel != NULL ? panel->kernelAddress() : 0;
++	} else
+ #endif
+ 	{
+ 		fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -820,7 +846,12 @@ AppleCLCD::present(const uint8_t *rec)
+ 			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
++#if defined(ARM64_BOARD_CONFIG_A04S)
++		/* Only the panel itself needs no copy. */
++		if (s == NULL || (s == fSurface && !fScaled && fLogicalW == fWidth && fLogicalH == fHeight)) {
++#else
+ 		if (s == NULL || (s == fSurface && !fScaled)) {
++#endif
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index aba42b4..c323b4e 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -251,6 +251,39 @@ sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+ 	return s;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_A04S)
++SweetSurface *
++sweet_surface_create_kernel(uint32_t width, uint32_t height, uint32_t bytesPerRow,
++    uint32_t pixelFormat)
++{
++	SweetSurface *s = sweet_surface_alloc();
++	if (s == NULL) {
++		return NULL;
++	}
++	s->width = width;
++	s->height = height;
++	s->bytesPerRow = bytesPerRow;
++	s->bytesPerElement = 4;
++	s->elementWidth = s->elementHeight = 1;
++	s->pixelFormat = pixelFormat;
++	s->allocSize = (uint32_t)round_page(bytesPerRow * height);
++	IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++	if (mem != NULL) {
++		bzero(mem->getBytesNoCopy(), s->allocSize);
++		/* free() takes this off the wired total, as for a client's surface. */
++		OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++	}
++	s->memory = mem;
++	s->mapCache = kIOMapDefaultCache;
++	if (s->memory == NULL || !sweet_surface_publish(s)) {
++		s->release();
++		return NULL;
++	}
++	return s;
++}
++#endif
++
+ mach_port_name_t
+ sweet_surface_port_in_task(SweetSurface *s, task_t task)
+ {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..679b0ba 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -57,6 +57,11 @@ SweetSurface *sweet_surface_copy(uint32_t id);
+  */
+ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
++#if defined(ARM64_BOARD_CONFIG_A04S)
++/* A surface in ordinary kernel memory: a default surface larger than the panel. */
++SweetSurface *sweet_surface_create_kernel(uint32_t width, uint32_t height,
++    uint32_t bytesPerRow, uint32_t pixelFormat);
++#endif
+ 
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
 diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
 index d1099ff..a1349e4 100644
 --- a/iokit/KernelConfigTables.cpp
