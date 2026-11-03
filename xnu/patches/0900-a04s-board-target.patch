@@ -25,14 +25,16 @@ index a16d8e0..0e9f87d 100644
  bsd/dev/herolte_battery.c		standard
 diff --git a/bsd/dev/a04s_acpm.c b/bsd/dev/a04s_acpm.c
 new file mode 100644
-index 0000000..eb0d679
+index 0000000..6214122
 --- /dev/null
 +++ b/bsd/dev/a04s_acpm.c
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,284 @@
 +/*
-+ * Galaxy A04s: reads over ACPM, the mailbox protocol of the APM core, from the S2MPU12 PMIC
-+ * and the AUD3004X codec on the same bus. A write there can change a supply voltage, so this
-+ * stage builds read commands only, and tools/check_acpm_source.py refuses anything else.
++ * Galaxy A04s: ACPM, the mailbox protocol of the APM core, to the S2MPU12 PMIC and the
++ * AUD3004X codec on the same bus. A write there can change a supply voltage, so this file
++ * builds reads, and single-register writes that a04s_acpm_guard.h allows: the codec's capture
++ * path, and nothing on the PMIC. tools/check_acpm_source.py refuses anything else, and
++ * tools/check_kernel_acpm.py checks the guard's table in the built kernel.
 + * The protocol follows Samsung's drivers/soc/samsung/acpm (acpm_ipc.c, acpm_mfd.c).
 + */
 +#if defined(ARM64_BOARD_CONFIG_A04S)
@@ -43,11 +45,12 @@ index 0000000..eb0d679
 +#include <kern/locks.h>
 +#include <pexpert/pexpert.h>
 +#include <libkern/libkern.h>
++#include "a04s_acpm_guard.h"
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern uint64_t mach_absolute_time(void);
 +
-+#define ACPM_MBOX_PA            0x11900000u     /* acpm_ipc reg 0 */
++#define ACPM_MBOX_PA           0x11900000u     /* acpm_ipc reg 0 */
 +#define ACPM_MBOX_SIZE          0x1000u
 +#define ACPM_SRAM_PA            0x02039000u     /* acpm_ipc reg 1 */
 +#define ACPM_SRAM_SIZE          0x30000u
@@ -79,7 +82,8 @@ index 0000000..eb0d679
 +
 +/* cmd[0]: register, bus address, bus channel, sequence. cmd[1]: function, then the reply. */
 +#define ACPM_SEQ_SHIFT          16
-+#define ACPM_FUNC_READ          0u              /* acpm_mfd.h FUNC_READ, the only function built */
++#define ACPM_FUNC_READ          0u              /* acpm_mfd.h FUNC_READ */
++#define ACPM_FUNC_WRITE         1u              /* acpm_mfd.h FUNC_WRITE: built in acpm_write() alone */
 +#define ACPM_DEST(word)         (((word) >> 8) & 0xffu)
 +#define ACPM_RETURN(word)       (((word) >> 24) & 0xffu)
 +
@@ -92,8 +96,12 @@ index 0000000..eb0d679
 +static struct a04s_acpm_queue acpm_in, acpm_out;
 +static int acpm_error = -1;
 +
-+/* What 6b-1 reads, shown by the heartbeat: the PMIC's revision and two codec mic registers. */
++/* Shown by the heartbeat: the PMIC's revision, codec registers, and the guarded write test. */
 +static uint8_t acpm_pmic_rev, acpm_mic_bias, acpm_mic_gain;
++static uint8_t acpm_codec[4];
++static bool acpm_guard_ok, acpm_writes_ok;
++static int acpm_write_test = -1;
++static uint32_t acpm_refused;
 +
 +static inline uint32_t
 +sram_rd(uint32_t off)
@@ -165,7 +173,7 @@ index 0000000..eb0d679
 +}
 +
 +/* Queue one command, ring the APM, and wait for the reply with the same sequence number. */
-+static int
++static int __attribute__((noinline))
 +acpm_transfer(uint32_t cmd[4])
 +{
 +	uint32_t front = sram_rd(acpm_in.front), next = (front + 1) % acpm_len;
@@ -217,8 +225,8 @@ index 0000000..eb0d679
 +	}
 +}
 +
-+/* One register from a device on the PMIC's bus. The only kind of command this file builds. */
-+static int
++/* One register from a device on the PMIC's bus. */
++static int __attribute__((noinline))
 +acpm_read(uint32_t bus_addr, uint32_t reg, uint8_t *value)
 +{
 +	uint32_t cmd[4] = { 0 };
@@ -235,11 +243,37 @@ index 0000000..eb0d679
 +	return 0;
 +}
 +
++/* One codec register, if a04s_acpm_guard.h allows it. The only write this file builds. */
++static int __attribute__((noinline))
++acpm_write(uint32_t bus_addr, uint32_t reg, uint8_t value)
++{
++	if (!acpm_writes_ok || !a04s_acpm_write_allowed(bus_addr, reg)) {
++		acpm_refused++;
++		return EPERM;
++	}
++	uint32_t cmd[4] = { 0 };
++	cmd[0] = (reg & 0xffu) | ((bus_addr & 0xfu) << 8);
++	cmd[1] = ACPM_FUNC_WRITE | ((uint32_t)value << 8);
++	/* The APM takes the bus address and register from cmd[0] alone: check what it holds. */
++	if (!a04s_acpm_write_allowed((cmd[0] >> 8) & 0xfu, cmd[0] & 0xffu)) {
++		acpm_refused++;
++		return EPERM;
++	}
++	int error = acpm_transfer(cmd);
++	if (error) {
++		return error;
++	}
++	return ACPM_RETURN(cmd[1]) ? EIO : 0;
++}
++
 +/* The registers Samsung's own drivers read first: s2mpu12-core.c, then aud3004x.c. */
 +void a04s_acpm_probe(void);
 +void
 +a04s_acpm_probe(void)
 +{
++	acpm_guard_ok = a04s_acpm_guard_self_test();
++	int want_writes = 0;
++	(void)PE_parse_boot_argn("acpmwrite", &want_writes, sizeof(want_writes));
 +	acpm_error = acpm_setup();
 +	if (!acpm_error) {
 +		acpm_error = acpm_read(0x00, 0x04, &acpm_pmic_rev);     /* S2MPU12_PMIC_CHIPID */
@@ -250,16 +284,84 @@ index 0000000..eb0d679
 +	if (!acpm_error) {
 +		acpm_error = acpm_read(0x08, 0x34, &acpm_mic_gain);     /* AUD3004X_134_VOL_AD1 */
 +	}
++	/* Digital-block settings Android left: not all zero means the codec itself answers. */
++	static const uint8_t codec_regs[4] = { 0x16, 0x20, 0x34, 0x37 };
++	for (unsigned i = 0; i < 4 && !acpm_error; i++) {
++		acpm_error = acpm_read(0x07, codec_regs[i], &acpm_codec[i]);
++	}
++	/* The write test puts back the value AUD3004X_34_AD_VOLL already holds, so nothing changes. */
++	acpm_writes_ok = !acpm_error && want_writes == 1 && acpm_guard_ok;
++	if (acpm_writes_ok) {
++		uint8_t again = 0;
++		acpm_write_test = acpm_write(0x07, 0x34, acpm_codec[2]);
++		if (!acpm_write_test) {
++			acpm_write_test = acpm_read(0x07, 0x34, &again);
++		}
++		if (!acpm_write_test && again != acpm_codec[2]) {
++			acpm_write_test = EIO;
++		}
++	}
 +}
 +
 +void a04s_acpm_report(void);
 +void
 +a04s_acpm_report(void)
 +{
-+	kprintf("ACPM ERR %d LEN %u ELEM %u PMIC %02x MIC %02x %02x\n", acpm_error, acpm_len, acpm_elem,
-+	    acpm_pmic_rev, acpm_mic_bias, acpm_mic_gain);
++	kprintf("ACPM ERR %d PMIC %02x MIC %02x %02x\n", acpm_error, acpm_pmic_rev, acpm_mic_bias, acpm_mic_gain);
++	kprintf("CODEC %02x %02x %02x %02x GUARD %s WR %s TEST %d REF %u\n", acpm_codec[0], acpm_codec[1],
++	    acpm_codec[2], acpm_codec[3], acpm_guard_ok ? "OK" : "FAILED", acpm_writes_ok ? "ON" : "OFF",
++	    acpm_write_test, acpm_refused);
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
+diff --git a/bsd/dev/a04s_acpm_guard.h b/bsd/dev/a04s_acpm_guard.h
+new file mode 100644
+index 0000000..6b07ccc
+--- /dev/null
++++ b/bsd/dev/a04s_acpm_guard.h
+@@ -0,0 +1,43 @@
++/*
++ * Galaxy A04s: the only registers a kernel may write over ACPM. The same bus carries the
++ * S2MPU12 PMIC's regulators: its top and PMIC pages (bus addresses 0x00 and 0x01) set supply
++ * voltages, and none of them is here, nor its RTC (0x02), the codec's OTP fuses (0x03) or its
++ * trims (0x0F). Only the AUD3004X's capture path, on its digital (0x07) and analog (0x08)
++ * blocks. One bit per register, so tools/check_kernel_acpm.py can read the table out of a
++ * built kernel and check every bit. Generated with the port patch; edit the list there.
++ * The caller provides uint32_t and bool.
++ */
++#ifndef A04S_ACPM_GUARD_H
++#define A04S_ACPM_GUARD_H
++
++/* [bus address][register / 32], bit register % 32. */
++const uint32_t a04s_acpm_writable[16][8] __attribute__((used)) = {
++	/* 0x07: 10 CLKGATE0, 11 CLKGATE1, 12 CLKGATE2, 14 RESETB0, 16 CLK_MODE_SEL, 18 PWAUTO_AD, 1E CHOP1, 1F CHOP2, 20 IF_FORM1, 21 IF_FORM2, 22 IF_FORM3, 23 IF_FORM4, 24 IF_FORM5, 29 IF_FORM6, 30 ADC1, 31 ADC2, 32 ADC3, 33 ADC4, 34 AD_VOLL, 35 AD_VOLR, 37 AD_HPF, C5 ACTR_MCB3, C6 ACTR_MCB4 */
++	[0x07] = { 0xc1570000u, 0x00bf021fu, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000060u, 0x00000000u },
++	/* 0x08: 02 CLK3_COD, 06 DSM_AD, 07 LPF_AD, 10 PD_REF, 11 PD_AD1, 12 PD_AD2, 13 PD_AD3, 17 CTRL_REF, 30 MIX_AD1, 34 VOL_AD1, 35 VOL_AD2, 36 VOL_AD3 */
++	[0x08] = { 0x008f00c4u, 0x00710000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u },
++};
++
++static inline bool
++a04s_acpm_write_allowed(uint32_t bus, uint32_t reg)
++{
++	return bus < 16 && reg < 256 && ((a04s_acpm_writable[bus][reg / 32] >> (reg % 32)) & 1u);
++}
++
++/* Every register on the PMIC, RTC, OTP and trim pages refused, and the test write allowed. */
++static inline bool
++a04s_acpm_guard_self_test(void)
++{
++	static const uint32_t refused_buses[] = { 0x00, 0x01, 0x02, 0x03, 0x0F };
++	for (unsigned i = 0; i < sizeof(refused_buses) / sizeof(refused_buses[0]); i++) {
++		for (uint32_t reg = 0; reg < 256; reg++) {
++			if (a04s_acpm_write_allowed(refused_buses[i], reg)) {
++				return false;
++			}
++		}
++	}
++	return a04s_acpm_write_allowed(0x07, 0x34) && !a04s_acpm_write_allowed(0x08, 0x50) &&
++	       !a04s_acpm_write_allowed(0x17, 0x34) && !a04s_acpm_write_allowed(0x07, 0x100);
++}
++
++#endif /* A04S_ACPM_GUARD_H */
 diff --git a/bsd/dev/a04s_emmc_guard.h b/bsd/dev/a04s_emmc_guard.h
 new file mode 100644
 index 0000000..61653da
