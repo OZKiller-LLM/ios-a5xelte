@@ -25,10 +25,10 @@ index a16d8e0..0e9f87d 100644
  bsd/dev/herolte_battery.c		standard
 diff --git a/bsd/dev/a04s_acpm.c b/bsd/dev/a04s_acpm.c
 new file mode 100644
-index 0000000..c891d34
+index 0000000..e9ac908
 --- /dev/null
 +++ b/bsd/dev/a04s_acpm.c
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,323 @@
 +/*
 + * Galaxy A04s: ACPM, the mailbox protocol of the APM core, to the S2MPU12 PMIC and the
 + * AUD3004X codec on the same bus. A write there can change a supply voltage, so this file
@@ -98,7 +98,12 @@ index 0000000..c891d34
 +
 +/* Shown by the heartbeat: the PMIC's revision, codec registers, and the guarded write test. */
 +static uint8_t acpm_pmic_rev, acpm_mic_bias, acpm_mic_gain;
-+static uint8_t acpm_codec[4], acpm_otp[4], acpm_set_back;
++static uint8_t acpm_codec[4], acpm_otp[4], acpm_set_back, acpm_ldo33, acpm_ldo34;
++/* pd-aud@11862080 in the always-on PMU: readable whether the audio block is powered or not. */
++#define PD_AUD_PA               0x11862000u
++#define PD_AUD_CONFIG           0x080u
++#define PD_AUD_STATUS           0x084u
++static uint32_t pd_aud_config, pd_aud_status;
 +static bool acpm_guard_ok, acpm_writes_ok;
 +static int acpm_write_test = -1;
 +static uint32_t acpm_refused;
@@ -289,6 +294,18 @@ index 0000000..c891d34
 +	for (unsigned i = 0; i < 4 && !acpm_error; i++) {
 +		acpm_error = acpm_read(0x07, codec_regs[i], &acpm_codec[i]);
 +	}
++	/* The codec's supplies, vdd_aldo1 and vdd_aldo2: enable bits 7:6, voltage 5:0. Reads only. */
++	if (!acpm_error) {
++		acpm_error = acpm_read(0x01, 0x4B, &acpm_ldo33);        /* S2MPU12_PMIC_L33CTRL */
++	}
++	if (!acpm_error) {
++		acpm_error = acpm_read(0x01, 0x4C, &acpm_ldo34);        /* S2MPU12_PMIC_L34CTRL */
++	}
++	vm_offset_t pmu = ml_io_map(PD_AUD_PA, 0x1000);
++	if (pmu) {
++		pd_aud_config = *(volatile uint32_t *)(pmu + PD_AUD_CONFIG);
++		pd_aud_status = *(volatile uint32_t *)(pmu + PD_AUD_STATUS);
++	}
 +	/* Factory current-reference trims in the codec's OTP block: zero on a calibrated part is unlikely. */
 +	static const uint8_t otp_regs[4] = { 0xA2, 0xA3, 0xA4, 0xA6 };  /* AUD3004X_2A2..2A6_CTRL_IREF */
 +	for (unsigned i = 0; i < 4 && !acpm_error; i++) {
@@ -332,6 +349,7 @@ index 0000000..c891d34
 +	    acpm_write_test, acpm_refused);
 +	kprintf("OTP %02x %02x %02x %02x SET %02x BACK %02x\n", acpm_otp[0], acpm_otp[1], acpm_otp[2], acpm_otp[3],
 +	    (uint8_t)(acpm_codec[2] ^ 0x5au), acpm_set_back);
++	kprintf("LDO33 %02x LDO34 %02x PDAUD %x %x\n", acpm_ldo33, acpm_ldo34, pd_aud_config, pd_aud_status);
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_acpm_guard.h b/bsd/dev/a04s_acpm_guard.h
