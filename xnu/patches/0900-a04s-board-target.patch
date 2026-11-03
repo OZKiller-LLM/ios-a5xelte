@@ -926,16 +926,16 @@ index 0000000..e3b8eb3
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index f1e25f9..c4cb21e 100644
+index f1e25f9..b794b60 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -267,6 +267,22 @@ AppleCLCD::start(IOService *provider)
+@@ -267,6 +267,23 @@ AppleCLCD::start(IOService *provider)
  		PE_parse_boot_argn("sweetfb_gpu", &gpu, sizeof(gpu));
  		fGpu = gpu != 0;
  	}
 +#elif defined(ARM64_BOARD_CONFIG_A04S)
-+	/* An ADT canvas a little larger than the panel is presented, and its centered part
-+	 * shown: 750x1624 loses 15 pixels at each side and 12 at the top and bottom. */
++	/* A larger ADT canvas is presented instead of the panel. Up to 64 pixels larger, its
++	 * centered part is shown; beyond that, scaledCopy() fits it to the panel (nearest). */
 +	{
 +		OSData *cw = OSDynamicCast(OSData, provider->getProperty("canvas-width"));
 +		OSData *ch = OSDynamicCast(OSData, provider->getProperty("canvas-height"));
@@ -944,15 +944,16 @@ index f1e25f9..c4cb21e 100644
 +			memcpy(&cwv, cw->getBytesNoCopy(), 4);
 +			memcpy(&chv, ch->getBytesNoCopy(), 4);
 +		}
-+		if (cwv >= fWidth && chv >= fHeight && cwv <= fWidth + 64 && chv <= fHeight + 64) {
++		if (cwv >= fWidth && chv >= fHeight && cwv <= 2 * fWidth && chv <= 2 * fHeight) {
 +			fLogicalW = cwv;
 +			fLogicalH = chv;
++			fScaled = cwv > fWidth + 64 || chv > fHeight + 64;
 +		}
 +	}
  #elif !defined(ARM64_BOARD_CONFIG_A5XELTE)
  	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
  		fLogicalW = SWEET_FB_LOGICAL_W;
-@@ -288,6 +304,16 @@ AppleCLCD::start(IOService *provider)
+@@ -288,6 +305,16 @@ AppleCLCD::start(IOService *provider)
  		SweetSurface *panel = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
  		fPixels = panel != NULL ? panel->kernelAddress() : 0;
  	} else
@@ -969,7 +970,7 @@ index f1e25f9..c4cb21e 100644
  #endif
  	{
  		fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
-@@ -820,7 +846,12 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -820,7 +847,12 @@ AppleCLCD::present(const uint8_t *rec)
  			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
  			    get32(a, 12), dx, dy, w, h);
  		}

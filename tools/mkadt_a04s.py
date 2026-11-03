@@ -19,9 +19,9 @@ DRAM_BASE, DRAM_SIZE = 0x92000000, 0x2A000000
 GICD, GICD_SIZE = 0x12a01000, 0x1000
 GICC, GICC_SIZE = 0x12a02000, 0x2000
 FB, FB_W, FB_H = 0xfa000000, 720, 1600
-# The screen iOS is given: the iPhone X's 375x812 points at @2x. The kernel shows its centered
-# 720x1600, 15 pixels in from each side and 12 from the top and bottom.
-CANVAS_W, CANVAS_H = 750, 1624
+# The screen iOS is given: the iPhone XR's, 414x896 points at @2x. The kernel scales it to the
+# panel, x0.870 across and x0.893 down (nearest), so it is 2.7% taller than it should be.
+CANVAS_W, CANVAS_H = 828, 1792
 EMMC, EMMC_SIZE = 0x12100000, 0x2000
 TIMEBASE = 26000000
 CPU_HZ = 2000000000
@@ -55,13 +55,14 @@ def build(seed=None):
     chosen = child(root, 'chosen')
     set_prop(chosen, 'dram-base', mkadt.u64(DRAM_BASE))
     set_prop(chosen, 'dram-size', mkadt.u64(DRAM_SIZE))
-    set_prop(chosen, 'firmware-version', mkadt.cstr('a04s-stage6a-3'))
-    set_prop(chosen, 'system-firmware-version', mkadt.cstr('a04s-stage6a-3'))
-    # The panel's own 360x800 points match no iPhone, and UIKit draws a red placeholder status
-    # bar for them. 375x812 points are the iPhone X's; the artwork is the iPhone X's, at @2x.
+    set_prop(chosen, 'firmware-version', mkadt.cstr('a04s-stage6a-4'))
+    set_prop(chosen, 'system-firmware-version', mkadt.cstr('a04s-stage6a-4'))
+    # UIKit picks its status bar by pixel width and notch, and draws a red placeholder for the
+    # panel's 720 pixels (and for 750). The canvas and artwork are the iPhone XR's, the @2x
+    # notched iPhone, as mkadt_herolte.py --scale2.
     set_prop(chosen, 'display-scale', mkadt.u32(2))
     product = child(root, 'product')
-    set_prop(product, 'artwork-device-subtype', mkadt.u32(2436))
+    set_prop(product, 'artwork-device-subtype', mkadt.u32(1792))
     set_prop(product, 'artwork-scale-factor', mkadt.u32(2))
     # MobileGestalt derives the UDID from these; without them SpringBoard stays on the boot logo.
     # Synthetic, locally administered addresses, not the phone's.
