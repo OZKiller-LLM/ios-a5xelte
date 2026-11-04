@@ -20,6 +20,7 @@ on:
         default: ""
   push:
     branches: [main, herolte, a04s, codex/a5xelte-bringup]
+    # A push that touches either path builds the kernel.
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
