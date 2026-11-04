@@ -481,10 +481,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_input.c b/bsd/dev/a04s_input.c
 new file mode 100644
-index 0000000..58c9af9
+index 0000000..3c38fe3
 --- /dev/null
 +++ b/bsd/dev/a04s_input.c
-@@ -0,0 +1,1110 @@
+@@ -0,0 +1,1297 @@
 +/*
 + * Galaxy A04s, stage 7: the keys (7b), and read-only first looks at the touch path (7a-1) and
 + * the GPU's power domain (7c-1).
@@ -525,6 +525,13 @@ index 0000000..58c9af9
 + * says where. Before a byte goes to the chip, its size, SHA-256 (the csot file, the one panel ID 6
 + * selects), end flag, version check byte and every partition's range are checked.
 + *
++ * Touch, 7a-4: with tptouch=1 as well, once the firmware is running, the same thread reads touch
++ * frames as nvt_ts_work_func() does, from EVENT_BUF_ADDR. It checks the interrupt pin (GPA0-0, low
++ * when a frame is ready) every 8 ms, and reads a frame every 24 ms anyway until that pin has been
++ * seen to toggle. A frame is read in two transfers that each fit the 64-byte FIFO, and is used only
++ * if Samsung's point-data checksum (byte 65 over bytes 1-64) matches. Up to 10 slots go to
++ * sweet_hid_touch(); a finger missing from a frame is lifted.
++ *
 + * All of it is on the heartbeat (a04s_input_report), and each key change gets its own line.
 + */
 +#if defined(ARM64_BOARD_CONFIG_A04S)
@@ -544,6 +551,7 @@ index 0000000..58c9af9
 +extern void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
 +extern void IOSleep(unsigned int milliseconds);
 +extern void sweet_hid_key(int key, int down);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
 +extern int a04s_acpm_power_key(uint8_t *status1);
 +
 +/* pinctrl@11850000 (ALIVE): bank n at n * 0x20, CON +0x0, DAT +0x4 (pinctrl-exynos-arm64.c). */
@@ -648,6 +656,18 @@ index 0000000..58c9af9
 +#define FW_MAX_PARTS            24
 +#define FW_CHUNK                56u
 +#define FW_TRIES                3
++/* 7a-4: point data (nt36xxx.c POINT_DATA_CHECKSUM_LEN, FINGER_*, struct nvt_ts_event_coord). */
++#define TOUCH_SLOTS             10
++#define TOUCH_CK_LEN            65              /* bytes 1-64 summed, byte 65 the checksum */
++#define TOUCH_PART1             58
++#define FINGER_ENTER            0x01
++#define FINGER_MOVING           0x02
++#define GLOVE_TOUCH             0x06
++#define TOUCH_POLL_MS           8
++#define TOUCH_BLIND_EVERY       3               /* polls: a read every 24 ms until INT is seen */
++#define TOUCH_LINES             48
++#define TOUCH_RAW_LINES         6
++#define TOUCH_FAIL_RELEASE      20              /* bad reads in a row that lift every finger */
 +static const uint8_t fw_sha256[SHA256_DIGEST_LENGTH] = {
 +	0x5c, 0xf8, 0x41, 0x98, 0xd3, 0x4f, 0xbc, 0xba, 0x90, 0xcb, 0x17, 0x04, 0x61, 0xc0, 0xc9, 0xc2,
 +	0x11, 0x7f, 0x3e, 0x6a, 0xdf, 0xee, 0x0c, 0x97, 0x4e, 0x9b, 0x01, 0x41, 0xb0, 0xa5, 0xb0, 0xf5,
@@ -735,6 +755,15 @@ index 0000000..58c9af9
 +	uint32_t g_ilm, r_ilm, g_dlm, r_dlm;
 +	uint8_t fwinfo[8];
 +} tp3 = { .state = -1, .why = "NOT RUN" };
++static struct {
++	int state;                              /* -1 not run, 0 polling */
++	const char *why;
++	volatile uint32_t polls, int_low, int_high, reads, ck_bad, recovery, bad_xy, events;
++	volatile uint32_t down;                 /* a bit a finger */
++	volatile int last_x, last_y;
++	uint16_t max_x, max_y;
++	bool int_works;
++} tp4 = { .state = -1, .why = "NOT RUN" };
 +struct fw_part {
 +	uint32_t bin, sram, size, crc;
 +};
@@ -1338,6 +1367,156 @@ index 0000000..58c9af9
 +	return ETIMEDOUT;
 +}
 +
++/* One point-data frame, buf[0] being Samsung's point_data[1]: two reads, then the checksum. */
++static int
++touch_read_frame(uint8_t *buf)
++{
++	if (nvt_read_here(NVT_EVENT_BUF, buf, TOUCH_PART1) ||
++	    nvt_read_here(NVT_EVENT_BUF + TOUCH_PART1, buf + TOUCH_PART1, TOUCH_CK_LEN - TOUCH_PART1)) {
++		return EIO;
++	}
++	uint8_t sum = 0;
++	for (int i = 0; i < TOUCH_CK_LEN - 1; i++) {
++		sum += buf[i];
++	}
++	if ((uint8_t)(~sum + 1) != buf[TOUCH_CK_LEN - 1]) {
++		return EBADMSG;
++	}
++	return 0;
++}
++
++static void
++touch_release_all(int *fx, int *fy)
++{
++	for (int f = 0; f < TOUCH_SLOTS; f++) {
++		if (tp4.down & (1u << f)) {
++			sweet_hid_touch(f, 0, fx[f], fy[f]);
++		}
++	}
++	tp4.down = 0;
++}
++
++/* nvt_ts_touch_report(): slots with an id 1-10 and an enter, move or glove status are down. */
++static void
++touch_report(const uint8_t *buf, int *fx, int *fy)
++{
++	uint32_t now = 0;
++	for (int i = 0; i < TOUCH_SLOTS; i++) {
++		const uint8_t *e = buf + 6 * i;
++		int id = e[0] >> 3, status = e[0] & 7;
++		if (id < 1 || id > TOUCH_SLOTS) {
++			continue;
++		}
++		if (status != FINGER_ENTER && status != FINGER_MOVING && status != GLOVE_TOUCH) {
++			continue;
++		}
++		int x = (e[1] << 4) | (e[3] >> 4), y = (e[2] << 4) | (e[3] & 0xf);
++		if (x > tp4.max_x || y > tp4.max_y) {
++			tp4.bad_xy++;
++			continue;
++		}
++		int f = id - 1;
++		now |= 1u << f;
++		if (!(tp4.down & (1u << f)) && tp4.events < TOUCH_LINES) {
++			kprintf("A04S TOUCH %d DOWN %d,%d\n", f, x, y);
++		}
++		if (!(tp4.down & (1u << f))) {
++			tp4.events++;
++		}
++		fx[f] = x;
++		fy[f] = y;
++		tp4.last_x = x;
++		tp4.last_y = y;
++		sweet_hid_touch(f, 1, x, y);
++	}
++	for (int f = 0; f < TOUCH_SLOTS; f++) {
++		if ((tp4.down & (1u << f)) && !(now & (1u << f))) {
++			if (tp4.events < TOUCH_LINES) {
++				kprintf("A04S TOUCH %d UP %d,%d\n", f, fx[f], fy[f]);
++			}
++			tp4.events++;
++			sweet_hid_touch(f, 0, fx[f], fy[f]);
++		}
++	}
++	tp4.down = now;
++}
++
++/* Stage 7a-4: poll the interrupt pin and hand finished frames to SweetHIDTouch. Never returns. */
++static void
++a04s_touch_events(void)
++{
++	int want = 0;
++	(void)PE_parse_boot_argn("tptouch", &want, sizeof(want));
++	if (!want) {
++		tp4.why = "OFF";
++		return;
++	}
++	if (!alive_pins) {
++		tp4.why = "NO PINS";
++		return;
++	}
++	/* nvt_get_fw_info(): abs_x_max and abs_y_max, else the panel. */
++	tp4.max_x = (uint16_t)((tp3.fwinfo[4] << 8) | tp3.fwinfo[5]);
++	tp4.max_y = (uint16_t)((tp3.fwinfo[6] << 8) | tp3.fwinfo[7]);
++	if (tp4.max_x == 0 || tp4.max_x > 4095 || tp4.max_y == 0 || tp4.max_y > 4095) {
++		tp4.max_x = 720;
++		tp4.max_y = 1600;
++	}
++	if (nvt_set_page(NVT_EVENT_BUF)) {
++		tp4.why = "PAGE";
++		return;
++	}
++	tp4.state = 0;
++	tp4.why = "POLLING";
++	kprintf("A04S 7A4 START MAX %u,%u\n", tp4.max_x, tp4.max_y);
++	int fx[TOUCH_SLOTS] = { 0 }, fy[TOUCH_SLOTS] = { 0 };
++	uint8_t buf[TOUCH_CK_LEN];
++	uint32_t fails = 0, raw_lines = 0;
++	for (;;) {
++		IOSleep(TOUCH_POLL_MS);
++		tp4.polls++;
++		bool low = !(io_rd(alive_pins, GPA0 + PIN_DAT) & 1u);
++		if (low) {
++			tp4.int_low++;
++		} else {
++			tp4.int_high++;
++		}
++		if (!tp4.int_works && tp4.int_low > 8 && tp4.int_high > 8) {
++			tp4.int_works = true;
++		}
++		if (!low && (tp4.int_works || tp4.polls % TOUCH_BLIND_EVERY)) {
++			continue;
++		}
++		tp4.reads++;
++		int error = touch_read_frame(buf);
++		if (error) {
++			if (error == EBADMSG) {
++				tp4.ck_bad++;
++			}
++			if (++fails == TOUCH_FAIL_RELEASE) {
++				touch_release_all(fx, fy);
++			}
++			continue;
++		}
++		fails = 0;
++		bool pattern = true;
++		for (int i = 0; i < 6; i++) {
++			pattern = pattern && buf[i] == 0x77;
++		}
++		if (pattern) {
++			tp4.recovery++;                 /* nvt_fw_recovery(): a handshake, not touches */
++			continue;
++		}
++		if (raw_lines < TOUCH_RAW_LINES && (buf[0] >> 3) != 0) {
++			raw_lines++;
++			kprintf("A04S TOUCH RAW %02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x\n",
++			    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
++			    buf[10], buf[11]);
++		}
++		touch_report(buf, fx, fy);
++	}
++}
++
 +/* Stage 7a-3, after the trim ID matched: find, check, then load the firmware. */
 +static void
 +a04s_touch_fw(void)
@@ -1466,6 +1645,11 @@ index 0000000..58c9af9
 +	} else {
 +		tp3.why = "NO 0C ID";
 +	}
++	if (tp3.state == 0) {
++		a04s_touch_events();
++	} else {
++		tp4.why = "NO FIRMWARE";
++	}
 +}
 +
 +/*
@@ -1584,6 +1768,9 @@ index 0000000..58c9af9
 +	kprintf("TP3 CRC %02x ILM %08x/%08x DLM %08x/%08x FW %02x %02x %02x %02x %02x %02x %02x %02x\n",
 +	    tp3.crc_flag, tp3.g_ilm, tp3.r_ilm, tp3.g_dlm, tp3.r_dlm, tp3.fwinfo[0], tp3.fwinfo[1],
 +	    tp3.fwinfo[2], tp3.fwinfo[3], tp3.fwinfo[4], tp3.fwinfo[5], tp3.fwinfo[6], tp3.fwinfo[7]);
++	kprintf("TP4 %d %s P %u INT %u/%u%s RD %u CK %u REC %u XY %u EV %u DOWN %x AT %d,%d\n", tp4.state, tp4.why,
++	    tp4.polls, tp4.int_low, tp4.int_high, tp4.int_works ? " OK" : "", tp4.reads, tp4.ck_bad, tp4.recovery,
++	    tp4.bad_xy, tp4.events, tp4.down, tp4.last_x, tp4.last_y);
 +	kprintf("GPU PD %x %x %s\n", gpu_pd_config, gpu_pd_status, (gpu_pd_status & 1u) ? "ON" : "OFF");
 +	kprintf("GPU CLK %u%u %u%u%u Q %x %x\n", gate_code(gpu.top), gate_code(gpu.core), gate_code(gpu.g3d_pclk),
 +	    gate_code(gpu.g3d_gpu), gate_code(gpu.g3d_lhm), gpu.qch_gpu, gpu.qch_lhm);
