@@ -2706,7 +2706,7 @@ index 0000000..e3b8eb3
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index b269868..28b5273 100644
+index b269868..d8cc99a 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
 @@ -20,10 +20,12 @@
@@ -2723,7 +2723,7 @@ index b269868..28b5273 100644
  /* Free page in the first DRAM bank, below the loader log page 0x8ffff000. */
  #define HEROLTE_SMP_TRAMPOLINE_PA 0x8fffe000u
  #endif
-@@ -35,6 +37,24 @@ extern "C" void a5xelte_send_ipi(unsigned int logical);
+@@ -35,6 +37,149 @@ extern "C" void a5xelte_send_ipi(unsigned int logical);
  #define CPU_PORT_NAME "SWEET"
  #endif
  
@@ -2743,12 +2743,137 @@ index b269868..28b5273 100644
 +	IOLog(CPU_PORT_NAME " CPU: cpu=%u trace step %llx EL %llu mpidr %llx sctlr %llx\n", cpu,
 +	    t[0], t[1] >> 2, t[2], t[3]);
 +}
++
++/* Stage 8 diagnostics (v29). v28: CPU1 took PSCI CPU_ON (rc 0) and ran none of
++ * sweet_secondary_entry (trace step 0, nothing written). Read-only apart from a cache clean of
++ * the entry code. Shown: the firmware's view (PSCI AFFINITY_INFO: 0 on, 1 off, 2 on pending),
++ * the always-on PMU's view of the core (pmu@11860000, CPU_INFORM at 0x860 and the per-CPU
++ * block at 0x1000 + 0x400 * cluster + 0x80 * core, as in mainline's exynos850-pmu.c), and
++ * whether DRAM holds the entry code that a core with its MMU and caches off fetches. */
++#define A04S_PMU_PA             0x11860000UL
++#define A04S_PMU_SIZE           0x2000UL
++#define A04S_PMU_INFORM(c)      (0x0860 + ((c) & 7) * 4)
++#define A04S_PMU_CPU(c)         (0x1000 + (((c) >> 2) & 1) * 0x400 + ((c) & 3) * 0x80)
++#define A04S_PSCI_VERSION       0x84000000ULL
++#define A04S_PSCI_FEATURES      0x8400000AULL
++#define A04S_PSCI_CPU_ON        0xC4000003ULL
++#define A04S_PSCI_AFFINITY_INFO 0xC4000004ULL
++static volatile uint32_t *a04s_pmu;
++
++/* SMCCC 1.0: x0 is the signed 32-bit PSCI result; do not assume x1-x17 survive. */
++static int64_t
++a04s_psci(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	    "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int64_t)(int32_t)(uint32_t)x0;
++}
++
++static int64_t
++a04s_affinity(uint32_t mpidr)
++{
++	return a04s_psci(A04S_PSCI_AFFINITY_INFO, mpidr, 0, 0);
++}
++
++static volatile uint32_t *
++a04s_pmu_cpu(unsigned int c)
++{
++	if (a04s_pmu == NULL) {
++		a04s_pmu = (volatile uint32_t *)ml_io_map(A04S_PMU_PA, A04S_PMU_SIZE);
++	}
++	return a04s_pmu == NULL ? NULL : a04s_pmu + A04S_PMU_CPU(c) / 4;
++}
++
++static void
++a04s_pmu_print(const char *when, unsigned int c)
++{
++	volatile uint32_t *r = a04s_pmu_cpu(c);
++	if (r == NULL) {
++		IOLog(CPU_PORT_NAME " CPU: %s cpu=%u PMU not mapped\n", when, c);
++		return;
++	}
++	IOLog(CPU_PORT_NAME " CPU: %s cpu=%u PMU %x %x %x %x int %x inf %x\n", when, c,
++	    r[0], r[1], r[2], r[3], r[0x44 / 4], a04s_pmu[A04S_PMU_INFORM(c) / 4]);
++}
++
++static void
++a04s_pre_cpu_on(unsigned int c, uint32_t mpidr, vm_offset_t entry_pa)
++{
++	IOLog(CPU_PORT_NAME " CPU: PSCI ver %llx CPU_ON feat %lld aff(0x%x) %lld\n",
++	    (unsigned long long)a04s_psci(A04S_PSCI_VERSION, 0, 0, 0),
++	    a04s_psci(A04S_PSCI_FEATURES, A04S_PSCI_CPU_ON, 0, 0), mpidr, a04s_affinity(mpidr));
++	a04s_pmu_print("before", 0);
++	a04s_pmu_print("before", c);
++	/* Last, so the lines above are on screen if this alias of kernel text is refused. */
++	const volatile uint32_t *k = (const volatile uint32_t *)(uintptr_t)&sweet_secondary_entry;
++	vm_offset_t page = ml_io_map(entry_pa & ~(vm_offset_t)PAGE_MASK, PAGE_SIZE);
++	if (page == 0) {
++		IOLog(CPU_PORT_NAME " CPU: entry DRAM alias not mapped\n");
++		return;
++	}
++	volatile uint32_t *d = (volatile uint32_t *)(page + (entry_pa & PAGE_MASK));
++	uint32_t d0 = d[0], d1 = d[1];
++	for (uintptr_t a = (uintptr_t)k & ~(uintptr_t)63; a < (uintptr_t)k + 0x400; a += 64) {
++		__asm__ volatile("dc cvac, %0" : : "r"(a) : "memory");
++	}
++	__builtin_arm_dsb(DSB_SY);
++	IOLog(CPU_PORT_NAME " CPU: entry %08x %08x DRAM %08x %08x cleaned %08x %08x\n",
++	    k[0], k[1], d0, d1, d[0], d[1]);
++}
++
++/* Called about every millisecond while the boot CPU waits; prints only changes. */
++static void
++a04s_watch(unsigned int c, uint32_t mpidr)
++{
++	static unsigned int ticks, lines;
++	static int64_t last_aff = -100;
++	static uint32_t last_st = 0xdeadbeefu;
++	static uint64_t last_step = ~0ULL;
++	if (c == 0 || ++ticks % 200 != 0 || lines >= 6) {
++		return;
++	}
++	volatile uint32_t *r = a04s_pmu_cpu(c);
++	int64_t aff = a04s_affinity(mpidr);
++	uint32_t st = r == NULL ? 0xffffffffu : r[1];
++	uint64_t step = a04s_smp_trace == NULL ? 0 : a04s_smp_trace[c * 4];
++	if (aff == last_aff && st == last_st && step == last_step) {
++		return;
++	}
++	last_aff = aff;
++	last_st = st;
++	last_step = step;
++	lines++;
++	IOLog(CPU_PORT_NAME " CPU: wait tick %u cpu=%u aff %lld PMU st %x step %llx\n", ticks, c,
++	    aff, st, step);
++}
++
++/* Before the startup panic: the same views, then CPU_ON once more. Its rc says what the
++ * firmware believes: -4 already on, -5 on pending, 0 it was off and starts again. */
++static void
++a04s_timeout_report(unsigned int c, uint32_t mpidr)
++{
++	a04s_pmu_print("timeout", c);
++	vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
++	int64_t aff = a04s_affinity(mpidr);
++	__builtin_arm_dsb(DSB_SY);
++	int64_t rc = a04s_psci(A04S_PSCI_CPU_ON, mpidr, entry, c);
++	IOLog(CPU_PORT_NAME " CPU: timeout aff %lld, CPU_ON again rc %lld\n", aff, rc);
++	IOSleep(1000);
++	IOLog(CPU_PORT_NAME " CPU: 1s later aff %lld\n", a04s_affinity(mpidr));
++	a04s_smp_trace_print(c);
++	a04s_pmu_print("1s later", c);
++}
 +#endif
 +
  class SweetCPU;
  static SweetCPU *sweet_cpus[MAX_CPUS];
  static uint32_t sweet_cpus_registered;
-@@ -57,7 +77,7 @@ class SweetCPU : public IOCPU {
+@@ -57,7 +202,7 @@ class SweetCPU : public IOCPU {
  	OSDeclareDefaultStructors(SweetCPU);
  	const OSSymbol *cpuName = NULL;
  	uint32_t initialized = 0; /* release/acquire publication after initCPU sends SGI */
@@ -2757,7 +2882,7 @@ index b269868..28b5273 100644
  	/* Read by this CPU in initCPU, before it publishes initialized. */
  	uint64_t initVct = 0, initPct = 0, initCtr = 0, initMidr = 0;
  #endif
-@@ -100,6 +120,14 @@ SweetCPU::start(IOService *provider)
+@@ -100,6 +245,14 @@ SweetCPU::start(IOService *provider)
  		panic(CPU_PORT_NAME " CPU: unsupported topology cpu=%u mpidr=0x%x count=%u",
  		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
  	}
@@ -2772,7 +2897,7 @@ index b269868..28b5273 100644
  #elif defined(A5XELTE)
  	/* Only the boot CPU is described and tested on these boards. */
  	if (cpu->phys_id != A5XELTE_BOOT_MPIDR || topology->num_cpus != 1) {
-@@ -120,6 +148,8 @@ SweetCPU::start(IOService *provider)
+@@ -120,6 +273,8 @@ SweetCPU::start(IOService *provider)
  #if defined(A5XELTE)
  #if defined(HEROLTE)
  	cpuName = OSSymbol::withCStringNoCopy(cpu->cpu_id < 4 ? "Cortex-A53" : "Mongoose");
@@ -2781,15 +2906,19 @@ index b269868..28b5273 100644
  #else
  	cpuName = OSSymbol::withCStringNoCopy("Cortex-A53");
  #endif
-@@ -211,13 +241,19 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -211,13 +366,23 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  			if (mach_absolute_time() > deadline) {
  				IOLog(CPU_PORT_NAME " CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
  				    i, topology->cpus[i].phys_id);
 +#if defined(A04S)
 +				a04s_smp_trace_print(i);
++				a04s_timeout_report(i, topology->cpus[i].phys_id);
 +#endif
  				panic(CPU_PORT_NAME " CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
  			}
++#if defined(A04S)
++			a04s_watch(i, topology->cpus[i].phys_id);
++#endif
  			IOSleep(1);
  		}
  		IOLog(CPU_PORT_NAME " CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
@@ -2802,7 +2931,7 @@ index b269868..28b5273 100644
  		/* Both clusters must see one counter: the boot CPU reads it just after
  		 * the secondary did, so vct_lag is small and positive unless the
  		 * firmware gave the cluster its own CNTVOFF. */
-@@ -237,7 +273,7 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -237,7 +402,7 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  	ml_set_max_cpus(topology->max_cpu_id + 1);
  	IOLog(CPU_PORT_NAME " CPU: %u/%u CPUs initialized, SGI1 verified\n",
  	    topology->num_cpus, topology->num_cpus);
@@ -2811,7 +2940,7 @@ index b269868..28b5273 100644
  	/* A CPU whose timer interrupt never fires still answers SGIs: sleep once
  	 * on each CPU. Boot does not wait for this thread, so a CPU that never
  	 * wakes leaves its "sleeping" line as the last one. */
-@@ -280,7 +316,7 @@ SweetCPU::initCPU(bool boot)
+@@ -280,7 +445,7 @@ SweetCPU::initCPU(bool boot)
  	 * Waiting here with DAIF.I set would deadlock every secondary. */
  	signalCPU(this);
  	setCPUState(kIOCPUStateRunning);
@@ -2820,7 +2949,7 @@ index b269868..28b5273 100644
  	if (getCPUNumber() != 0) {
  		/* As on the A5 (GICv2): a secondary enters at splsched with DAIF.I
  		 * set; take the queued self-SGI here, then restore the mask that
-@@ -293,7 +329,7 @@ SweetCPU::initCPU(bool boot)
+@@ -293,7 +458,7 @@ SweetCPU::initCPU(bool boot)
  	kprintf(CPU_PORT_NAME " CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu IRQs=%u\n",
  	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL,
  	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled());
@@ -2829,7 +2958,7 @@ index b269868..28b5273 100644
  	initMidr = __builtin_arm_rsr64("MIDR_EL1");
  	initCtr = __builtin_arm_rsr64("CTR_EL0");
  	__builtin_arm_isb(ISB_SY);
-@@ -306,7 +342,7 @@ SweetCPU::initCPU(bool boot)
+@@ -306,7 +471,7 @@ SweetCPU::initCPU(bool boot)
  void
  SweetCPU::signalCPU(IOCPU *target)
  {
@@ -2838,7 +2967,7 @@ index b269868..28b5273 100644
  	if (target == this) {
  		a5xelte_send_self_ipi();
  	} else {
-@@ -374,6 +410,16 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+@@ -374,6 +539,17 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
  		    getCPUNumber(), (uint64_t)entry, HEROLTE_SMP_TRAMPOLINE_PA);
  		entry = HEROLTE_SMP_TRAMPOLINE_PA;
  	}
@@ -2852,6 +2981,7 @@ index b269868..28b5273 100644
 +			a04s_smp_trace[getCPUNumber() * 4 + w] = 0;
 +		}
 +	}
++	a04s_pre_cpu_on(getCPUNumber(), cpu->phys_id, entry);
  #endif
  	IOLog(CPU_PORT_NAME " CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
  	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
