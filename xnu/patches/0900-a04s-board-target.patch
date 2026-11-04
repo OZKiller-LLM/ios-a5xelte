@@ -3082,13 +3082,13 @@ index 6d0b107..2dd9827 100644
  ARM64_PLKSEG_ADDR  =0xfffffff004004000
  ARM64_LINK_ADDR    =0xfffffff007004000
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index 195967c..19e8ca3 100644
+index 195967c..ae16113 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
-@@ -680,9 +680,23 @@ arm_init(
+@@ -679,10 +679,24 @@ arm_init(
+  *    Runs on S2R resume (all CPUs) and SMP boot (non-boot CPUs only).
   */
  
- void
 +#if defined(ARM64_BOARD_CONFIG_A04S)
 +/* Stage 8 trace, mapped by SweetCPU::startCPU: see osfmk/arm64/start.s. */
 +extern volatile uint64_t *a04s_smp_trace;
@@ -3102,6 +3102,7 @@ index 195967c..19e8ca3 100644
 +#define A04S_SMP_STEP(cdp, step) do { } while (0)
 +#endif
 +
+ void
  arm_init_cpu(
  	cpu_data_t      *cpu_data_ptr)
  {
