@@ -481,10 +481,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_input.c b/bsd/dev/a04s_input.c
 new file mode 100644
-index 0000000..a3d575b
+index 0000000..d25f17a
 --- /dev/null
 +++ b/bsd/dev/a04s_input.c
-@@ -0,0 +1,433 @@
+@@ -0,0 +1,754 @@
 +/*
 + * Galaxy A04s, stage 7: the keys (7b), and read-only first looks at the touch path (7a-1) and
 + * the GPU's power domain (7c-1).
@@ -505,6 +505,18 @@ index 0000000..a3d575b
 + * on, every clock gate on the path from the CPU (CMU_TOP, CMU_CORE, CMU_G3D) is running, and the
 + * GPU's and its bus port's Q-channels can't have the clock handshaken off. Otherwise the line says
 + * which check stopped it. Reads only, as for touch.
++ *
++ * Touch, 7a-2: with the boot-arg tpspi=1 only, SPI1 is brought up and the chip's trim ID read. This
++ * is the first build that writes for touch, and each write is one Samsung's drivers make at boot:
++ *  - the USI_CMGP0 mode (usi_v2.c, SPI_SW_CONF);
++ *  - DIV_CLK_CMGP_USI_CMGP0 to its largest ratio, /32. spi-s3c64xx.c feeds the IP four times the
++ *    SCLK it wants, so SCLK is the CMGP bus clock / 128: slow, and well under the chip's 9.6 MHz;
++ *  - the SPI1 controller's set-up (s3c64xx_spi_hwinit and _config: mode 0, 8-bit, polled);
++ *  - GPM0-2 to SPI and GPM3, the chip select, to an output that idles high (spi1-bus, spi1-cs);
++ *  - on the chip: the engineering reset, then nvt_ts_check_chip_ver_trim(): the boot-loader reset
++ *    and the 7-byte trim ID read, at most 5 times at each of the two trim addresses.
++ * The touch reset pin is left alone: Samsung's on_state keeps GPA3-0 an input pulled down. Nothing
++ * here touches the PMIC, the eMMC, or a pin outside GPM0-3.
 + *
 + * All of it is on the heartbeat (a04s_input_report), and each key change gets its own line.
 + */
@@ -560,6 +572,47 @@ index 0000000..a3d575b
 +#define SPI_MODE_CFG            0x08u
 +#define SPI_STATUS              0x14u
 +#define SPI_USI_CON             0xc4u
++#define SPI_SLAVE_SEL           0x0cu
++#define SPI_INT_EN              0x10u
++#define SPI_TX_DATA             0x18u
++#define SPI_RX_DATA             0x1cu
++#define SPI_PACKET_CNT          0x20u
++#define SPI_PENDING_CLR         0x24u
++#define SPI_SWAP_CFG            0x28u
++#define SPI_FB_CLK              0x2cu
++#define CH_HS_EN                (1u << 6)
++#define CH_SW_RST               (1u << 5)
++#define CH_SLAVE                (1u << 4)
++#define CH_CPOL                 (1u << 3)
++#define CH_CPHA                 (1u << 2)
++#define CH_RXCH_ON              (1u << 1)
++#define CH_TXCH_ON              (1u << 0)
++#define MODE_CH_TSZ_MASK        (3u << 29)
++#define MODE_BUS_TSZ_MASK       (3u << 17)
++#define MODE_TRAILCNT           (0x3ffu << 19)
++#define MODE_RXDMA_ON           (1u << 2)
++#define MODE_TXDMA_ON           (1u << 1)
++#define MODE_4BURST             (1u << 0)
++#define PACKET_CNT_EN           (1u << 16)
++#define PND_CLEAR_ALL           0x1eu           /* RX/TX overrun and underrun */
++#define SLAVE_SIG_INACT         (1u << 0)
++#define TX_FIFO_LVL(st)         (((st) >> 6) & 0x7fu)   /* fifosize 64: mask (64 << 1) - 1 */
++#define RX_FIFO_LVL(st)         (((st) >> 15) & 0x7fu)
++#define SPI_XFER_MAX            32u
++/* CMGP pins (bank_type_7): PUD and DRV are 4 bits a pin, at +0x8 and +0xc. */
++#define PIN_PUD                 0x8u
++#define PIN_DRV                 0xcu
++#define GPM_CS                  3u
++#define DIV_RATIO_MASK          0x1fu
++#define DIV_RATIO_SLOWEST       0x1fu
++#define DIV_BUSY                (1u << 16)
++/* NT36525C (nt36xxx.c, nt36xxx_mem_map.h and the live device tree). */
++#define NVT_ENG_RST             0x7fff80u
++#define NVT_SWRST_N8            0x3f0feu
++#define NVT_SPI_RD_FAST         0x3f310u
++#define NVT_TRIM                0x3f004u
++#define NVT_TRIM_OLD            0x1f64eu
++#define NVT_TRIES               5
 +/* pd-g3d@11861d00: configuration, then status; bit 0 is the local power state (mali gpu_pmu_status_*). */
 +#define PD_G3D_PA               0x11861000u
 +#define PD_G3D_CONFIG           0xd00u
@@ -623,6 +676,17 @@ index 0000000..a3d575b
 +	uint32_t id, l2_features, status, shaders, l2;
 +	const char *why;                        /* NULL once the ID was read */
 +} gpu = { .why = "NOT TRIED" };
++static vm_offset_t cmu_cmgp_va, spi1, cmgp_pins;
++static struct {
++	int state;                              /* -1 not run, 0 the ID matched, 1 ran without a match */
++	const char *why;                        /* the step it is on, or the one that stopped it */
++	uint32_t usi_back, div_back, cfg, mode, status;
++	volatile uint32_t xfers, timeouts;
++	uint8_t id[6];
++	int tries;
++	uint32_t addr;                          /* trim address of the last read */
++	bool match;
++} tp2 = { .state = -1, .why = "NOT RUN" };
 +
 +static inline uint32_t
 +io_rd(vm_offset_t base, uint32_t off)
@@ -727,6 +791,12 @@ index 0000000..a3d575b
 +		}
 +		key_down = down;
 +	}
++}
++
++static inline void
++io_wr(vm_offset_t base, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(base + off) = value;
 +}
 +
 +/* A Q-channel that lets the hardware stop the clock: enabled, with no clock request held. */
@@ -846,6 +916,251 @@ index 0000000..a3d575b
 +	a04s_gpu_probe();
 +}
 +
++/* One CMGP pin, GPM0-3 only: pull, drive, then function, as pinctrl applies a state. */
++static void
++gpm_set(uint32_t pin, uint32_t func, uint32_t pud, uint32_t drv)
++{
++	if (pin > GPM_CS) {
++		return;
++	}
++	uint32_t bank = pin * 0x20u;
++	io_wr(cmgp_pins, bank + PIN_PUD, (io_rd(cmgp_pins, bank + PIN_PUD) & ~0xfu) | pud);
++	io_wr(cmgp_pins, bank + PIN_DRV, (io_rd(cmgp_pins, bank + PIN_DRV) & ~0xfu) | drv);
++	io_wr(cmgp_pins, bank + PIN_CON, (io_rd(cmgp_pins, bank + PIN_CON) & ~0xfu) | func);
++}
++
++static void
++spi_cs(uint32_t high)
++{
++	uint32_t bank = GPM_CS * 0x20u;
++	io_wr(cmgp_pins, bank + PIN_DAT, (io_rd(cmgp_pins, bank + PIN_DAT) & ~1u) | (high & 1u));
++}
++
++/* flush_fifo() in spi-s3c64xx.c. */
++static void
++spi_flush(void)
++{
++	uint32_t cfg = io_rd(spi1, SPI_CH_CFG) & ~(CH_RXCH_ON | CH_TXCH_ON);
++	io_wr(spi1, SPI_CH_CFG, cfg);
++	io_wr(spi1, SPI_PACKET_CNT, 0);
++	io_wr(spi1, SPI_CH_CFG, (cfg | CH_SW_RST) & ~CH_HS_EN);
++	for (int i = 0; i < 1000 && TX_FIFO_LVL(io_rd(spi1, SPI_STATUS)); i++) {
++	}
++	for (int i = 0; i < 1000 && RX_FIFO_LVL(io_rd(spi1, SPI_STATUS)); i++) {
++		(void)*(volatile uint8_t *)(spi1 + SPI_RX_DATA);
++	}
++	io_wr(spi1, SPI_CH_CFG, io_rd(spi1, SPI_CH_CFG) & ~CH_SW_RST);
++}
++
++/*
++ * One polled transfer with the chip selected: len bytes out and len in, as enable_datapath() and
++ * wait_for_xfer() do without DMA. 0, or ETIMEDOUT after about 20 ms with too few bytes back.
++ */
++static int
++spi_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
++{
++	if (len == 0 || len > SPI_XFER_MAX) {
++		return EINVAL;
++	}
++	spi_cs(0);
++	spi_flush();
++	uint32_t cfg = (io_rd(spi1, SPI_CH_CFG) & ~CH_TXCH_ON) | CH_RXCH_ON;
++	io_wr(spi1, SPI_PACKET_CNT, io_rd(spi1, SPI_PACKET_CNT) & ~PACKET_CNT_EN);
++	io_wr(spi1, SPI_PACKET_CNT, len);
++	io_wr(spi1, SPI_PACKET_CNT, len | PACKET_CNT_EN);
++	uint32_t mode = io_rd(spi1, SPI_MODE_CFG) & ~(MODE_4BURST | MODE_TXDMA_ON | MODE_RXDMA_ON);
++	io_wr(spi1, SPI_MODE_CFG, mode);
++	for (uint32_t i = 0; i < len; i++) {
++		*(volatile uint8_t *)(spi1 + SPI_TX_DATA) = tx[i];
++	}
++	io_wr(spi1, SPI_CH_CFG, cfg | CH_TXCH_ON);
++	int error = ETIMEDOUT;
++	for (int wait = 0; wait < 20 && error; wait++) {
++		for (int i = 0; i < 2000; i++) {
++			if (RX_FIFO_LVL(io_rd(spi1, SPI_STATUS)) >= len) {
++				error = 0;
++				break;
++			}
++		}
++		if (error) {
++			IOSleep(1);
++		}
++	}
++	if (!error) {
++		for (uint32_t i = 0; i < len; i++) {
++			uint8_t byte = *(volatile uint8_t *)(spi1 + SPI_RX_DATA);
++			if (rx) {
++				rx[i] = byte;
++			}
++		}
++	} else {
++		tp2.timeouts++;
++	}
++	tp2.xfers++;
++	tp2.status = io_rd(spi1, SPI_STATUS);
++	spi_flush();
++	spi_cs(1);
++	return error;
++}
++
++/* nvt_set_page() and nvt_write_addr(): CTP_SPI_WRITE sets bit 7 of the first byte. */
++static int
++nvt_set_page(uint32_t addr)
++{
++	uint8_t cmd[3] = { 0xff, (uint8_t)(addr >> 15), (uint8_t)(addr >> 7) };
++	return spi_xfer(cmd, NULL, 3);
++}
++
++static int
++nvt_write_addr(uint32_t addr, uint8_t data)
++{
++	int error = nvt_set_page(addr);
++	if (error) {
++		return error;
++	}
++	uint8_t cmd[2] = { (uint8_t)((addr & 0x7fu) | 0x80u), data };
++	return spi_xfer(cmd, NULL, 2);
++}
++
++/*
++ * nvt_ts_check_chip_ver_trim(): reset into the boot loader, then read 7 bytes at the trim address
++ * (an address byte, a dummy, then ID 0-5). NT36525 is the table entry with ID 3-5 = 25 65 03.
++ */
++static bool
++nvt_read_trim(uint32_t addr)
++{
++	tp2.addr = addr;
++	for (int retry = 0; retry < NVT_TRIES; retry++) {
++		tp2.tries++;
++		(void)nvt_write_addr(NVT_SWRST_N8, 0x69);
++		IOSleep(50);
++		(void)nvt_write_addr(NVT_SPI_RD_FAST, 0x00);
++		uint8_t tx[8] = { (uint8_t)(addr & 0x7fu) }, rx[8] = { 0 };
++		if (!nvt_set_page(addr) && !spi_xfer(tx, rx, 8)) {
++			for (int i = 0; i < 6; i++) {
++				tp2.id[i] = rx[2 + i];
++			}
++			if (rx[5] == 0x25 && rx[6] == 0x65 && rx[7] == 0x03) {
++				return true;
++			}
++		}
++		IOSleep(10);
++	}
++	return false;
++}
++
++static void
++a04s_touch_spi_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	kprintf("A04S 7A2 START\n");
++	tp2.why = "USI";
++	vm_offset_t usi = ml_io_map(USI_MODE_PA, 0x1000);
++	spi1 = ml_io_map(SPI1_PA, 0x1000);
++	cmgp_pins = ml_io_map(CMGP_PINS_PA, 0x1000);
++	if (!usi || !spi1 || !cmgp_pins) {
++		tp2.why = "NO MAPPING";
++		return;
++	}
++	io_wr(usi, 0, USI_MODE_SPI);
++	tp2.usi_back = io_rd(usi, 0);
++	if (tp2.usi_back != USI_MODE_SPI) {
++		return;
++	}
++
++	tp2.why = "DIV";
++	uint32_t div = io_rd(cmu_cmgp_va, DIV_USI_CMGP0);
++	io_wr(cmu_cmgp_va, DIV_USI_CMGP0, (div & ~DIV_RATIO_MASK) | DIV_RATIO_SLOWEST);
++	for (int wait = 0; wait < 10 && (io_rd(cmu_cmgp_va, DIV_USI_CMGP0) & DIV_BUSY); wait++) {
++		IOSleep(1);
++	}
++	tp2.div_back = io_rd(cmu_cmgp_va, DIV_USI_CMGP0);
++	if ((tp2.div_back & DIV_BUSY) || (tp2.div_back & DIV_RATIO_MASK) != DIV_RATIO_SLOWEST) {
++		return;
++	}
++
++	/* exynos_usi_init(), s3c64xx_spi_hwinit(), then s3c64xx_spi_config() for mode 0, 8 bits. */
++	tp2.why = "SPI";
++	io_wr(spi1, SPI_USI_CON, 0);
++	io_wr(spi1, SPI_SLAVE_SEL, SLAVE_SIG_INACT);
++	io_wr(spi1, SPI_INT_EN, 0);
++	io_wr(spi1, SPI_MODE_CFG, 0);
++	io_wr(spi1, SPI_PACKET_CNT, 0);
++	io_wr(spi1, SPI_PENDING_CLR, PND_CLEAR_ALL);
++	io_wr(spi1, SPI_PENDING_CLR, 0);
++	io_wr(spi1, SPI_SWAP_CFG, 0);
++	io_wr(spi1, SPI_MODE_CFG, (io_rd(spi1, SPI_MODE_CFG) & ~(MODE_4BURST | MODE_TRAILCNT)) | MODE_TRAILCNT);
++	spi_flush();
++	io_wr(spi1, SPI_CH_CFG, io_rd(spi1, SPI_CH_CFG) & ~(CH_SLAVE | CH_CPOL | CH_CPHA));
++	io_wr(spi1, SPI_MODE_CFG, io_rd(spi1, SPI_MODE_CFG) & ~(MODE_BUS_TSZ_MASK | MODE_CH_TSZ_MASK));
++	io_wr(spi1, SPI_SWAP_CFG, 0);
++	io_wr(spi1, SPI_FB_CLK, 0);                     /* samsung,spi-feedback-delay = <0> */
++	tp2.cfg = io_rd(spi1, SPI_CH_CFG);
++	tp2.mode = io_rd(spi1, SPI_MODE_CFG);
++
++	/* spi1-cs then spi1-bus: chip select high before it becomes an output. */
++	tp2.why = "PINS";
++	spi_cs(1);
++	gpm_set(GPM_CS, 1, 0, 0);
++	for (uint32_t pin = 0; pin < GPM_CS; pin++) {
++		gpm_set(pin, 2, 0, 0);
++	}
++
++	/* nvt_ts_probe(): engineering reset, 10 ms, then the trim ID at the new address, then the old. */
++	tp2.why = "ENG RESET";
++	(void)nvt_write_addr(NVT_ENG_RST, 0x5a);
++	IOSleep(11);
++	tp2.why = "TRIM";
++	tp2.match = nvt_read_trim(NVT_TRIM) || nvt_read_trim(NVT_TRIM_OLD);
++	tp2.state = tp2.match ? 0 : 1;
++	tp2.why = tp2.match ? "DONE" : "NO ID";
++	kprintf("A04S 7A2 %s ID %02x %02x %02x %02x %02x %02x XF %u TO %u\n", tp2.why, tp2.id[0], tp2.id[1],
++	    tp2.id[2], tp2.id[3], tp2.id[4], tp2.id[5], tp2.xfers, tp2.timeouts);
++}
++
++/*
++ * 7a-2 runs only with tpspi=1, and only if the bootloader left the path as v20 and v21 saw it: the
++ * CMGP clocks running, USI_CMGP0 unset or already SPI, GPM0-3 still inputs, and the CSOT panel.
++ */
++static void
++a04s_touch_spi_start(void)
++{
++	int want = 0;
++	(void)PE_parse_boot_argn("tpspi", &want, sizeof(want));
++	if (!want) {
++		tp2.why = "OFF";
++		return;
++	}
++	for (int i = 2; i < 6; i++) {
++		if (!gate_running(tp.gate[i])) {
++			tp2.why = "GATE";
++			return;
++		}
++	}
++	if (qch_may_stop(tp.qch)) {
++		tp2.why = "QCH";
++		return;
++	}
++	if (tp.usi_mode != 0 && tp.usi_mode != USI_MODE_SPI) {
++		tp2.why = "USI IN USE";
++		return;
++	}
++	if (tp.gpm_con != 0) {
++		tp2.why = "PINS IN USE";
++		return;
++	}
++	if (tp.panel_id != 6) {
++		tp2.why = "PANEL";
++		return;
++	}
++	thread_t thread;
++	if (kernel_thread_start(a04s_touch_spi_thread, NULL, &thread) != KERN_SUCCESS) {
++		tp2.why = "NO THREAD";
++		return;
++	}
++	thread_deallocate(thread);
++	tp2.why = "STARTED";
++}
++
 +/* After a04s_acpm_probe(): the key thread is the only ACPM user from here on. */
 +void a04s_input_start(void);
 +void
@@ -865,6 +1180,8 @@ index 0000000..a3d575b
 +	}
 +	a04s_touch_gpu_probe(cmu_peri, cmu_cmgp);
 +	kprintf("A04S 7 PROBED\n");
++	cmu_cmgp_va = cmu_cmgp;
++	a04s_touch_spi_start();
 +	if (!alive_pins) {
 +		keys_state = gate_running(tp.gate[0]) ? ENOMEM : ENXIO;
 +		return;
@@ -907,6 +1224,10 @@ index 0000000..a3d575b
 +	kprintf("TP PIN %04x D %x INT %x/%u RST %x/%u\n", tp.gpm_con, tp.gpm_dat,
 +	    tp.gpa0_con & 0xfu, tp.gpa0_dat & 1u, tp.gpa3_con & 0xfu, tp.gpa3_dat & 1u);
 +	kprintf("TP ID %d FW %s\n", tp.panel_id, panel_firmware(tp.panel_id));
++	kprintf("TP2 %d %s USI %x DIV %x CFG %x MODE %x ST %x XF %u TO %u\n", tp2.state, tp2.why,
++	    tp2.usi_back, tp2.div_back, tp2.cfg, tp2.mode, tp2.status, tp2.xfers, tp2.timeouts);
++	kprintf("TP2 ID %02x %02x %02x %02x %02x %02x AT %x TRY %d %s\n", tp2.id[0], tp2.id[1], tp2.id[2],
++	    tp2.id[3], tp2.id[4], tp2.id[5], tp2.addr, tp2.tries, tp2.match ? "NT36525" : "NO MATCH");
 +	kprintf("GPU PD %x %x %s\n", gpu_pd_config, gpu_pd_status, (gpu_pd_status & 1u) ? "ON" : "OFF");
 +	kprintf("GPU CLK %u%u %u%u%u Q %x %x\n", gate_code(gpu.top), gate_code(gpu.core), gate_code(gpu.g3d_pclk),
 +	    gate_code(gpu.g3d_gpu), gate_code(gpu.g3d_lhm), gpu.qch_gpu, gpu.qch_lhm);
