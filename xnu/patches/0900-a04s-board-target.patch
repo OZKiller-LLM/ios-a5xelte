@@ -481,10 +481,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_input.c b/bsd/dev/a04s_input.c
 new file mode 100644
-index 0000000..b87c083
+index 0000000..58c9af9
 --- /dev/null
 +++ b/bsd/dev/a04s_input.c
-@@ -0,0 +1,759 @@
+@@ -0,0 +1,1110 @@
 +/*
 + * Galaxy A04s, stage 7: the keys (7b), and read-only first looks at the touch path (7a-1) and
 + * the GPU's power domain (7c-1).
@@ -518,6 +518,13 @@ index 0000000..b87c083
 + * The touch reset pin is left alone: Samsung's on_state keeps GPA3-0 an input pulled down. Nothing
 + * here touches the PMIC, the eMMC, or a pin outside GPM0-3.
 + *
++ * Touch, 7a-3: with tpfw=1 as well, and once the trim ID has matched, the firmware is loaded into the
++ * chip's SRAM as nvt_download_firmware_hw_crc() does. The ID's first byte, 0x0C, makes Samsung's
++ * trim_id_table pick the NT36672A memory map and hw_crc = 1. The firmware is not in this repository:
++ * mkpayload.py --touch-fw puts it in the payload at pack time, and /chosen/memory-map TouchFirmware
++ * says where. Before a byte goes to the chip, its size, SHA-256 (the csot file, the one panel ID 6
++ * selects), end flag, version check byte and every partition's range are checked.
++ *
 + * All of it is on the heartbeat (a04s_input_report), and each key change gets its own line.
 + */
 +#if defined(ARM64_BOARD_CONFIG_A04S)
@@ -528,8 +535,13 @@ index 0000000..b87c083
 +#include <kern/thread.h>
 +#include <pexpert/pexpert.h>
 +#include <libkern/libkern.h>
++#include <libkern/crypto/sha2.h>
++#include <pexpert/device_tree.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_static_ptovirt(vm_offset_t paddr);
++extern uint64_t mach_absolute_time(void);
++extern void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
 +extern void IOSleep(unsigned int milliseconds);
 +extern void sweet_hid_key(int key, int down);
 +extern int a04s_acpm_power_key(uint8_t *status1);
@@ -598,7 +610,7 @@ index 0000000..b87c083
 +#define SLAVE_SIG_INACT         (1u << 0)
 +#define TX_FIFO_LVL(st)         (((st) >> 6) & 0x7fu)   /* fifosize 64: mask (64 << 1) - 1 */
 +#define RX_FIFO_LVL(st)         (((st) >> 15) & 0x7fu)
-+#define SPI_XFER_MAX            32u
++#define SPI_XFER_MAX            60u             /* FIFO 64: a firmware chunk plus its address byte */
 +/* CMGP pins (bank_type_7): PUD and DRV are 4 bits a pin, at +0x8 and +0xc. */
 +#define PIN_PUD                 0x8u
 +#define PIN_DRV                 0xcu
@@ -613,6 +625,33 @@ index 0000000..b87c083
 +#define NVT_TRIM                0x3f004u
 +#define NVT_TRIM_OLD            0x1f64eu
 +#define NVT_TRIES               5
++/* 7a-3: NT36672A_memory_map (nt36xxx_mem_map.h) and the event map (nt36xxx.h). */
++#define NVT_EVENT_BUF           0x21c00u
++#define EV_HOST_CMD             0x50u
++#define EV_RESET_COMPLETE       0x60u
++#define EV_FWINFO               0x78u
++#define NVT_BOOT_RDY            0x3f10du
++#define NVT_G_ILM_CRC           0x3f100u
++#define NVT_G_DLM_CRC           0x3f104u
++#define NVT_ILM_LENGTH          0x3f118u
++#define NVT_R_ILM_CRC           0x3f120u
++#define NVT_R_DLM_CRC           0x3f124u
++#define NVT_ILM_DES             0x3f128u
++#define NVT_DLM_DES             0x3f12cu
++#define NVT_DLM_LENGTH          0x3f130u
++#define NVT_BLD_ILM_DLM_CRC     0x3f133u
++#define NVT_BLD_CRC_EN          0x3f30eu
++#define RESET_STATE_INIT        0xa0u
++#define RESET_STATE_MAX         0xafu
++#define FW_SIZE                 118784u         /* nt36525c_a04s_csot.bin */
++#define FW_NEED_WRITE           0x1b000u        /* the "NVT" end flag closes this sector */
++#define FW_MAX_PARTS            24
++#define FW_CHUNK                56u
++#define FW_TRIES                3
++static const uint8_t fw_sha256[SHA256_DIGEST_LENGTH] = {
++	0x5c, 0xf8, 0x41, 0x98, 0xd3, 0x4f, 0xbc, 0xba, 0x90, 0xcb, 0x17, 0x04, 0x61, 0xc0, 0xc9, 0xc2,
++	0x11, 0x7f, 0x3e, 0x6a, 0xdf, 0xee, 0x0c, 0x97, 0x4e, 0x9b, 0x01, 0x41, 0xb0, 0xa5, 0xb0, 0xf5,
++};
 +/* pd-g3d@11861d00: configuration, then status; bit 0 is the local power state (mali gpu_pmu_status_*). */
 +#define PD_G3D_PA               0x11861000u
 +#define PD_G3D_CONFIG           0xd00u
@@ -687,6 +726,19 @@ index 0000000..b87c083
 +	uint32_t addr;                          /* trim address of the last read */
 +	bool match;
 +} tp2 = { .state = -1, .why = "NOT RUN" };
++static struct {
++	int state;                              /* -1 not run, 0 the firmware reported reset, 1 failed */
++	const char *why;
++	int tries;
++	uint32_t parts, sent, ms;
++	uint8_t reset_state, crc_flag;
++	uint32_t g_ilm, r_ilm, g_dlm, r_dlm;
++	uint8_t fwinfo[8];
++} tp3 = { .state = -1, .why = "NOT RUN" };
++struct fw_part {
++	uint32_t bin, sram, size, crc;
++};
++static struct fw_part fw_parts[FW_MAX_PARTS];
 +
 +static inline uint32_t
 +io_rd(vm_offset_t base, uint32_t off)
@@ -1054,6 +1106,295 @@ index 0000000..b87c083
 +	return false;
 +}
 +
++/* CTP_SPI_READ at an address whose page is set: the address byte, a dummy, then n bytes. */
++static int
++nvt_read_here(uint32_t addr, uint8_t *out, uint32_t n)
++{
++	uint8_t tx[SPI_XFER_MAX] = { (uint8_t)(addr & 0x7fu) }, rx[SPI_XFER_MAX];
++	if (n + 2 > SPI_XFER_MAX) {
++		return EINVAL;
++	}
++	int error = spi_xfer(tx, rx, n + 2);
++	for (uint32_t i = 0; !error && i < n; i++) {
++		out[i] = rx[2 + i];
++	}
++	return error;
++}
++
++/* CTP_SPI_WRITE at an address whose page is set. */
++static int
++nvt_write_here(uint32_t addr, const uint8_t *data, uint32_t n)
++{
++	uint8_t tx[SPI_XFER_MAX];
++	if (n + 1 > SPI_XFER_MAX) {
++		return EINVAL;
++	}
++	tx[0] = (uint8_t)((addr & 0x7fu) | 0x80u);
++	for (uint32_t i = 0; i < n; i++) {
++		tx[1 + i] = data[i];
++	}
++	return spi_xfer(tx, NULL, n + 1);
++}
++
++static uint32_t
++le32(const uint8_t *b)
++{
++	return b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
++}
++
++/*
++ * nvt_get_fw_need_write_size(), the FW_VER check and nvt_bin_header_parser() for hw_crc, on the
++ * payload's copy. Any range outside the file fails the whole firmware.
++ */
++static const char *
++fw_check(const uint8_t *fw, uint32_t size)
++{
++	if (size != FW_SIZE) {
++		return "SIZE";
++	}
++	SHA256_CTX ctx;
++	uint8_t digest[SHA256_DIGEST_LENGTH];
++	SHA256_Init(&ctx);
++	SHA256_Update(&ctx, fw, size);
++	SHA256_Final(digest, &ctx);
++	for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
++		if (digest[i] != fw_sha256[i]) {
++			return "SHA256";
++		}
++	}
++	if (fw[FW_NEED_WRITE - 3] != 'N' || fw[FW_NEED_WRITE - 2] != 'V' || fw[FW_NEED_WRITE - 1] != 'T') {
++		return "END FLAG";
++	}
++	if (((fw[FW_NEED_WRITE - 4096] + fw[FW_NEED_WRITE - 4096 + 1]) & 0xffu) != 0xffu) {
++		return "FW VER";
++	}
++	uint32_t end = le32(fw), info = 0;
++	for (uint32_t pos = 0x30; pos < end; pos += 0x10) {
++		info++;
++	}
++	uint32_t ovly = (fw[0x28] & 0x10) ? (fw[0x28] & 0x0fu) : 0;
++	uint32_t parts = 2 + info + ovly;
++	if (parts > FW_MAX_PARTS || 0x30 + 0x10 * info > size) {
++		return "HEADER";
++	}
++	for (uint32_t i = 0; i < parts; i++) {
++		struct fw_part *pt = &fw_parts[i];
++		uint32_t pos;
++		if (i < 2) {
++			pt->bin = le32(fw + i * 12);
++			pt->sram = le32(fw + 4 + i * 12);
++			pt->size = le32(fw + 8 + i * 12);
++			pt->crc = le32(fw + 0x18 + i * 4);
++			continue;
++		}
++		pos = (i < 2 + info) ? 0x30 + 0x10 * (i - 2) : fw_parts[1].bin + 0x10 * (i - 2 - info);
++		if (pos + 16 > size) {
++			return "HEADER";
++		}
++		pt->sram = le32(fw + pos);
++		pt->size = le32(fw + pos + 4);
++		pt->bin = le32(fw + pos + 8);
++		pt->crc = le32(fw + pos + 12);
++	}
++	for (uint32_t i = 0; i < parts; i++) {
++		/* nvt_write_firmware() writes size + 1 bytes of every partition that has a size. */
++		if (fw_parts[i].size && (uint64_t)fw_parts[i].bin + fw_parts[i].size + 1 > size) {
++			return "RANGE";
++		}
++	}
++	tp3.parts = parts;
++	return NULL;
++}
++
++/* nvt_write_sram(), in FW_CHUNK pieces: a page set, then the bytes at that address. */
++static int
++fw_write_sram(const uint8_t *fw, uint32_t sram, uint32_t bin, uint32_t size)
++{
++	while (size) {
++		uint32_t n = size < FW_CHUNK ? size : FW_CHUNK;
++		int error = nvt_set_page(sram);
++		if (!error) {
++			error = nvt_write_here(sram, fw + bin, n);
++		}
++		if (error) {
++			return error;
++		}
++		tp3.sent += n;
++		sram += n;
++		bin += n;
++		size -= n;
++	}
++	return 0;
++}
++
++/* nvt_set_bld_crc_bank() for hw_crc 1: destination, 2 length bytes, golden CRC, all on one page. */
++static int
++fw_crc_bank(uint32_t des, uint32_t sram, uint32_t len_addr, uint32_t size, uint32_t g_addr, uint32_t crc)
++{
++	uint8_t d[3] = { (uint8_t)sram, (uint8_t)(sram >> 8), (uint8_t)(sram >> 16) };
++	uint8_t l[2] = { (uint8_t)size, (uint8_t)(size >> 8) };
++	uint8_t c[4] = { (uint8_t)crc, (uint8_t)(crc >> 8), (uint8_t)(crc >> 16), (uint8_t)(crc >> 24) };
++	int error = nvt_set_page(des);
++	if (!error) {
++		error = nvt_write_here(des, d, 3);
++	}
++	if (!error) {
++		error = nvt_write_here(len_addr, l, 2);
++	}
++	if (!error) {
++		error = nvt_write_here(g_addr, c, 4);
++	}
++	return error;
++}
++
++static uint32_t
++fw_read_word(uint32_t addr)
++{
++	uint8_t b[4] = { 0 };
++	if (nvt_set_page(addr) || nvt_read_here(addr, b, 4)) {
++		return 0xffffffffu;
++	}
++	return le32(b);
++}
++
++/* nvt_read_bld_hw_crc(): the boot loader's CRC flags and the golden and computed CRCs. */
++static void
++fw_read_crc(void)
++{
++	uint8_t flag = 0xff;
++	if (!nvt_set_page(NVT_BLD_ILM_DLM_CRC)) {
++		(void)nvt_read_here(NVT_BLD_ILM_DLM_CRC, &flag, 1);
++	}
++	tp3.crc_flag = flag;
++	tp3.g_ilm = fw_read_word(NVT_G_ILM_CRC);
++	tp3.r_ilm = fw_read_word(NVT_R_ILM_CRC);
++	tp3.g_dlm = fw_read_word(NVT_G_DLM_CRC);
++	tp3.r_dlm = fw_read_word(NVT_R_DLM_CRC);
++}
++
++/* One nvt_download_firmware_hw_crc() pass. 0 once the firmware reports a reset state. */
++static int
++fw_download_once(const uint8_t *fw)
++{
++	tp3.why = "BLD RESET";
++	(void)nvt_write_addr(NVT_SWRST_N8, 0x69);
++	IOSleep(50);
++	(void)nvt_write_addr(NVT_SPI_RD_FAST, 0x00);
++
++	tp3.why = "SRAM";
++	tp3.sent = 0;
++	for (uint32_t i = 0; i < tp3.parts; i++) {
++		if (fw_parts[i].size && fw_write_sram(fw, fw_parts[i].sram, fw_parts[i].bin, fw_parts[i].size + 1)) {
++			return EIO;
++		}
++	}
++
++	tp3.why = "CRC SET";
++	if (fw_crc_bank(NVT_ILM_DES, fw_parts[0].sram, NVT_ILM_LENGTH, fw_parts[0].size, NVT_G_ILM_CRC,
++	    fw_parts[0].crc) ||
++	    fw_crc_bank(NVT_DLM_DES, fw_parts[1].sram, NVT_DLM_LENGTH, fw_parts[1].size, NVT_G_DLM_CRC,
++	    fw_parts[1].crc)) {
++		return EIO;
++	}
++	/* nvt_bld_crc_enable(): set bit 7 of BLD_CRC_EN. */
++	uint8_t en = 0;
++	if (nvt_set_page(NVT_BLD_CRC_EN) || nvt_read_here(NVT_BLD_CRC_EN, &en, 1)) {
++		return EIO;
++	}
++	en |= 0x80;
++	if (nvt_write_here(NVT_BLD_CRC_EN, &en, 1)) {
++		return EIO;
++	}
++	/* nvt_fw_crc_enable(): clear the reset state, then host command 0xAE. */
++	uint8_t zero = 0x00, cmd = 0xae;
++	if (nvt_set_page(NVT_EVENT_BUF | EV_RESET_COMPLETE) ||
++	    nvt_write_here(NVT_EVENT_BUF | EV_RESET_COMPLETE, &zero, 1) ||
++	    nvt_set_page(NVT_EVENT_BUF | EV_HOST_CMD) ||
++	    nvt_write_here(NVT_EVENT_BUF | EV_HOST_CMD, &cmd, 1)) {
++		return EIO;
++	}
++	/* nvt_boot_ready(), hw_crc: BOOT_RDY = 1, then 5 ms. */
++	tp3.why = "BOOT RDY";
++	if (nvt_write_addr(NVT_BOOT_RDY, 1)) {
++		return EIO;
++	}
++	IOSleep(5);
++
++	/* nvt_check_fw_reset_state(RESET_STATE_INIT): 11 reads, 10 ms apart. */
++	tp3.why = "RESET STATE";
++	if (nvt_set_page(NVT_EVENT_BUF | EV_RESET_COMPLETE)) {
++		return EIO;
++	}
++	for (int i = 0; i <= 10; i++) {
++		uint8_t st[5] = { 0 };
++		if (!nvt_read_here(NVT_EVENT_BUF | EV_RESET_COMPLETE, st, 5)) {
++			tp3.reset_state = st[0];
++			if (st[0] >= RESET_STATE_INIT && st[0] <= RESET_STATE_MAX) {
++				return 0;
++			}
++		}
++		IOSleep(10);
++	}
++	return ETIMEDOUT;
++}
++
++/* Stage 7a-3, after the trim ID matched: find, check, then load the firmware. */
++static void
++a04s_touch_fw(void)
++{
++	int want = 0;
++	(void)PE_parse_boot_argn("tpfw", &want, sizeof(want));
++	if (!want) {
++		tp3.why = "OFF";
++		return;
++	}
++	DTEntry map;
++	void const *prop = NULL;
++	unsigned int prop_size = 0;
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &map) != kSuccess ||
++	    SecureDTGetProperty(map, "TouchFirmware", &prop, &prop_size) != kSuccess ||
++	    prop_size != 2 * sizeof(uint64_t)) {
++		tp3.why = "NOT IN PAYLOAD";
++		return;
++	}
++	const uint64_t *where = prop;
++	if (where[0] == 0 || where[1] != FW_SIZE) {
++		tp3.why = "SIZE";
++		return;
++	}
++	const uint8_t *fw = (const uint8_t *)ml_static_ptovirt((vm_offset_t)where[0]);
++	if (!fw) {
++		tp3.why = "NO MAPPING";
++		return;
++	}
++	tp3.why = fw_check(fw, (uint32_t)where[1]);
++	if (tp3.why) {
++		tp3.state = 1;
++		return;
++	}
++	kprintf("A04S 7A3 START PARTS %u\n", tp3.parts);
++	uint64_t start = mach_absolute_time(), ns = 0;
++	int error = EIO;
++	for (tp3.tries = 1; tp3.tries <= FW_TRIES; tp3.tries++) {
++		error = fw_download_once(fw);
++		if (!error) {
++			break;
++		}
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
++	tp3.ms = (uint32_t)(ns / 1000000u);
++	fw_read_crc();
++	if (!error && !nvt_set_page(NVT_EVENT_BUF | EV_FWINFO)) {
++		(void)nvt_read_here(NVT_EVENT_BUF | EV_FWINFO, tp3.fwinfo, sizeof(tp3.fwinfo));
++	}
++	tp3.state = error ? 1 : 0;
++	if (!error) {
++		tp3.why = "RUNNING";
++	}
++	kprintf("A04S 7A3 %s RST %02x MS %u SENT %u TO %u\n", tp3.why, tp3.reset_state, tp3.ms, tp3.sent,
++	    tp2.timeouts);
++}
++
 +static void
 +a04s_touch_spi_thread(__unused void *arg, __unused wait_result_t wr)
 +{
@@ -1120,6 +1461,11 @@ index 0000000..b87c083
 +	tp2.why = tp2.match ? "DONE" : "NO ID";
 +	kprintf("A04S 7A2 %s ID %02x %02x %02x %02x %02x %02x XF %u TO %u\n", tp2.why, tp2.id[0], tp2.id[1],
 +	    tp2.id[2], tp2.id[3], tp2.id[4], tp2.id[5], tp2.xfers, tp2.timeouts);
++	if (tp2.match && tp2.id[0] == 0x0c) {
++		a04s_touch_fw();
++	} else {
++		tp3.why = "NO 0C ID";
++	}
 +}
 +
 +/*
@@ -1233,6 +1579,11 @@ index 0000000..b87c083
 +	    tp2.usi_back, tp2.div_back, tp2.cfg, tp2.mode, tp2.status, tp2.xfers, tp2.timeouts);
 +	kprintf("TP2 ID %02x %02x %02x %02x %02x %02x AT %x TRY %d %s\n", tp2.id[0], tp2.id[1], tp2.id[2],
 +	    tp2.id[3], tp2.id[4], tp2.id[5], tp2.addr, tp2.tries, tp2.match ? "NT36525" : "NO MATCH");
++	kprintf("TP3 %d %s TRY %d PARTS %u SENT %u MS %u RST %02x\n", tp3.state, tp3.why, tp3.tries, tp3.parts,
++	    tp3.sent, tp3.ms, tp3.reset_state);
++	kprintf("TP3 CRC %02x ILM %08x/%08x DLM %08x/%08x FW %02x %02x %02x %02x %02x %02x %02x %02x\n",
++	    tp3.crc_flag, tp3.g_ilm, tp3.r_ilm, tp3.g_dlm, tp3.r_dlm, tp3.fwinfo[0], tp3.fwinfo[1],
++	    tp3.fwinfo[2], tp3.fwinfo[3], tp3.fwinfo[4], tp3.fwinfo[5], tp3.fwinfo[6], tp3.fwinfo[7]);
 +	kprintf("GPU PD %x %x %s\n", gpu_pd_config, gpu_pd_status, (gpu_pd_status & 1u) ? "ON" : "OFF");
 +	kprintf("GPU CLK %u%u %u%u%u Q %x %x\n", gate_code(gpu.top), gate_code(gpu.core), gate_code(gpu.g3d_pclk),
 +	    gate_code(gpu.g3d_gpu), gate_code(gpu.g3d_lhm), gpu.qch_gpu, gpu.qch_lhm);
