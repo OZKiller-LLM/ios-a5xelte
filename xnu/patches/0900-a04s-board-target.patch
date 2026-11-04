@@ -12,23 +12,24 @@ index 7dee125..cc95042 100644
  SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
  sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
 diff --git a/bsd/conf/files b/bsd/conf/files
-index a16d8e0..0e9f87d 100644
+index a16d8e0..49df2c9 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -106,6 +106,7 @@ bsd/dev/random/randomdev.c		standard
+@@ -106,6 +106,8 @@ bsd/dev/random/randomdev.c		standard
  bsd/dev/memdev.c			standard
  bsd/dev/sweet_ufs.c			standard
  bsd/dev/a5xelte_emmc.c			standard
 +bsd/dev/a04s_acpm.c			standard
++bsd/dev/a04s_input.c			standard
  bsd/dev/herolte_ufs.c			standard
  bsd/dev/herolte_touch.c			standard
  bsd/dev/herolte_battery.c		standard
 diff --git a/bsd/dev/a04s_acpm.c b/bsd/dev/a04s_acpm.c
 new file mode 100644
-index 0000000..e9ac908
+index 0000000..87fd20d
 --- /dev/null
 +++ b/bsd/dev/a04s_acpm.c
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,351 @@
 +/*
 + * Galaxy A04s: ACPM, the mailbox protocol of the APM core, to the S2MPU12 PMIC and the
 + * AUD3004X codec on the same bus. A write there can change a supply voltage, so this file
@@ -95,6 +96,7 @@ index 0000000..e9ac908
 +static uint32_t acpm_id, acpm_len, acpm_elem, acpm_seq;
 +static struct a04s_acpm_queue acpm_in, acpm_out;
 +static int acpm_error = -1;
++static bool acpm_ready;                         /* the channel was found: reads can go */
 +
 +/* Shown by the heartbeat: the PMIC's revision, codec registers, and the guarded write test. */
 +static uint8_t acpm_pmic_rev, acpm_mic_bias, acpm_mic_gain;
@@ -107,6 +109,8 @@ index 0000000..e9ac908
 +static bool acpm_guard_ok, acpm_writes_ok;
 +static int acpm_write_test = -1;
 +static uint32_t acpm_refused;
++static uint8_t acpm_status1[2];                 /* S2MPU12_PMIC_STATUS1 read on bus 0x00, then 0x01 */
++static int acpm_status1_err = -1;
 +
 +static inline uint32_t
 +sram_rd(uint32_t off)
@@ -280,8 +284,16 @@ index 0000000..e9ac908
 +	int want_writes = 0;
 +	(void)PE_parse_boot_argn("acpmwrite", &want_writes, sizeof(want_writes));
 +	acpm_error = acpm_setup();
++	acpm_ready = !acpm_error;
 +	if (!acpm_error) {
 +		acpm_error = acpm_read(0x00, 0x04, &acpm_pmic_rev);     /* S2MPU12_PMIC_CHIPID */
++	}
++	/* Stage 7b: STATUS1 from both pages, so the first boot shows which one holds PWRON. */
++	if (acpm_ready) {
++		acpm_status1_err = acpm_read(0x00, 0x0C, &acpm_status1[0]);
++		if (!acpm_status1_err) {
++			acpm_status1_err = acpm_read(0x01, 0x0C, &acpm_status1[1]);
++		}
 +	}
 +	if (!acpm_error) {
 +		acpm_error = acpm_read(0x08, 0x10, &acpm_mic_bias);     /* AUD3004X_110_PD_REF */
@@ -339,6 +351,22 @@ index 0000000..e9ac908
 +	}
 +}
 +
++/*
++ * Stage 7b: the side key. S2MPU12_PMIC_STATUS1 (0x0C) bit 0 is PWRON, the key's level; Samsung's
++ * s2mpu12-irq.c reads it through the main client, bus address 0x00. A status register: reading it
++ * clears nothing, unlike INT1. Only the key thread calls this, and a04s_input.c starts that after
++ * a04s_acpm_probe() returns, so two transfers never overlap on the channel.
++ */
++int a04s_acpm_power_key(uint8_t *status1);
++int
++a04s_acpm_power_key(uint8_t *status1)
++{
++	if (!acpm_ready) {
++		return ENXIO;
++	}
++	return acpm_read(0x00, 0x0C, status1);
++}
++
 +void a04s_acpm_report(void);
 +void
 +a04s_acpm_report(void)
@@ -350,6 +378,7 @@ index 0000000..e9ac908
 +	kprintf("OTP %02x %02x %02x %02x SET %02x BACK %02x\n", acpm_otp[0], acpm_otp[1], acpm_otp[2], acpm_otp[3],
 +	    (uint8_t)(acpm_codec[2] ^ 0x5au), acpm_set_back);
 +	kprintf("LDO33 %02x LDO34 %02x PDAUD %x %x\n", acpm_ldo33, acpm_ldo34, pd_aud_config, pd_aud_status);
++	kprintf("STATUS1 %d %02x %02x\n", acpm_status1_err, acpm_status1[0], acpm_status1[1]);
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_acpm_guard.h b/bsd/dev/a04s_acpm_guard.h
@@ -450,8 +479,352 @@ index 0000000..61653da
 +}
 +
 +#endif /* A04S_EMMC_GUARD_H */
+diff --git a/bsd/dev/a04s_input.c b/bsd/dev/a04s_input.c
+new file mode 100644
+index 0000000..9e86da3
+--- /dev/null
++++ b/bsd/dev/a04s_input.c
+@@ -0,0 +1,338 @@
++/*
++ * Galaxy A04s, stage 7: the keys (7b), and read-only first looks at the touch path (7a-1) and
++ * the GPU's power domain (7c-1).
++ *
++ * Keys: volume up is GPA0-7 and volume down GPA1-0 (gpio_keys in the live device tree); the side
++ * key is the PMIC's PWRON level, read over ACPM (a04s_acpm.c). They are polled every 15 ms, take
++ * two equal samples to change, and go to SweetHIDButtons. Nothing here changes a pin: the levels
++ * are read as the bootloader left the pins, and each key's idle level is learned at start, so an
++ * inverted pin can't hold a key down. A key that flips too often is dropped, with a line saying so.
++ *
++ * Touch, 7a-1: the NT36525C is on SPI1 (USI_CMGP0 at 0x11d00000). This build reads the USI mode,
++ * the CMGP clocks, the SPI controller, the pins Samsung's driver uses, and the three panel-ID pins
++ * that choose its firmware. It writes no register. A block is read only when the CMU gate in front
++ * of it isn't held off, because a read through a stopped clock can hang the bus.
++ *
++ * GPU, 7c-1: pd-g3d's status in the always-on PMU, which reads the same with the GPU on or off.
++ *
++ * All of it is on the heartbeat (a04s_input_report), and each key change gets its own line.
++ */
++#if defined(ARM64_BOARD_CONFIG_A04S)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <stdbool.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void IOSleep(unsigned int milliseconds);
++extern void sweet_hid_key(int key, int down);
++extern int a04s_acpm_power_key(uint8_t *status1);
++
++/* pinctrl@11850000 (ALIVE): bank n at n * 0x20, CON +0x0, DAT +0x4 (pinctrl-exynos-arm64.c). */
++#define ALIVE_PINS_PA           0x11850000u
++#define GPA0                    0x000u          /* 0 touch interrupt, 2 panel ID 3, 7 volume up */
++#define GPA1                    0x020u          /* 0 volume down */
++#define GPA3                    0x060u          /* 0 touch reset */
++#define PIN_CON                 0x0u
++#define PIN_DAT                 0x4u
++/* pinctrl@11c30000 (CMGP): one pin a bank. GPM0-2 are SPI1's clock and data, GPM3 its chip select. */
++#define CMGP_PINS_PA            0x11c30000u
++/* pinctrl@139b0000 (PERI): GPG1-7 is panel ID 1, GPG2-0 panel ID 2. */
++#define PERI_PINS_PA            0x139b0000u
++#define GPG1                    0x080u
++#define GPG2                    0x0a0u
++/* CMU gates (cmucal-sfr.c): bit 20 MANUAL, 21 CG_VAL, 28 automatic gating. MANUAL without CG_VAL is stopped. */
++#define CMU_APM_PA              0x11800000u
++#define GATE_GPIO_ALIVE         0x2018u
++#define CMU_PERI_PA             0x10030000u
++#define GATE_GPIO_PERI          0x2020u
++#define CMU_CMGP_PA             0x11c00000u
++#define MUX_USI_CMGP0           0x1004u
++#define DIV_USI_CMGP0           0x1804u
++#define GATE_GPIO_CMGP          0x2018u
++#define GATE_SYSREG_CMGP        0x2040u
++#define GATE_USI0_IPCLK         0x2044u
++#define GATE_USI0_PCLK          0x2048u
++#define QCH_USI_CMGP0           0x3034u
++#define GATE_MANUAL             (1u << 20)
++#define GATE_CG_VAL             (1u << 21)
++#define GATE_AUTO               (1u << 28)
++/* usi@11C22000 in SYSREG_CMGP: USI_CMGP0's mode (usi_v2.c). SPI is SPI_SW_CONF, bit 1. */
++#define USI_MODE_PA             0x11c22000u
++#define USI_MODE_SPI            0x2u
++/* spi@11D00000 (spi-s3c64xx.c). */
++#define SPI1_PA                 0x11d00000u
++#define SPI_CH_CFG              0x00u
++#define SPI_MODE_CFG            0x08u
++#define SPI_STATUS              0x14u
++#define SPI_USI_CON             0xc4u
++/* pd-g3d@11861d00: configuration, then status; bit 0 is the local power state (mali gpu_pmu_status_*). */
++#define PD_G3D_PA               0x11861000u
++#define PD_G3D_CONFIG           0xd00u
++#define PD_G3D_STATUS           0xd04u
++
++/* sweet_hid_key numbering. */
++#define KEY_POWER               0
++#define KEY_VOLUP               1
++#define KEY_VOLDOWN             2
++#define KEY_COUNT               3
++#define KEY_POLL_MS             15
++#define KEY_LINES               64              /* key lines shown; after that only the counters move */
++#define KEY_FLAP_WINDOW         67              /* polls, about a second */
++#define KEY_FLAP_LIMIT          10              /* changes in one window that drop a key */
++#define KEY_PMIC_EVERY          3               /* polls a side-key read: every 45 ms */
++#define KEY_PMIC_FAILS          8               /* ACPM failures in a row that stop the side key */
++
++static const char *const key_names[KEY_COUNT] = { "POWER", "VOLUP", "VOLDOWN" };
++static vm_offset_t alive_pins;
++static uint32_t key_idle;                       /* raw levels at start, a bit a key */
++static uint32_t key_dropped;                    /* keys that flipped too often */
++static volatile uint32_t key_down;              /* debounced state, a bit a key */
++static volatile uint32_t key_events, key_errors;
++static volatile uint8_t key_status1;
++static int key_last_error;
++static int keys_state = -1;                     /* -1 not started, 0 running, else why not */
++
++static struct {
++	uint32_t gate[6];                       /* GPIO ALIVE, GPIO PERI, GPIO CMGP, SYSREG CMGP, USI IPCLK, USI PCLK */
++	uint32_t qch, mux, div, usi_mode;
++	uint32_t spi_cfg, spi_mode, spi_status, usi_con;
++	uint32_t gpm_con, gpm_dat;              /* a nibble / a bit a pin, GPM0 lowest */
++	uint32_t gpa0_con, gpa0_dat, gpa3_con, gpa3_dat;
++	int panel_id;
++	bool spi_read;
++} tp = { .panel_id = -1 };
++static uint32_t gpu_pd_config, gpu_pd_status;
++
++static inline uint32_t
++io_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static bool
++gate_running(uint32_t gate)
++{
++	return !(gate & GATE_MANUAL) || (gate & GATE_CG_VAL);
++}
++
++/* A gate as one digit: 4 automatic gating, 2 CG_VAL, 1 MANUAL. 1 alone is a stopped clock. */
++static unsigned
++gate_code(uint32_t gate)
++{
++	return ((gate & GATE_AUTO) ? 4u : 0u) | ((gate & GATE_CG_VAL) ? 2u : 0u) | ((gate & GATE_MANUAL) ? 1u : 0u);
++}
++
++/*
++ * Raw levels, a bit a key, 1 high. The PMIC is asked only when read_pmic is set; otherwise, and when
++ * it can't be read, the side key keeps its last level. One CPU, and an ACPM read that times out
++ * spins for 50 ms, so after KEY_PMIC_FAILS failures in a row the side key stops being read.
++ */
++static uint32_t
++key_levels(uint32_t last, bool read_pmic)
++{
++	static unsigned fails_in_a_row;
++	uint32_t levels = last & (1u << KEY_POWER);
++	if (io_rd(alive_pins, GPA0 + PIN_DAT) & (1u << 7)) {
++		levels |= 1u << KEY_VOLUP;
++	}
++	if (io_rd(alive_pins, GPA1 + PIN_DAT) & 1u) {
++		levels |= 1u << KEY_VOLDOWN;
++	}
++	if (!read_pmic || fails_in_a_row >= KEY_PMIC_FAILS) {
++		return levels;
++	}
++	uint8_t status1 = 0;
++	int error = a04s_acpm_power_key(&status1);
++	if (error) {
++		key_errors++;
++		key_last_error = error;
++		if (++fails_in_a_row == KEY_PMIC_FAILS) {
++			kprintf("A04S KEY POWER STOPPED, ACPM ERROR %d\n", error);
++		}
++		return levels;
++	}
++	fails_in_a_row = 0;
++	key_status1 = status1;
++	levels &= ~(1u << KEY_POWER);
++	if (status1 & 1u) {
++		levels |= 1u << KEY_POWER;
++	}
++	return levels;
++}
++
++static void
++a04s_keys_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t levels = key_levels(0, true);
++	unsigned flips[KEY_COUNT] = { 0 }, window = 0, polls = 0;
++	key_idle = levels;
++	kprintf("A04S KEYS IDLE %x S1 %02x ERR %u\n", key_idle, key_status1, key_errors);
++	for (;;) {
++		IOSleep(KEY_POLL_MS);
++		if (++window == KEY_FLAP_WINDOW) {
++			window = 0;
++			for (int key = 0; key < KEY_COUNT; key++) {
++				flips[key] = 0;
++			}
++		}
++		uint32_t now = key_levels(levels, ++polls % KEY_PMIC_EVERY == 0);
++		if (now != levels) {
++			levels = now;                   /* one sample: wait for a second the same */
++			continue;
++		}
++		uint32_t down = (levels ^ key_idle) & ~key_dropped;
++		uint32_t changed = down ^ key_down;
++		for (int key = 0; key < KEY_COUNT; key++) {
++			uint32_t bit = 1u << key;
++			if (!(changed & bit)) {
++				continue;
++			}
++			bool pressed = (down & bit) != 0;
++			if (++flips[key] > KEY_FLAP_LIMIT) {
++				key_dropped |= bit;
++				down &= ~bit;
++				if (key_down & bit) {
++					sweet_hid_key(key, 0);
++				}
++				kprintf("A04S KEY %s DROPPED, %u CHANGES IN 1 S\n", key_names[key], flips[key]);
++				continue;
++			}
++			sweet_hid_key(key, pressed);
++			if (key_events++ < KEY_LINES) {
++				kprintf("A04S KEY %s %s\n", key_names[key], pressed ? "DOWN" : "UP");
++			}
++		}
++		key_down = down;
++	}
++}
++
++/* Stage 7a-1 and 7c-1: what the bootloader left, read once. */
++static void
++a04s_touch_gpu_probe(vm_offset_t cmu_peri, vm_offset_t cmu_cmgp)
++{
++	tp.gate[1] = io_rd(cmu_peri, GATE_GPIO_PERI);
++	tp.gate[2] = io_rd(cmu_cmgp, GATE_GPIO_CMGP);
++	tp.gate[3] = io_rd(cmu_cmgp, GATE_SYSREG_CMGP);
++	tp.gate[4] = io_rd(cmu_cmgp, GATE_USI0_IPCLK);
++	tp.gate[5] = io_rd(cmu_cmgp, GATE_USI0_PCLK);
++	tp.qch = io_rd(cmu_cmgp, QCH_USI_CMGP0);
++	tp.mux = io_rd(cmu_cmgp, MUX_USI_CMGP0);
++	tp.div = io_rd(cmu_cmgp, DIV_USI_CMGP0);
++
++	int id1 = -1, id2 = -1, id3 = -1;
++	if (alive_pins) {
++		tp.gpa0_con = io_rd(alive_pins, GPA0 + PIN_CON);
++		tp.gpa0_dat = io_rd(alive_pins, GPA0 + PIN_DAT);
++		tp.gpa3_con = io_rd(alive_pins, GPA3 + PIN_CON);
++		tp.gpa3_dat = io_rd(alive_pins, GPA3 + PIN_DAT);
++		id3 = (tp.gpa0_dat >> 2) & 1;
++	}
++	if (gate_running(tp.gate[1])) {
++		vm_offset_t peri = ml_io_map(PERI_PINS_PA, 0x1000);
++		if (peri) {
++			id1 = (io_rd(peri, GPG1 + PIN_DAT) >> 7) & 1;
++			id2 = io_rd(peri, GPG2 + PIN_DAT) & 1;
++		}
++	}
++	if (id1 >= 0 && id2 >= 0 && id3 >= 0) {
++		tp.panel_id = (id3 << 2) | (id2 << 1) | id1;   /* nvt_parse_dt's fw_sel_idx */
++	}
++	if (gate_running(tp.gate[2])) {
++		vm_offset_t cmgp = ml_io_map(CMGP_PINS_PA, 0x1000);
++		for (uint32_t pin = 0; cmgp && pin < 4; pin++) {
++			tp.gpm_con |= (io_rd(cmgp, pin * 0x20u + PIN_CON) & 0xfu) << (pin * 4);
++			tp.gpm_dat |= (io_rd(cmgp, pin * 0x20u + PIN_DAT) & 1u) << pin;
++		}
++	}
++	if (gate_running(tp.gate[3])) {
++		vm_offset_t usi = ml_io_map(USI_MODE_PA, 0x1000);
++		if (usi) {
++			tp.usi_mode = io_rd(usi, 0);
++		}
++	}
++	if (gate_running(tp.gate[4]) && gate_running(tp.gate[5]) && tp.usi_mode == USI_MODE_SPI) {
++		vm_offset_t spi = ml_io_map(SPI1_PA, 0x1000);
++		if (spi) {
++			tp.spi_cfg = io_rd(spi, SPI_CH_CFG);
++			tp.spi_mode = io_rd(spi, SPI_MODE_CFG);
++			tp.spi_status = io_rd(spi, SPI_STATUS);
++			tp.usi_con = io_rd(spi, SPI_USI_CON);
++			tp.spi_read = true;
++		}
++	}
++
++	vm_offset_t pmu = ml_io_map(PD_G3D_PA, 0x1000);
++	if (pmu) {
++		gpu_pd_config = io_rd(pmu, PD_G3D_CONFIG);
++		gpu_pd_status = io_rd(pmu, PD_G3D_STATUS);
++	}
++}
++
++/* After a04s_acpm_probe(): the key thread is the only ACPM user from here on. */
++void a04s_input_start(void);
++void
++a04s_input_start(void)
++{
++	vm_offset_t cmu_apm = ml_io_map(CMU_APM_PA, 0x4000);
++	vm_offset_t cmu_peri = ml_io_map(CMU_PERI_PA, 0x4000);
++	vm_offset_t cmu_cmgp = ml_io_map(CMU_CMGP_PA, 0x4000);
++	if (!cmu_apm || !cmu_peri || !cmu_cmgp) {
++		keys_state = ENOMEM;
++		kprintf("A04S 7 NO CMU MAPPING\n");
++		return;
++	}
++	tp.gate[0] = io_rd(cmu_apm, GATE_GPIO_ALIVE);
++	if (gate_running(tp.gate[0])) {
++		alive_pins = ml_io_map(ALIVE_PINS_PA, 0x1000);
++	}
++	a04s_touch_gpu_probe(cmu_peri, cmu_cmgp);
++	kprintf("A04S 7 PROBED\n");
++	if (!alive_pins) {
++		keys_state = gate_running(tp.gate[0]) ? ENOMEM : ENXIO;
++		return;
++	}
++	thread_t thread;
++	if (kernel_thread_start(a04s_keys_thread, NULL, &thread) != KERN_SUCCESS) {
++		keys_state = ENOMEM;
++		return;
++	}
++	thread_deallocate(thread);
++	keys_state = 0;
++}
++
++static const char *
++panel_firmware(int id)
++{
++	/* novatek,fw_name in the live device tree, by fw_sel_idx. */
++	switch (id) {
++	case 2: case 6: return "CSOT";
++	case 3: return "DTC";
++	case 4: return "TIANMA";
++	default: return "NONE";
++	}
++}
++
++void a04s_input_report(void);
++void
++a04s_input_report(void)
++{
++	uint32_t down = key_down;
++	kprintf("KEYS %d %c%c%c EV %u ER %u/%d S1 %02x\n", keys_state,
++	    (down & 1u) ? 'P' : '-', (down & 2u) ? 'U' : '-', (down & 4u) ? 'D' : '-',
++	    key_events, key_errors, key_last_error, key_status1);
++	kprintf("KEYCFG IDLE %x DROP %x CON %x %x\n", key_idle, key_dropped,
++	    tp.gpa0_con, alive_pins ? io_rd(alive_pins, GPA1 + PIN_CON) : 0);
++	kprintf("TP USI %x GT %u%u%u%u%u%u Q %x M %x D %x\n", tp.usi_mode,
++	    gate_code(tp.gate[0]), gate_code(tp.gate[1]), gate_code(tp.gate[2]),
++	    gate_code(tp.gate[3]), gate_code(tp.gate[4]), gate_code(tp.gate[5]), tp.qch, tp.mux, tp.div);
++	kprintf("TP SPI %d %x %x %x UC %x\n", tp.spi_read, tp.spi_cfg, tp.spi_mode, tp.spi_status, tp.usi_con);
++	kprintf("TP PIN %04x D %x INT %x/%u RST %x/%u\n", tp.gpm_con, tp.gpm_dat,
++	    tp.gpa0_con & 0xfu, tp.gpa0_dat & 1u, tp.gpa3_con & 0xfu, tp.gpa3_dat & 1u);
++	kprintf("TP ID %d FW %s\n", tp.panel_id, panel_firmware(tp.panel_id));
++	kprintf("GPU PD %x %x %s\n", gpu_pd_config, gpu_pd_status, (gpu_pd_status & 1u) ? "ON" : "OFF");
++}
++#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
-index 9ad7fd6..6c17549 100644
+index 9ad7fd6..087061d 100644
 --- a/bsd/dev/a5xelte_emmc.c
 +++ b/bsd/dev/a5xelte_emmc.c
 @@ -7,6 +7,12 @@
@@ -645,7 +1018,7 @@ index 9ad7fd6..6c17549 100644
  
  static uint32_t
  emmc_le32(const uint8_t *p)
-@@ -326,6 +402,355 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
+@@ -326,6 +402,359 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
  	return crc;
  }
  
@@ -950,6 +1323,8 @@ index 9ad7fd6..6c17549 100644
 +		kprintf("SVC %llu LAST %d ABORTS %llu\n", a04s_svc_count, a04s_last_svc, a04s_user_aborts);
 +		extern void a04s_acpm_report(void);
 +		a04s_acpm_report();
++		extern void a04s_input_report(void);
++		a04s_input_report();
 +		a04s_print_faults();
 +	}
 +}
@@ -989,6 +1364,8 @@ index 9ad7fd6..6c17549 100644
 +	kprintf("A04S 5C ROOT MOUNTED\n");
 +	extern void a04s_acpm_probe(void);
 +	a04s_acpm_probe();
++	extern void a04s_input_start(void);
++	a04s_input_start();
 +	a04s_report();
 +	if (kernel_thread_start(a04s_heartbeat, NULL, &thread) == KERN_SUCCESS) {
 +		thread_deallocate(thread);
@@ -1001,7 +1378,7 @@ index 9ad7fd6..6c17549 100644
  static int
  emmc_find_root_partition(void)
  {
-@@ -434,6 +859,7 @@ emmc_find_root_partition(void)
+@@ -434,6 +863,7 @@ emmc_find_root_partition(void)
  	    emmc_writable ? "writable" : "read-only");
  	return 0;
  }
@@ -1009,7 +1386,7 @@ index 9ad7fd6..6c17549 100644
  
  static int
  emmc_map_host(void)
-@@ -446,7 +872,7 @@ emmc_map_host(void)
+@@ -446,7 +876,7 @@ emmc_map_host(void)
  	}
  	if (SecureDTLookupEntry(NULL, "/a5xelte-emmc", &node) != kSuccess ||
  	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
@@ -1018,7 +1395,7 @@ index 9ad7fd6..6c17549 100644
  		printf("A5XELTE eMMC: missing or unexpected ADT register window\n");
  		return ENXIO;
  	}
-@@ -464,9 +890,19 @@ emmc_map_host(void)
+@@ -464,9 +894,19 @@ emmc_map_host(void)
  void
  a5xelte_emmc_probe(void)
  {
@@ -1038,7 +1415,7 @@ index 9ad7fd6..6c17549 100644
  }
  
  static int
-@@ -496,6 +932,9 @@ emmc_strategy(buf_t bp)
+@@ -496,6 +936,9 @@ emmc_strategy(buf_t bp)
  	if (!emmc_ready) {
  		error = ENXIO;
  	} else if (!(buf_flags(bp) & B_READ) && !emmc_writable) {
@@ -1048,7 +1425,7 @@ index 9ad7fd6..6c17549 100644
  		error = EROFS;
  	} else if (buf_blkno(bp) < 0) {
  		error = EINVAL;
-@@ -519,11 +958,31 @@ emmc_strategy(buf_t bp)
+@@ -519,11 +962,31 @@ emmc_strategy(buf_t bp)
  		uint32_t take = MIN(count - n, 512u - skip);
  		uint32_t lba = (uint32_t)(emmc_first_lba + pos / 512u);
  		if (buf_flags(bp) & B_READ) {
@@ -1080,7 +1457,7 @@ index 9ad7fd6..6c17549 100644
  			if (skip || take != 512u) {
  				error = emmc_read_sector(lba, emmc_bounce);
  			}
-@@ -531,6 +990,8 @@ emmc_strategy(buf_t bp)
+@@ -531,6 +994,8 @@ emmc_strategy(buf_t bp)
  				memcpy(emmc_bounce + skip, vaddr + n, take);
  				error = emmc_write_sector(lba, emmc_bounce);
  			}
@@ -1089,7 +1466,7 @@ index 9ad7fd6..6c17549 100644
  		}
  		if (error) {
  			break;
-@@ -596,6 +1057,7 @@ emmc_psize(__unused dev_t dev)
+@@ -596,6 +1061,7 @@ emmc_psize(__unused dev_t dev)
  	return emmc_ready ? (int)MIN(emmc_nsectors * 512u / emmc_secsize, INT_MAX) : -1;
  }
  
@@ -1097,7 +1474,7 @@ index 9ad7fd6..6c17549 100644
  static int
  emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
  {
-@@ -609,12 +1071,15 @@ emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
+@@ -609,12 +1075,15 @@ emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
  	    minphys, uio, (int)emmc_secsize) : EROFS;
  }
  
@@ -1113,7 +1490,7 @@ index 9ad7fd6..6c17549 100644
  static const struct cdevsw emmc_cdevsw = {
  	.d_open = emmc_open, .d_close = emmc_close, .d_read = emmc_read,
  	.d_write = emmc_write, .d_ioctl = emmc_ioctl, .d_stop = eno_stop,
-@@ -623,6 +1088,8 @@ static const struct cdevsw emmc_cdevsw = {
+@@ -623,6 +1092,8 @@ static const struct cdevsw emmc_cdevsw = {
  	.d_reserved_2 = eno_putc, .d_type = D_DISK,
  };
  
@@ -1122,7 +1499,7 @@ index 9ad7fd6..6c17549 100644
  /* _cnputs may execute in any context. Keep this path free of locks and I/O. */
  void a5xelte_log_append(const char *c, int size);
  void
-@@ -647,6 +1114,46 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
+@@ -647,6 +1118,46 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
  	*total = os_atomic_load(&emmc_log_total, relaxed);
  }
  
@@ -1169,7 +1546,7 @@ index 9ad7fd6..6c17549 100644
  struct a5_log_header {
  	char magic[8];
  	uint32_t version, size;
-@@ -752,4 +1259,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
+@@ -752,4 +1263,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
  	*dev = emmc_bdev;
  	return 0;
  }
@@ -1458,26 +1835,30 @@ index fbcdfac..679b0ba 100644
  
  /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
  mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
-diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
-index d1099ff..a1349e4 100644
---- a/iokit/KernelConfigTables.cpp
-+++ b/iokit/KernelConfigTables.cpp
-@@ -79,6 +79,7 @@ const char * gIOKernelConfigTables =
-     "     'IONameMatch'     = 'sweet,display';"
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 61aaef9..ccecb8e 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -456,6 +456,10 @@ SweetHIDTouch::start(IOService *provider)
+ 			fLogicalW = (int)((uint64_t)lw * 2560 / lh);
+ 		}
+ 	}
++#elif defined(ARM64_BOARD_CONFIG_A04S)
++	/* NT36525C reports 0..720 x 0..1600; the canvas fills the whole panel (SweetFramebuffer.cpp). */
++	fPanelW = fLogicalW = 720;
++	fPanelH = fLogicalH = 1600;
+ #elif defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	fPanelW = fLogicalW = 1080;
+ 	fPanelH = fLogicalH = 1920;
+@@ -476,6 +480,8 @@ SweetHIDTouch::start(IOService *provider)
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
  #endif
-     "   },"
-+#if !defined(ARM64_BOARD_CONFIG_A04S)
-     "   {"
-     "     'IOClass'         = SweetHIDButtons;"
-     "     'IOProviderClass' = IOResources;"
-@@ -89,6 +90,7 @@ const char * gIOKernelConfigTables =
-     "     'IOProviderClass' = IOResources;"
-     "     'IOMatchCategory' = SweetHIDTouch;"
-     "   },"
-+#endif
- #if !defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(ARM64_BOARD_CONFIG_HEROLTE)
-     "   {"
-     "     'IOClass'         = SweetBattery;"
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#elif defined(ARM64_BOARD_CONFIG_A04S)
++	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);	/* 1600 px at 270 dpi */
+ #elif defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	setProperty("SurfaceHeight", (unsigned long long)(121 << 16), 32);
+ #else
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 index 10449ab..20309cf 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
