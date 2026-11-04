@@ -3603,7 +3603,7 @@ index ed7dccd..16e7ce6 100644
  		fbcon_col = 0;
  		return;
 diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
-index 8f9c8a2..082e213 100644
+index 8f9c8a2..c459a99 100644
 --- a/pexpert/pexpert/arm64/A5XELTE.h
 +++ b/pexpert/pexpert/arm64/A5XELTE.h
 @@ -16,6 +16,7 @@
@@ -3614,17 +3614,18 @@ index 8f9c8a2..082e213 100644
  #define A5XELTE_FB_PA                 0xe2a00000
  #define A5XELTE_FB_WIDTH              1440
  #define A5XELTE_FB_HEIGHT             2560
-@@ -26,6 +27,22 @@
+@@ -26,6 +27,23 @@
  #define A5XELTE_MARKER_PA             0x8ffff100
  /* S-Boot starts on the Cortex-A53 "Apollo" cluster, Aff1 = 1. */
  #define A5XELTE_BOOT_MPIDR            0x100
 +#elif defined(ARM64_BOARD_CONFIG_A04S)
 +/* Galaxy A04s SM-A047F: values from its live device tree and the boot probe. */
 +#define A04S                          1
-+/* Stage 8: PSCI CPU_ON and GICv2 SGIs as on HEROLTE. Logical 0..3 = MPIDR 0x0..0x3, the
-+ * boot cluster; cpus=N picks how many start. The second cluster waits for its own test. */
++/* Stage 8: PSCI CPU_ON (context 0) and GICv2 SGIs as on HEROLTE. Logical 0..7 = PSCI
++ * targets 0x0..0x3 and 0x100..0x103, both clusters; cpus=N picks how many start. All
++ * eight cores have cluster-type 0 in the ADT, so XNU (no HAS_CLUSTER) makes one pset. */
 +#define A5XELTE_SMP                   1
-+#define SWEET_SMP_MAX_CPUS            4
++#define SWEET_SMP_MAX_CPUS            8     /* both clusters */
 +#define A5XELTE_FB_PA                 0xfa000000
 +#define A5XELTE_FB_WIDTH              720
 +#define A5XELTE_FB_HEIGHT             1600
