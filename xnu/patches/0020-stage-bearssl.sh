@@ -7,8 +7,16 @@ bearssl_sha=7bea48e5e850ab4cafbe68d3765cdaba13a86d6f
 bearssl_tmp=$(mktemp -d)
 trap 'rm -rf "$bearssl_tmp"' EXIT
 git init -q "$bearssl_tmp"
-git -C "$bearssl_tmp" fetch -q --depth 1 \
-    https://www.bearssl.org/git/BearSSL "$bearssl_sha"
+# bearssl.org sometimes answers 502. The commit is pinned and checked below, so a retry is safe.
+for try in 1 2 3 4 5; do
+    if git -C "$bearssl_tmp" fetch -q --depth 1 \
+        https://www.bearssl.org/git/BearSSL "$bearssl_sha"; then
+        break
+    fi
+    [[ $try -lt 5 ]] || exit 1
+    echo "BearSSL fetch failed (try $try of 5), retrying in $((try * 20)) s" >&2
+    sleep $((try * 20))
+done
 git -C "$bearssl_tmp" checkout -q FETCH_HEAD
 [[ "$(git -C "$bearssl_tmp" rev-parse HEAD)" == "$bearssl_sha" ]]
 python3 - "$bearssl_tmp" <<'PY'
