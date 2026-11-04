@@ -481,10 +481,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_input.c b/bsd/dev/a04s_input.c
 new file mode 100644
-index 0000000..d25f17a
+index 0000000..b87c083
 --- /dev/null
 +++ b/bsd/dev/a04s_input.c
-@@ -0,0 +1,754 @@
+@@ -0,0 +1,759 @@
 +/*
 + * Galaxy A04s, stage 7: the keys (7b), and read-only first looks at the touch path (7a-1) and
 + * the GPU's power domain (7c-1).
@@ -955,6 +955,9 @@ index 0000000..d25f17a
 +/*
 + * One polled transfer with the chip selected: len bytes out and len in, as enable_datapath() and
 + * wait_for_xfer() do without DMA. 0, or ETIMEDOUT after about 20 ms with too few bytes back.
++ * The controller shifts only while SLAVE_SEL's SIG_INACT is clear, so, as enable_cs() does in
++ * manual chip-select mode, it is cleared after the FIFO is loaded and set again once the bytes are
++ * back. v22 left it set: its 3 bytes stayed in the TX FIFO (ST c0) and every transfer timed out.
 + */
 +static int
 +spi_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
@@ -974,6 +977,7 @@ index 0000000..d25f17a
 +		*(volatile uint8_t *)(spi1 + SPI_TX_DATA) = tx[i];
 +	}
 +	io_wr(spi1, SPI_CH_CFG, cfg | CH_TXCH_ON);
++	io_wr(spi1, SPI_SLAVE_SEL, 0);
 +	int error = ETIMEDOUT;
 +	for (int wait = 0; wait < 20 && error; wait++) {
 +		for (int i = 0; i < 2000; i++) {
@@ -998,6 +1002,7 @@ index 0000000..d25f17a
 +	}
 +	tp2.xfers++;
 +	tp2.status = io_rd(spi1, SPI_STATUS);
++	io_wr(spi1, SPI_SLAVE_SEL, SLAVE_SIG_INACT);
 +	spi_flush();
 +	spi_cs(1);
 +	return error;
