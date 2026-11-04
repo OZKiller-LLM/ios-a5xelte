@@ -26,7 +26,7 @@ index a16d8e0..49df2c9 100644
  bsd/dev/herolte_battery.c		standard
 diff --git a/bsd/dev/a04s_acpm.c b/bsd/dev/a04s_acpm.c
 new file mode 100644
-index 0000000..87fd20d
+index 0000000..2c2f141
 --- /dev/null
 +++ b/bsd/dev/a04s_acpm.c
 @@ -0,0 +1,351 @@
@@ -352,9 +352,9 @@ index 0000000..87fd20d
 +}
 +
 +/*
-+ * Stage 7b: the side key. S2MPU12_PMIC_STATUS1 (0x0C) bit 0 is PWRON, the key's level; Samsung's
-+ * s2mpu12-irq.c reads it through the main client, bus address 0x00. A status register: reading it
-+ * clears nothing, unlike INT1. Only the key thread calls this, and a04s_input.c starts that after
++ * Stage 7b: the side key. S2MPU12_PMIC_STATUS1 (0x0C) bit 0 is PWRON, the key's level. It is on the
++ * PMIC page, bus address 0x01: s2mpu12-key.c reads it through s2mpu12->pmic (I2C_ADDR_PMIC). v20
++ * read page 0x00, which stays 00. A status register: reading it clears nothing, unlike INT1. Only the key thread calls this, and a04s_input.c starts that after
 + * a04s_acpm_probe() returns, so two transfers never overlap on the channel.
 + */
 +int a04s_acpm_power_key(uint8_t *status1);
@@ -364,7 +364,7 @@ index 0000000..87fd20d
 +	if (!acpm_ready) {
 +		return ENXIO;
 +	}
-+	return acpm_read(0x00, 0x0C, status1);
++	return acpm_read(0x01, 0x0C, status1);
 +}
 +
 +void a04s_acpm_report(void);
@@ -481,10 +481,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_input.c b/bsd/dev/a04s_input.c
 new file mode 100644
-index 0000000..9e86da3
+index 0000000..a3d575b
 --- /dev/null
 +++ b/bsd/dev/a04s_input.c
-@@ -0,0 +1,338 @@
+@@ -0,0 +1,433 @@
 +/*
 + * Galaxy A04s, stage 7: the keys (7b), and read-only first looks at the touch path (7a-1) and
 + * the GPU's power domain (7c-1).
@@ -501,6 +501,10 @@ index 0000000..9e86da3
 + * of it isn't held off, because a read through a stopped clock can hang the bus.
 + *
 + * GPU, 7c-1: pd-g3d's status in the always-on PMU, which reads the same with the GPU on or off.
++ * 7c-2: v20 showed pd-g3d on, so the Mali-G52's ID registers are read, but only if the domain is
++ * on, every clock gate on the path from the CPU (CMU_TOP, CMU_CORE, CMU_G3D) is running, and the
++ * GPU's and its bus port's Q-channels can't have the clock handshaken off. Otherwise the line says
++ * which check stopped it. Reads only, as for touch.
 + *
 + * All of it is on the heartbeat (a04s_input_report), and each key change gets its own line.
 + */
@@ -560,6 +564,26 @@ index 0000000..9e86da3
 +#define PD_G3D_PA               0x11861000u
 +#define PD_G3D_CONFIG           0xd00u
 +#define PD_G3D_STATUS           0xd04u
++/* The GPU's clock path (cmucal-sfr.c). CMU_G3D is inside pd-g3d: it is read only with the domain on. */
++#define CMU_TOP_PA              0x120e0000u
++#define GATE_TOP_G3D_SWITCH     0x2040u
++#define CMU_CORE_PA             0x12000000u
++#define GATE_CORE_LHS_P_G3D     0x20c0u
++#define CMU_G3D_PA              0x11400000u
++#define GATE_G3D_CMU_PCLK       0x2000u
++#define GATE_G3D_GPU            0x2004u
++#define GATE_G3D_LHM_P          0x2018u
++#define QCH_G3D_GPU             0x3018u
++#define QCH_G3D_LHM_P           0x3020u
++#define QCH_ENABLE              (1u << 0)
++#define QCH_CLOCK_REQ           (1u << 1)
++/* Mali-G52 (Bifrost) at 0x11500000: GPU_ID, L2_FEATURES, GPU_STATUS, shader and L2 present masks. */
++#define GPU_PA                  0x11500000u
++#define GPU_ID                  0x000u
++#define GPU_L2_FEATURES         0x004u
++#define GPU_STATUS              0x034u
++#define GPU_SHADER_PRESENT      0x100u
++#define GPU_L2_PRESENT          0x120u
 +
 +/* sweet_hid_key numbering. */
 +#define KEY_POWER               0
@@ -579,6 +603,7 @@ index 0000000..9e86da3
 +static uint32_t key_dropped;                    /* keys that flipped too often */
 +static volatile uint32_t key_down;              /* debounced state, a bit a key */
 +static volatile uint32_t key_events, key_errors;
++static volatile uint32_t key_raw, key_polls;     /* last raw levels, polls so far */
 +static volatile uint8_t key_status1;
 +static int key_last_error;
 +static int keys_state = -1;                     /* -1 not started, 0 running, else why not */
@@ -593,6 +618,11 @@ index 0000000..9e86da3
 +	bool spi_read;
 +} tp = { .panel_id = -1 };
 +static uint32_t gpu_pd_config, gpu_pd_status;
++static struct {
++	uint32_t top, core, g3d_pclk, g3d_gpu, g3d_lhm, qch_gpu, qch_lhm;
++	uint32_t id, l2_features, status, shaders, l2;
++	const char *why;                        /* NULL once the ID was read */
++} gpu = { .why = "NOT TRIED" };
 +
 +static inline uint32_t
 +io_rd(vm_offset_t base, uint32_t off)
@@ -667,6 +697,8 @@ index 0000000..9e86da3
 +			}
 +		}
 +		uint32_t now = key_levels(levels, ++polls % KEY_PMIC_EVERY == 0);
++		key_raw = now;
++		key_polls = polls;
 +		if (now != levels) {
 +			levels = now;                   /* one sample: wait for a second the same */
 +			continue;
@@ -695,6 +727,60 @@ index 0000000..9e86da3
 +		}
 +		key_down = down;
 +	}
++}
++
++/* A Q-channel that lets the hardware stop the clock: enabled, with no clock request held. */
++static bool
++qch_may_stop(uint32_t qch)
++{
++	return (qch & QCH_ENABLE) && !(qch & QCH_CLOCK_REQ);
++}
++
++/* Stage 7c-2: the Mali's ID, if every check on the way passes. */
++static void
++a04s_gpu_probe(void)
++{
++	if (!(gpu_pd_status & 1u)) {
++		gpu.why = "PD OFF";
++		return;
++	}
++	vm_offset_t top = ml_io_map(CMU_TOP_PA, 0x4000);
++	vm_offset_t core = ml_io_map(CMU_CORE_PA, 0x4000);
++	vm_offset_t g3d = ml_io_map(CMU_G3D_PA, 0x4000);
++	if (!top || !core || !g3d) {
++		gpu.why = "NO MAPPING";
++		return;
++	}
++	gpu.top = io_rd(top, GATE_TOP_G3D_SWITCH);
++	gpu.core = io_rd(core, GATE_CORE_LHS_P_G3D);
++	if (!gate_running(gpu.top) || !gate_running(gpu.core)) {
++		gpu.why = "BUS GATE";
++		return;
++	}
++	gpu.g3d_pclk = io_rd(g3d, GATE_G3D_CMU_PCLK);
++	gpu.g3d_gpu = io_rd(g3d, GATE_G3D_GPU);
++	gpu.g3d_lhm = io_rd(g3d, GATE_G3D_LHM_P);
++	gpu.qch_gpu = io_rd(g3d, QCH_G3D_GPU);
++	gpu.qch_lhm = io_rd(g3d, QCH_G3D_LHM_P);
++	if (!gate_running(gpu.g3d_gpu) || !gate_running(gpu.g3d_lhm)) {
++		gpu.why = "G3D GATE";
++		return;
++	}
++	if (qch_may_stop(gpu.qch_gpu) || qch_may_stop(gpu.qch_lhm)) {
++		gpu.why = "QCH";
++		return;
++	}
++	vm_offset_t regs = ml_io_map(GPU_PA, 0x1000);
++	if (!regs) {
++		gpu.why = "NO MAPPING";
++		return;
++	}
++	gpu.id = io_rd(regs, GPU_ID);
++	gpu.l2_features = io_rd(regs, GPU_L2_FEATURES);
++	gpu.status = io_rd(regs, GPU_STATUS);
++	gpu.shaders = io_rd(regs, GPU_SHADER_PRESENT);
++	gpu.l2 = io_rd(regs, GPU_L2_PRESENT);
++	gpu.why = NULL;
 +}
 +
 +/* Stage 7a-1 and 7c-1: what the bootloader left, read once. */
@@ -757,6 +843,7 @@ index 0000000..9e86da3
 +		gpu_pd_config = io_rd(pmu, PD_G3D_CONFIG);
 +		gpu_pd_status = io_rd(pmu, PD_G3D_STATUS);
 +	}
++	a04s_gpu_probe();
 +}
 +
 +/* After a04s_acpm_probe(): the key thread is the only ACPM user from here on. */
@@ -808,9 +895,9 @@ index 0000000..9e86da3
 +a04s_input_report(void)
 +{
 +	uint32_t down = key_down;
-+	kprintf("KEYS %d %c%c%c EV %u ER %u/%d S1 %02x\n", keys_state,
++	kprintf("KEYS %d %c%c%c EV %u ER %u/%d S1 %02x RAW %x P %u\n", keys_state,
 +	    (down & 1u) ? 'P' : '-', (down & 2u) ? 'U' : '-', (down & 4u) ? 'D' : '-',
-+	    key_events, key_errors, key_last_error, key_status1);
++	    key_events, key_errors, key_last_error, key_status1, key_raw, key_polls);
 +	kprintf("KEYCFG IDLE %x DROP %x CON %x %x\n", key_idle, key_dropped,
 +	    tp.gpa0_con, alive_pins ? io_rd(alive_pins, GPA1 + PIN_CON) : 0);
 +	kprintf("TP USI %x GT %u%u%u%u%u%u Q %x M %x D %x\n", tp.usi_mode,
@@ -821,6 +908,14 @@ index 0000000..9e86da3
 +	    tp.gpa0_con & 0xfu, tp.gpa0_dat & 1u, tp.gpa3_con & 0xfu, tp.gpa3_dat & 1u);
 +	kprintf("TP ID %d FW %s\n", tp.panel_id, panel_firmware(tp.panel_id));
 +	kprintf("GPU PD %x %x %s\n", gpu_pd_config, gpu_pd_status, (gpu_pd_status & 1u) ? "ON" : "OFF");
++	kprintf("GPU CLK %u%u %u%u%u Q %x %x\n", gate_code(gpu.top), gate_code(gpu.core), gate_code(gpu.g3d_pclk),
++	    gate_code(gpu.g3d_gpu), gate_code(gpu.g3d_lhm), gpu.qch_gpu, gpu.qch_lhm);
++	if (gpu.why) {
++		kprintf("GPU ID SKIPPED %s\n", gpu.why);
++	} else {
++		kprintf("GPU ID %08x L2F %x ST %x SC %x L2 %x\n", gpu.id, gpu.l2_features, gpu.status,
++		    gpu.shaders, gpu.l2);
++	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
