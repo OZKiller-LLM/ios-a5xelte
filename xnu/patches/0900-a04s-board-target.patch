@@ -483,10 +483,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..02a3922
+index 0000000..8927644
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
-@@ -0,0 +1,1755 @@
+@@ -0,0 +1,1764 @@
 +/*
 + * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
 + *
@@ -584,14 +584,17 @@ index 0000000..02a3922
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern void IOSleep(unsigned int milliseconds);
 +extern bool a04s_gpu_path_ok(void);
-+extern int a04s_fg_temp_dc(void);
++extern int a04s_batt_temp_dc(void);        /* bsd/dev/a04s_power.c: thermistor, else gauge */
++extern void a04s_adc_sample(void);
 +
 +/*
 + * Thermal monitor (a04sthermal, on unless it is 0): the three TMU sensors once a second. Readings
 + * count only after THERM_TRUST_READS in a row are sane (all three 10-80 C, within 25 C of each
 + * other), so a wrong decoding can't drive anything. Levels by the hottest sensor: NORMAL, WARM from
 + * 65 C, HOT from 80 C, CRITICAL from 95 C. GPU work runs only at NORMAL with trusted readings, and
-+ * every level change and a battery at 50 C or more gets a line. Nothing here changes a clock or a
++ * every level change and a battery at 50 C or more gets a line. A battery at 50 C or more also
++ * counts as HOT, so GPU work stops, until it is below 47 C (v43: the thermistor on the SoC's ADC
++ * once its readings are trusted, else the gauge). Nothing here changes a clock or a
 + * voltage: the CPU clusters' PLLs are read for the report only, and the CPUs stay at S-Boot's
 + * clock. The TMU's own trip (115 C in the device tree, if S-Boot armed it: CTL bit 12) is what
 + * protects the chip past that.
@@ -1076,7 +1079,10 @@ index 0000000..02a3922
 +		hi = t > hi ? t : hi;
 +	}
 +	therm.samples++;
-+	therm.batt_dc = a04s_fg_temp_dc();
++	if (therm.samples % 2u == 1u) {
++		a04s_adc_sample();
++	}
++	therm.batt_dc = a04s_batt_temp_dc();
 +	if (therm.batt_dc >= BATT_HOT_DC && !therm.batt_warned) {
 +		therm.batt_warned = true;
 +		kprintf("A04S BATTERY HOT %d.%d C\n", therm.batt_dc / 10, therm.batt_dc % 10);
@@ -1097,6 +1103,9 @@ index 0000000..02a3922
 +		}
 +		level = hi >= THERM_CRITICAL ? LEVEL_CRITICAL : hi >= THERM_HOT ? LEVEL_HOT :
 +		    hi >= THERM_WARM ? LEVEL_WARM : LEVEL_NORMAL;
++		if (therm.batt_warned && level < LEVEL_HOT) {
++			level = LEVEL_HOT;       /* the battery at 50 C or more */
++		}
 +	}
 +	if (level != therm.level) {
 +		therm.changes++;
@@ -3592,10 +3601,10 @@ index 0000000..ac6bfa6
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_power.c b/bsd/dev/a04s_power.c
 new file mode 100644
-index 0000000..83562d9
+index 0000000..dcb7b13
 --- /dev/null
 +++ b/bsd/dev/a04s_power.c
-@@ -0,0 +1,680 @@
+@@ -0,0 +1,954 @@
 +/*
 + * Galaxy A04s: the battery (fuel gauge), and read-only first looks at the speaker amp and the audio
 + * power domain.
@@ -3636,6 +3645,8 @@ index 0000000..83562d9
 + *
 + * Speaker amp, with a04samp=1: its ID and status registers (0x03, 0x00; 16-bit, big-endian), once
 + * at root mount. The amp stays as S-Boot left it.
++ *
++ * Battery thermistor, with a04sadc=1: the SoC's ADC, channel 1 (v43, below the gauge's code).
 + *
 + * Audio power, always: pd-aud's configuration and status in the always-on PMU, and PLL_AUD in
 + * CMU_AUD only when pd-aud is on. Reads only; ABOX itself is not touched.
@@ -4203,6 +4214,265 @@ index 0000000..83562d9
 +	return fg.temp_dc;
 +}
 +
++/*
++ * v43, the battery thermistor through the SoC's ADC (adc@11C40000, samsung,exynos-adc-v3), with the
++ * boot-arg a04sadc=1. The device tree's battery node reads channel 1 (adc-temp) and channel 3
++ * (adc-in-bat), and its battery,temp_table_adc / temp_table_data turn channel 1's 12-bit value into
++ * tenths of a degree: 90.0 C at 284 down to -20.0 C at 3681, every 5 C. Samsung's limits for a wired
++ * charger (same node): charging stops above 50.0 C (wire_warm_overheat_thresh) and below 0 C
++ * (wire_cold_cool3_thresh), and is cut to 1280 mA above 42.0 C (wire_normal_warm_thresh).
++ *
++ * One conversion is Linux exynos_adc.c's v3 path, polled instead of taking the interrupt: CON1 soft
++ * reset then non-reset, CON2 = C_TIME(6), INT_EN = 1, the channel into CON2, START; wait for INT_ST
++ * bit 0 (at most 1 ms); the value from DAT (0x08, low 12 bits); INT_ST cleared, C_TIME and INT_EN
++ * back to 0. These are the only writes, all to the ADC's own registers. It runs only if:
++ *  - GIC SPI 0 (the ADC's line, interrupts = <0 0 4>) is disabled, so INT_EN can't reach XNU with
++ *    no handler, and
++ *  - the ADC's PCLK gate in CMU_CMGP (0x200c) isn't manually stopped. The clock unit is only read.
++ * No CHUB semaphore: the node has no samsung,cmgp-sysreg, and nothing else here uses the ADC (on
++ * Android, the audio codec's jack detection reads channels 6 and 7).
++ *
++ * The thermal thread samples it every 2 s: five conversions of channel 1, the highest and lowest
++ * dropped (battery,adc_check_count = 5), the middle three averaged; channels 0, 2 and 3 once each,
++ * for the report. A reading counts once three samples in a row are inside the table and within
++ * 3.0 C of each other, and stops counting on any sample outside it. Until then
++ * a04s_batt_temp_dc() gives the gauge's temperature instead. Charger safety is a dry run in v43:
++ * the decision is logged and reported, and the charger is not written.
++ */
++#define CMU_CMGP_PA             0x11c00000u
++#define CMGP_ADC_MUX            0x1000u
++#define CMGP_ADC_DIV            0x1800u
++#define CMGP_ADC_GATE_S0        0x200cu
++#define CMGP_ADC_GATE_S1        0x2010u
++#define CMGP_ADC_DMYQCH         0x3000u
++#define CMGP_ADC_QCH_S0         0x3004u
++#define ADC_PA                  0x11c40000u
++#define ADC_CON1                0x00u
++#define ADC_CON2                0x04u
++#define ADC_DAT                 0x08u
++#define ADC_INT_EN              0x10u
++#define ADC_INT_ST              0x14u
++#define ADC_VER                 0x20u
++#define ADC_CON1_START          (1u << 0)
++#define ADC_CON1_NON_RESET      (1u << 1)
++#define ADC_CON1_SOFT_RESET     (1u << 2)
++#define ADC_CON2_C_TIME_6       (6u << 4)
++#define ADC_CON2_C_TIME_MASK    (7u << 4)
++#define ADC_CON2_ACH_MASK       0xfu
++#define ADC_VALUE_MASK          0xfffu
++#define ADC_GIC_ID              32u             /* SPI 0 */
++#define ADC_WAIT_US             1000u
++#define ADC_CH_BATT             1u
++#define ADC_SAMPLES             5u
++#define ADC_TRUST               3u
++#define ADC_STEADY_DC           30
++#define ADC_TABLE_N             23u
++#define SAFE_HOT_DC             500
++#define SAFE_WARM_DC            420
++#define SAFE_COLD_DC            0
++#define SAFE_HYST_DC            20
++
++static const uint16_t batt_table_adc[ADC_TABLE_N] = {
++	284, 340, 397, 501, 583, 678, 794, 919, 1070, 1223, 1400, 1593, 1810, 2038, 2272, 2503, 2733, 2940,
++	3134, 3310, 3458, 3582, 3681,
++};
++static const int16_t batt_table_dc[ADC_TABLE_N] = {
++	900, 850, 800, 750, 700, 650, 600, 550, 500, 450, 400, 350, 300, 250, 200, 150, 100, 50, 0, -50,
++	-100, -150, -200,
++};
++
++enum { SAFE_UNKNOWN, SAFE_OK, SAFE_WARM, SAFE_HOT, SAFE_COLD };
++static const char *const safe_names[] = { "UNKNOWN", "OK", "WOULD LIMIT 1280 MA (WARM)", "WOULD STOP (HOT)",
++	                                  "WOULD STOP (COLD)" };
++
++static vm_offset_t cmgp_va, adc_va;
++static struct {
++	const char *state;                      /* OFF, NO MAPPING, GATE, GIC, TIMEOUT, OUT OF TABLE, SETTLING, OK */
++	uint32_t mux, div, gate0, gate1, dmyqch, qch0, ver, dat;
++	unsigned raw, raw_min, raw_max, ch[4];
++	int temp_dc, last_dc;
++	unsigned steady, samples, timeouts, untrusted;
++	int safe;
++	bool trusted, checked, usable;
++} adc = { .state = "OFF", .temp_dc = NO_TEMP, .last_dc = NO_TEMP, .safe = SAFE_UNKNOWN };
++
++/* Whether the ADC may be used: decided once, with reads only. */
++static bool
++adc_check(void)
++{
++	if (adc.checked) {
++		return adc.usable;
++	}
++	adc.checked = true;
++	if (!gicd_va) {
++		gicd_va = ml_io_map(GICD_PA, 0x1000);
++	}
++	cmgp_va = ml_io_map(CMU_CMGP_PA, 0x4000);
++	adc_va = ml_io_map(ADC_PA, 0x1000);
++	if (!gicd_va || !cmgp_va || !adc_va) {
++		adc.state = "NO MAPPING";
++		return false;
++	}
++	adc.mux = io_rd(cmgp_va, CMGP_ADC_MUX);
++	adc.div = io_rd(cmgp_va, CMGP_ADC_DIV);
++	adc.gate0 = io_rd(cmgp_va, CMGP_ADC_GATE_S0);
++	adc.gate1 = io_rd(cmgp_va, CMGP_ADC_GATE_S1);
++	adc.dmyqch = io_rd(cmgp_va, CMGP_ADC_DMYQCH);
++	adc.qch0 = io_rd(cmgp_va, CMGP_ADC_QCH_S0);
++	if (!gate_running(adc.gate0)) {
++		adc.state = "GATE";
++		return false;
++	}
++	uint32_t en = io_rd(gicd_va, GICD_ISENABLER + 4u * (ADC_GIC_ID / 32u));
++	if (en & (1u << (ADC_GIC_ID % 32u))) {
++		adc.state = "GIC";
++		return false;
++	}
++	adc.ver = io_rd(adc_va, ADC_VER);
++	adc.state = "SETTLING";
++	adc.usable = true;
++	return true;
++}
++
++/* One conversion of channel ch; false if it didn't finish within ADC_WAIT_US. */
++static bool
++adc_convert(unsigned ch, unsigned *value)
++{
++	io_wr(adc_va, ADC_CON1, ADC_CON1_SOFT_RESET);
++	io_wr(adc_va, ADC_CON1, ADC_CON1_NON_RESET);
++	io_wr(adc_va, ADC_CON2, ADC_CON2_C_TIME_6);
++	io_wr(adc_va, ADC_INT_EN, 1u);
++	io_wr(adc_va, ADC_CON2, (io_rd(adc_va, ADC_CON2) & ~ADC_CON2_ACH_MASK) | (ch & ADC_CON2_ACH_MASK));
++	io_wr(adc_va, ADC_CON1, io_rd(adc_va, ADC_CON1) | ADC_CON1_START);
++	bool done = false;
++	for (unsigned us = 0; us <= ADC_WAIT_US; us += 5) {
++		if (io_rd(adc_va, ADC_INT_ST) & 1u) {
++			done = true;
++			break;
++		}
++		delay(5);
++	}
++	adc.dat = io_rd(adc_va, ADC_DAT);
++	*value = adc.dat & ADC_VALUE_MASK;
++	io_wr(adc_va, ADC_INT_ST, 1u);
++	io_wr(adc_va, ADC_CON2, io_rd(adc_va, ADC_CON2) & ~ADC_CON2_C_TIME_MASK);
++	io_wr(adc_va, ADC_INT_EN, 0);
++	return done;
++}
++
++/* Channel 1's value to tenths of a degree by the device tree's table; NO_TEMP outside it. */
++static int
++adc_to_dc(unsigned raw)
++{
++	if (raw < batt_table_adc[0] || raw > batt_table_adc[ADC_TABLE_N - 1u]) {
++		return NO_TEMP;
++	}
++	for (unsigned i = 1; i < ADC_TABLE_N; i++) {
++		if (raw <= batt_table_adc[i]) {
++			int a0 = batt_table_adc[i - 1u], a1 = batt_table_adc[i];
++			int t0 = batt_table_dc[i - 1u], t1 = batt_table_dc[i];
++			return t0 + (t1 - t0) * ((int)raw - a0) / (a1 - a0);
++		}
++	}
++	return NO_TEMP;
++}
++
++static int
++safe_decide(int dc, int was)
++{
++	if (dc == NO_TEMP) {
++		return SAFE_UNKNOWN;
++	}
++	/* Leaving a state takes SAFE_HYST_DC (2.0 C) past its threshold. */
++	int hot = was == SAFE_HOT ? SAFE_HOT_DC - SAFE_HYST_DC : SAFE_HOT_DC;
++	int warm = was == SAFE_WARM || was == SAFE_HOT ? SAFE_WARM_DC - SAFE_HYST_DC : SAFE_WARM_DC;
++	int cold = was == SAFE_COLD ? SAFE_COLD_DC + SAFE_HYST_DC : SAFE_COLD_DC;
++	if (dc > hot) {
++		return SAFE_HOT;
++	}
++	if (dc < cold) {
++		return SAFE_COLD;
++	}
++	if (dc > warm) {
++		return SAFE_WARM;
++	}
++	return SAFE_OK;
++}
++
++/* From the thermal thread (bsd/dev/a04s_gpu.c), every 2 s. Only that thread touches the ADC. */
++void a04s_adc_sample(void);
++void
++a04s_adc_sample(void)
++{
++	unsigned want = 0;
++	(void)PE_parse_boot_argn("a04sadc", &want, sizeof(want));
++	if (want != 1 || !adc_check()) {
++		return;
++	}
++	unsigned v[ADC_SAMPLES] = { 0 }, lo = 0, hi = 0, sum = 0;
++	for (unsigned i = 0; i < ADC_SAMPLES; i++) {
++		if (!adc_convert(ADC_CH_BATT, &v[i])) {
++			adc.timeouts++;
++			adc.state = "TIMEOUT";
++			adc.trusted = false;
++			adc.steady = 0;
++			return;
++		}
++		lo = v[i] < v[lo] ? i : lo;
++		hi = v[i] > v[hi] ? i : hi;
++		sum += v[i];
++	}
++	adc.raw_min = v[lo];
++	adc.raw_max = v[hi];
++	adc.raw = lo == hi ? v[0] : (sum - v[lo] - v[hi]) / (ADC_SAMPLES - 2u);
++	for (unsigned c = 0; c < 4; c++) {
++		if (c != ADC_CH_BATT && !adc_convert(c, &adc.ch[c])) {
++			adc.timeouts++;
++		}
++	}
++	adc.ch[ADC_CH_BATT] = adc.raw;
++	adc.samples++;
++	int dc = adc_to_dc(adc.raw);
++	if (dc == NO_TEMP) {
++		adc.state = "OUT OF TABLE";
++		if (adc.trusted) {
++			adc.untrusted++;
++		}
++		adc.trusted = false;
++		adc.steady = 0;
++		adc.temp_dc = NO_TEMP;
++	} else {
++		int step = adc.last_dc == NO_TEMP ? 0 : dc - adc.last_dc;
++		adc.steady = (adc.last_dc != NO_TEMP && step <= ADC_STEADY_DC && step >= -ADC_STEADY_DC) ?
++		    adc.steady + 1u : 1u;
++		if (!adc.trusted && adc.steady >= ADC_TRUST) {
++			adc.trusted = true;
++			kprintf("A04S BATTERY TEMP %s%d.%d C FROM THE THERMISTOR (ADC %u)\n", dc < 0 ? "-" : "",
++			    (dc < 0 ? -dc : dc) / 10, (dc < 0 ? -dc : dc) % 10, adc.raw);
++		}
++		adc.state = adc.trusted ? "OK" : "SETTLING";
++		adc.temp_dc = dc;
++	}
++	adc.last_dc = dc;
++	int safe = safe_decide(adc.trusted ? adc.temp_dc : NO_TEMP, adc.safe);
++	if (safe != adc.safe) {
++		kprintf("A04S CHGSAFE %s AT %d (DRY RUN, CHARGER NOT WRITTEN)\n", safe_names[safe], adc.temp_dc);
++		adc.safe = safe;
++	}
++}
++
++/* The battery temperature in tenths of a degree, or NO_TEMP: the thermistor once it is trusted,
++ * else the gauge's. For the thermal monitor and SweetBattery. */
++int a04s_batt_temp_dc(void);
++int
++a04s_batt_temp_dc(void)
++{
++	if (adc.trusted && adc.temp_dc != NO_TEMP) {
++		return adc.temp_dc;
++	}
++	return a04s_fg_temp_dc();
++}
++
 +/* Called from a04s_input_start() at root mount. */
 +void a04s_power_start(void);
 +void
@@ -4253,6 +4523,19 @@ index 0000000..83562d9
 +	    fg.state, fg.devname, fg.percent, fg.mv, fg.avg_mv, fg.ma, fg.avg_ma, fg.rem, fg.full, fg.designcap,
 +	    fg.temp_dc / 10, (fg.temp_dc < 0 ? -fg.temp_dc : fg.temp_dc) % 10, fg.status, fg.cycles, fg.tte,
 +	    fg.reads, fg.bad);
++	{
++		int t = adc.temp_dc == NO_TEMP ? 0 : adc.temp_dc, use = a04s_batt_temp_dc();
++		int ut = use == NO_TEMP ? 0 : use;
++		kprintf("BATT ADC %s T %s%d.%d C RAW %u (%u-%u) CH0 %u CH2 %u CH3 %u N %u TO %u LOST %u SAFE %s USE %s %s%d.%d
++",
++		    adc.state, t < 0 ? "-" : "", (t < 0 ? -t : t) / 10, (t < 0 ? -t : t) % 10, adc.raw, adc.raw_min,
++		    adc.raw_max, adc.ch[0], adc.ch[2], adc.ch[3], adc.samples, adc.timeouts, adc.untrusted, safe_names[adc.safe],
++		    use == NO_TEMP ? "NONE" : (adc.trusted ? "ADC" : "FG"), ut < 0 ? "-" : "", (ut < 0 ? -ut : ut) / 10,
++		    (ut < 0 ? -ut : ut) % 10);
++		kprintf("BATT ADC CMGP MUX %x DIV %x G %x/%x Q %x/%x VER %x DAT %x
++", adc.mux, adc.div, adc.gate0, adc.gate1,
++		    adc.dmyqch, adc.qch0, adc.ver, adc.dat);
++	}
 +	static const char *const vbus_names[8] = { "NONE", "SDP", "CDP", "DCP", "HVDCP", "ADAPTER", "NONSTD", "OTG" };
 +	static const char *const chrg_names[4] = { "NOT", "PRE", "FAST", "DONE" };
 +	static const unsigned wd_secs[4] = { 0, 40, 80, 160 };
@@ -5174,7 +5457,7 @@ index 0000000..e3b8eb3
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
-index 6d8a0fd..70101bc 100644
+index 6d8a0fd..680d690 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
 @@ -4,7 +4,7 @@
@@ -5204,7 +5487,7 @@ index 6d8a0fd..70101bc 100644
 +/* The SY6970 charger's view of the cable, and the gauge's temperature (tenths of a degree,
 + * -9990 when unknown). Both read only. */
 +extern "C" int a04s_chg_state(int *external, int *charging, int *done);
-+extern "C" int a04s_fg_temp_dc(void);
++extern "C" int a04s_batt_temp_dc(void);   /* v43: the thermistor once trusted, else the gauge */
 +#define BATTERY_DESIGN_MAH 5000u        /* SM-A047F, typical */
 +#elif defined(ARM64_BOARD_CONFIG_HEROLTE)
 +#define SWEET_BATTERY_MAXIM 1
@@ -5216,8 +5499,8 @@ index 6d8a0fd..70101bc 100644
  	putNumber("DesignCapacity", BATTERY_DESIGN_MAH);
  	putNumber("InstantAmperage", (UInt32)ma);
 +#if defined(ARM64_BOARD_CONFIG_A04S)
-+	/* iOS battery convention: centidegrees C. A04S: the gauge's, when it has one (0-90 C). */
-+	int tempDc = measured ? a04s_fg_temp_dc() : -9990;
++	/* iOS battery convention: centidegrees C. A04S: the battery thermistor's, else the gauge's (0-90 C). */
++	int tempDc = measured ? a04s_batt_temp_dc() : -9990;
 +	bool tempKnown = tempDc >= 0 && tempDc <= 900;
 +	putNumber("Temperature", tempKnown ? (UInt32)(tempDc * 10) : 2500u);
 +#else
