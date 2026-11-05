@@ -2571,10 +2571,10 @@ index 0000000..ac6bfa6
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_power.c b/bsd/dev/a04s_power.c
 new file mode 100644
-index 0000000..36346cb
+index 0000000..b23a13c
 --- /dev/null
 +++ b/bsd/dev/a04s_power.c
-@@ -0,0 +1,479 @@
+@@ -0,0 +1,538 @@
 +/*
 + * Galaxy A04s: the battery (fuel gauge), and read-only first looks at the speaker amp and the audio
 + * power domain.
@@ -2585,11 +2585,18 @@ index 0000000..36346cb
 + * The driver below can only read. A transfer sends the device's address and one register number,
 + * then a repeated start and the read: no data byte is ever sent, and there is no write function.
 + * Each device has a fixed list of registers it may read; anything else is refused. A bus is used
-+ * only if its CMU_PERI PCLK gate is running, its Q-channel can't stop the clock, both pins already
-+ * have the I2C function (nothing here changes a pin), and the controller isn't busy. The bus runs at
++ * only if its CMU_PERI PCLK gate is running, its Q-channel can't stop the clock, both pins have the
++ * I2C function, and the controller isn't busy. The bus runs at
 + * the slowest rate the controller has (PCLK / 512 / 16), far under the 400 kHz both chips take, and
 + * its interrupt-enable bit is set only if the GIC can't deliver that interrupt (S-Boot may have left
 + * an SPI enabled, and XNU has no handler for it). Every poll is bounded.
++ *
++ * Pins (v35): v34 found S-Boot leaves gpp0-0/1 as GPIO outputs (CON 0x11, so it bit-bangs the gauge)
++ * and gpp1-0/1 at reset (inputs, 0x00). pins_to_i2c() sets just those two pins of the bank to
++ * function 2 with pull-up 3, the values in the device tree's i2c0-bus / i2c3-bus nodes, and only
++ * from those two states. Exynos 850 PERI banks have 4-bit CON and PUD fields (Linux
++ * exynos850_bank_type_off: CON +0x0, DAT +0x4, PUD +0x8). The other pins' fields are written back
++ * unchanged, the result is read back, and on a mismatch both registers get their old values again.
 + *
 + * Fuel gauge, with the boot-arg a04sfg=1 (SweetBattery polls it every 30 s; without it iOS gets
 + * SweetBattery's static 100%): Maxim ModelGauge m5 registers, as the S7's MAX77854 (herolte_battery.c).
@@ -2624,6 +2631,14 @@ index 0000000..36346cb
 +#define CMU_PERI_PA             0x10030000u
 +#define PERI_PINS_PA            0x139b0000u     /* pinctrl@139b0000: bank CON +0x0 */
 +#define GICD_PA                 0x12a01000u
++#define PIN_CON                 0x00u
++#define PIN_DAT                 0x04u
++#define PIN_PUD                 0x08u
++#define PIN_MASK                0xffu           /* pins 0 and 1, 4 bits each */
++#define PIN_FUNC_I2C            0x22u
++#define PIN_PUD_UP              0x33u           /* samsung,pin-pud = 3 */
++#define PIN_WAS_OUT             0x11u           /* as S-Boot leaves gpp0 */
++#define PIN_WAS_IN              0x00u           /* the reset value, as gpp1 */
 +#define GICD_ISENABLER          0x100u
 +
 +/* s3c2440-i2c (Linux i2c-s3c2410.c). */
@@ -2678,6 +2693,8 @@ index 0000000..36346cb
 +	vm_offset_t va;
 +	const char *why;                        /* NULL once usable */
 +	uint32_t gate, qch, pins, con0, stat0;
++	uint32_t pins_was, pud_was, dat_was, pud;
++	const char *pinset;                     /* -, ALREADY, SET, UNEXPECTED, NO READBACK */
 +	bool irqen;
 +	uint32_t xfers, errors;
 +	const char *last_error;
@@ -2685,9 +2702,9 @@ index 0000000..36346cb
 +
 +static struct i2c_bus buses[2] = {
 +	{ .name = "I2C0", .pa = 0x13830000u, .gate_off = 0x203cu, .qch_off = 0x301cu, .pin_bank = 0x020u,
-+	  .gic_id = 32u + 0xc4u, .why = "NOT TRIED", .last_error = "-" },
++	  .gic_id = 32u + 0xc4u, .why = "NOT TRIED", .last_error = "-", .pinset = "-" },
 +	{ .name = "I2C3", .pa = 0x13860000u, .gate_off = 0x2048u, .qch_off = 0x3028u, .pin_bank = 0x040u,
-+	  .gic_id = 32u + 0xc7u, .why = "NOT TRIED", .last_error = "-" },
++	  .gic_id = 32u + 0xc7u, .why = "NOT TRIED", .last_error = "-", .pinset = "-" },
 +};
 +
 +/* The only transfers there are: a device, its bus, its byte order, and the registers it may read. */
@@ -2756,7 +2773,44 @@ index 0000000..36346cb
 +	return (qch & QCH_ENABLE) && !(qch & QCH_CLOCK_REQ);
 +}
 +
-+/* Reads only: decides whether a bus can be used, and how. */
++/*
++ * The one write outside the I2C controllers: the bus's two pins to the I2C function with pull-ups,
++ * pull-ups first so a line is never left floating. Called with a04s_i2c_mtx held, once per bus.
++ */
++static void
++pins_to_i2c(struct i2c_bus *b)
++{
++	uint32_t con = io_rd(pins_va, b->pin_bank + PIN_CON);
++	uint32_t pud = io_rd(pins_va, b->pin_bank + PIN_PUD);
++
++	b->pins_was = con;
++	b->pud_was = pud;
++	b->dat_was = io_rd(pins_va, b->pin_bank + PIN_DAT);
++	if ((con & PIN_MASK) == PIN_FUNC_I2C) {
++		b->pinset = "ALREADY";
++		return;
++	}
++	if ((con & PIN_MASK) != PIN_WAS_OUT && (con & PIN_MASK) != PIN_WAS_IN) {
++		b->pinset = "UNEXPECTED";
++		return;
++	}
++	io_wr(pins_va, b->pin_bank + PIN_PUD, (pud & ~PIN_MASK) | PIN_PUD_UP);
++	io_wr(pins_va, b->pin_bank + PIN_CON, (con & ~PIN_MASK) | PIN_FUNC_I2C);
++	delay(100);
++	uint32_t con2 = io_rd(pins_va, b->pin_bank + PIN_CON);
++	uint32_t pud2 = io_rd(pins_va, b->pin_bank + PIN_PUD);
++	if (con2 != ((con & ~PIN_MASK) | PIN_FUNC_I2C) || pud2 != ((pud & ~PIN_MASK) | PIN_PUD_UP)) {
++		io_wr(pins_va, b->pin_bank + PIN_CON, con);
++		io_wr(pins_va, b->pin_bank + PIN_PUD, pud);
++		b->pinset = "NO READBACK";
++		kprintf("A04S %s PINS NO READBACK CON %x->%x PUD %x->%x, put back\n", b->name, con, con2, pud, pud2);
++		return;
++	}
++	b->pinset = "SET";
++	kprintf("A04S %s PINS SET CON %x->%x PUD %x->%x DAT %x\n", b->name, con, con2, pud, pud2, b->dat_was);
++}
++
++/* Decides whether a bus can be used, and how. Its only write is pins_to_i2c(). */
 +static void
 +bus_check(struct i2c_bus *b)
 +{
@@ -2783,8 +2837,12 @@ index 0000000..36346cb
 +		b->why = "QCH";
 +		return;
 +	}
-+	b->pins = io_rd(pins_va, b->pin_bank);
-+	if ((b->pins & 0xffu) != 0x22u) {
++	if (b->pinset[0] == '-') {
++		pins_to_i2c(b);
++	}
++	b->pins = io_rd(pins_va, b->pin_bank + PIN_CON);
++	b->pud = io_rd(pins_va, b->pin_bank + PIN_PUD);
++	if ((b->pins & PIN_MASK) != PIN_FUNC_I2C) {
 +		b->why = "PINS";
 +		return;
 +	}
@@ -3041,9 +3099,10 @@ index 0000000..36346cb
 +{
 +	for (unsigned i = 0; i < 2; i++) {
 +		struct i2c_bus *b = &buses[i];
-+		kprintf("%s %s G %x Q %x PIN %x CON %x ST %x IRQ %d XF %u ERR %u %s\n", b->name,
-+		    b->why ? b->why : "OK", b->gate, b->qch, b->pins & 0xffu, b->con0, b->stat0, b->irqen ? 1 : 0,
-+		    b->xfers, b->errors, b->last_error);
++		kprintf("%s %s G %x Q %x PIN %x PUD %x (WAS %x/%x DAT %x %s) CON %x ST %x IRQ %d XF %u ERR %u %s\n",
++		    b->name, b->why ? b->why : "OK", b->gate, b->qch, b->pins & PIN_MASK, b->pud & PIN_MASK,
++		    b->pins_was & PIN_MASK, b->pud_was & PIN_MASK, b->dat_was & 3u, b->pinset, b->con0, b->stat0,
++		    b->irqen ? 1 : 0, b->xfers, b->errors, b->last_error);
 +	}
 +	kprintf("FG %s DEV %04x %u%% %u MV (AVG %u) %d MA (AVG %d) CAP %u/%u DES %u T %d.%d ST %04x CYC %u TTE %u N %u/%u\n",
 +	    fg.state, fg.devname, fg.percent, fg.mv, fg.avg_mv, fg.ma, fg.avg_ma, fg.rem, fg.full, fg.designcap,
