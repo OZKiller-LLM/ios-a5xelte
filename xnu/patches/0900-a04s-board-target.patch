@@ -483,10 +483,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..13b348a
+index 0000000..02a3922
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
-@@ -0,0 +1,1681 @@
+@@ -0,0 +1,1755 @@
 +/*
 + * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
 + *
@@ -561,6 +561,13 @@ index 0000000..13b348a
 + *    frames to a04s_gpu_present_*: the surface's pages are mapped into one of two 8 MiB GPU slots
 + *    (level-3 tables in the private block's second 64 KiB), the frame is scaled to the panel, and
 + *    any fault turns the GPU path off for the rest of the boot, so the CPU copy takes over.
++ *    v41 on the phone: the blit job completed with no fault but left every pixel at the clear
++ *    colour. The compiler's info (shaderc, CI run 42033097275) has wait_6 = wait_7 = 1 for both
++ *    shaders, which pan_shader_prepare_bifrost_rsd() copies into Renderer Properties bits 30-31;
++ *    v41 left them 0. v42 sets them, clears under the blit in magenta (so "did not run" and "sampled
++ *    black" differ), and runs the test in five variants (as above; nearest filtering; RGBA order;
++ *    normalised coordinates; the gradient's code in the blit's Draw), printing each one's samples.
++ *    The first variant whose four quadrants all match is used for the full check and the live path.
 + *  - The cores are powered off again. iOS keeps drawing on the CPU.
 + */
 +#if defined(ARM64_BOARD_CONFIG_A04S)
@@ -768,6 +775,13 @@ index 0000000..13b348a
 +#define BL_TEST_W               64u
 +#define BL_TEST_H               64u
 +#define SWIZZLE_RGBA            0x688u          /* R, G, B, A */
++#define RSD_WAIT_6_7            ((1u << 30) | (1u << 31))       /* the compiler's wait_6, wait_7 */
++#define BL_CLEAR                0xffff00ffu     /* magenta, under the blit */
++#define BLV_NEAREST             1u              /* variant: nearest filtering */
++#define BLV_RGBA                2u              /* variant: texture order RGBA, not BGRA */
++#define BLV_NORM                4u              /* variant: normalised coordinates, corners 0..1 */
++#define BLV_GRADIENT            8u              /* variant: the gradient's code in the blit's Draw */
++#define BL_VARIANTS             5u
 +#define SWIZZLE_BGRA            0x60au          /* B, G, R, A */
 +#define TEX_FMT_BGRA8           ((187u << 12) | 4u)     /* RGBA8_UNORM, BGRA order */
 +#define ATTR_FMT_RGB32F         ((183u << 12) | 16u)    /* RGB32F, RGB1 order */
@@ -906,7 +920,12 @@ index 0000000..13b348a
 +	const char *why;
 +	struct frag_result r;
 +	uint32_t good, total, samples[4];
-+} blit = { .state = "OFF", .why = "NOT RUN" };
++	uint32_t variant;                       /* BLV_* flags in use */
++	uint32_t var_samples[BL_VARIANTS][5];   /* four quadrants and the centre */
++	uint32_t var_exc[BL_VARIANTS], var_us[BL_VARIANTS];
++	bool var_ran[BL_VARIANTS];
++	unsigned var_count;
++} blit = { .state = "OFF", .why = "NOT RUN", .variant = 0xffffffffu };
 +
 +static struct {
 +	uint32_t id, pages, maps;
@@ -1531,7 +1550,8 @@ index 0000000..13b348a
 +	rsd[4] = (2u << 8) |            /* depth source: fixed function */
 +	    (2u << 12) |                /* 32 registers a thread */
 +	    (1u << 19) |                /* allow forward pixel kill */
-+	    (1u << 20);                 /* allow being killed; pixel kill and ZS update force early (0) */
++	    (1u << 20) |                /* allow being killed; pixel kill and ZS update force early (0) */
++	    RSD_WAIT_6_7;               /* Mesa: wait_6 = wait_7 = 1 */
 +	rsd[8] = 0xffffu | (7u << 24);  /* sample mask, depth function ALWAYS */
 +	rsd[9] = 0xffffu;               /* stencil masks, stencil off */
 +	rsd[10] = 0x024fff00u;          /* stencil front: ALWAYS, REPLACE x3, mask 0xff */
@@ -1590,7 +1610,7 @@ index 0000000..13b348a
 + * SweetFramebuffer's present path, which its vsync timer serialises.
 + */
 +static void
-+blit_setup(uint64_t src, uint32_t w, uint32_t h, uint32_t stride)
++blit_setup(uint64_t src, uint32_t w, uint32_t h, uint32_t stride, uint32_t variant)
 +{
 +	vm_offset_t base = mem_va + GPU_DATA_OFF;
 +	gpu_zero(base + BL_TEX_OFF, BL_CODE_OFF - BL_TEX_OFF);
@@ -1599,7 +1619,7 @@ index 0000000..13b348a
 +	volatile uint32_t *tex = (volatile uint32_t *)(base + BL_TEX_OFF);
 +	tex[0] = 2u |                   /* type: texture */
 +	    (2u << 4) |                 /* dimension 2D; coordinates as the sampler says */
-+	    (TEX_FMT_BGRA8 << 10);
++	    ((variant & BLV_RGBA ? (187u << 12) : TEX_FMT_BGRA8) << 10);
 +	tex[1] = ((h - 1u) << 16) | (w - 1u);
 +	tex[2] = SWIZZLE_RGBA |         /* identity */
 +	    (2u << 12);                 /* linear; one level */
@@ -1611,7 +1631,9 @@ index 0000000..13b348a
 +	/* Sampler (v7.xml): clamp to edge, bilinear, unnormalised coordinates (pan_preload_emit_sampler). */
 +	*(volatile uint32_t *)(base + BL_SAMPLER_OFF) = 1u | (9u << 8) | (9u << 12) | (9u << 16) |
 +	    (1u << 21) |                /* round to nearest even */
-+	    (1u << 26);                 /* clamp integer array indices; seamless cube off, normalised off */
++	    (1u << 26) |                /* clamp integer array indices; seamless cube off */
++	    (variant & BLV_NORM ? 1u << 25 : 0) |   /* normalised coordinates (off: texels) */
++	    (variant & BLV_NEAREST ? (1u << 27) | (1u << 28) : 0);  /* nearest (off: bilinear) */
 +
 +	/* Varying 0: RGB32F from attribute buffer 0, no offset (Bifrost). */
 +	*(volatile uint32_t *)(base + BL_ATTR_OFF) = ATTR_FMT_RGB32F << 10;
@@ -1621,7 +1643,8 @@ index 0000000..13b348a
 +	*(volatile uint32_t *)(base + BL_ABUF_OFF + 12) = 64u;
 +	*(volatile uint32_t *)(base + BL_ABUF_OFF + 16) = 1u;
 +	volatile uint32_t *coords = (volatile uint32_t *)(base + BL_COORDS_OFF);
-+	const uint32_t us[4] = { 0, w, 0, w }, vs[4] = { 0, 0, h, h };
++	uint32_t uw = variant & BLV_NORM ? 1u : w, vh = variant & BLV_NORM ? 1u : h;
++	const uint32_t us[4] = { 0, uw, 0, uw }, vs[4] = { 0, 0, vh, vh };
 +	for (unsigned i = 0; i < 4; i++) {
 +		coords[4 * i + 0] = f32_bits(us[i]);
 +		coords[4 * i + 1] = f32_bits(vs[i]);
@@ -1647,13 +1670,18 @@ index 0000000..13b348a
 +	put64(base + BL_RSD_OFF, GPU_VA + BL_CODE_OFF);
 +	rsd[2] = 1u | (1u << 16);       /* samplers, textures */
 +	rsd[3] = 1u << 16;              /* varyings */
-+	rsd[4] = (2u << 8) | (2u << 12) | (1u << 19) | (1u << 20);
++	rsd[4] = (2u << 8) | (2u << 12) | (1u << 19) | (1u << 20) | RSD_WAIT_6_7;
 +	rsd[8] = 0xffffu | (7u << 24);
 +	rsd[9] = 0xffffu;
 +	rsd[10] = 0x024fff00u;
 +	rsd[11] = 0x024fff00u;
-+	rsd[12] = 1u << 7;              /* preload coverage (r60) only */
-+	rsd[15] = 2u | (1u << 15);      /* message preload 1: VAR_TEX, zero LOD */
++	if (variant & BLV_GRADIENT) {
++		rsd[12] = (1u << 7) | (1u << 11);       /* the gradient: coverage and fragment position */
++		rsd[15] = 0;
++	} else {
++		rsd[12] = 1u << 7;      /* preload coverage (r60) only */
++		rsd[15] = 2u | (1u << 15);      /* message preload 1: VAR_TEX, zero LOD */
++	}
 +	volatile uint32_t *blend = rsd + 16;
 +	blend[0] = (1u << 9) | (1u << 11);
 +	blend[1] = 0xf0122122u;
@@ -1661,8 +1689,9 @@ index 0000000..13b348a
 +	blend[3] = (237u << 12) | (1u << 24);
 +
 +	volatile uint8_t *code = (volatile uint8_t *)(base + BL_CODE_OFF);
++	const unsigned char *bin = variant & BLV_GRADIENT ? a04s_sh_gradient : a04s_sh_blit;
 +	for (unsigned i = 0; i < sizeof(a04s_sh_blit); i++) {
-+		code[i] = a04s_sh_blit[i];
++		code[i] = bin[i];
 +	}
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +}
@@ -1699,14 +1728,56 @@ index 0000000..13b348a
 +		}
 +	}
 +	frame_setup();
-+	blit_setup(GPU_VA + FRAG_RT_OFF, BL_TEST_W, BL_TEST_H, BL_TEST_W * 4u);
++	vm_offset_t pix = ml_io_map((vm_offset_t)panel.pa, (vm_size_t)panel.stride * panel.h);
++	if (!pix) {
++		blit.state = "FAIL";
++		blit.why = "NO MAPPING";
++		return false;
++	}
++	const uint32_t at[5][2] = { { panel.w / 4u, panel.h / 4u }, { 3u * panel.w / 4u, panel.h / 4u },
++		                    { panel.w / 4u, 3u * panel.h / 4u }, { 3u * panel.w / 4u, 3u * panel.h / 4u },
++		                    { panel.w / 2u, panel.h / 2u } };
++	const uint32_t quad_want[4] = { 0xffff0000u, 0xff00ff00u, 0xff0000ffu, 0xffffffffu };
++	const uint32_t variants[BL_VARIANTS] = { 0, BLV_NEAREST, BLV_RGBA, BLV_NORM, BLV_GRADIENT };
 +	uint64_t hold;
 +	nanoseconds_to_absolutetime((uint64_t)SH_HOLD_MS * 1000000ull, &hold);
 +	sweet_fb_hold_until = mach_absolute_time() + hold;
-+	bool ran = frag_job(PANEL_VA, panel.w, panel.h, panel.stride, SH_CLEAR, affinity, &blit.r,
++	for (unsigned v = 0; v < BL_VARIANTS; v++) {
++		struct frag_result vr = { 0 };
++		blit_setup(GPU_VA + FRAG_RT_OFF, BL_TEST_W, BL_TEST_H, BL_TEST_W * 4u, variants[v]);
++		blit.var_ran[v] = frag_job(PANEL_VA, panel.w, panel.h, panel.stride, BL_CLEAR, affinity, &vr,
++		    GPU_VA + BL_DCD_OFF, FRAME_MODE_ALWAYS, SWIZZLE_BGRA);
++		blit.var_exc[v] = vr.exc;
++		blit.var_us[v] = vr.us;
++		bool match = blit.var_ran[v] && !(variants[v] & BLV_GRADIENT);
++		for (unsigned i = 0; i < 5; i++) {
++			blit.var_samples[v][i] = *(volatile uint32_t *)(pix + (vm_offset_t)at[i][1] * panel.stride + at[i][0] * 4u);
++			if (i < 4 && blit.var_samples[v][i] != quad_want[i]) {
++				match = false;
++			}
++		}
++		blit.var_count = v + 1u;
++		kprintf("A04S GPU BLIT VARIANT %x %s %x %x %x %x %x\n", variants[v], blit.var_ran[v] ? "RAN" : "FAULT",
++		    blit.var_samples[v][0], blit.var_samples[v][1], blit.var_samples[v][2], blit.var_samples[v][3],
++		    blit.var_samples[v][4]);
++		if (!blit.var_ran[v]) {
++			break;          /* a fault: no further variants this boot */
++		}
++		if (match && blit.variant == 0xffffffffu) {
++			blit.variant = variants[v];
++		}
++	}
++	if (blit.variant == 0xffffffffu) {
++		blit.state = "FAIL";
++		blit.why = "NO VARIANT";
++		kprintf("A04S GPU BLIT FAIL: no variant drew the test image\n");
++		return false;
++	}
++	blit_setup(GPU_VA + FRAG_RT_OFF, BL_TEST_W, BL_TEST_H, BL_TEST_W * 4u, blit.variant);
++	sweet_fb_hold_until = mach_absolute_time() + hold;
++	bool ran = frag_job(PANEL_VA, panel.w, panel.h, panel.stride, BL_CLEAR, affinity, &blit.r,
 +	    GPU_VA + BL_DCD_OFF, FRAME_MODE_ALWAYS, SWIZZLE_BGRA);
-+	vm_offset_t pix = ml_io_map((vm_offset_t)panel.pa, (vm_size_t)panel.stride * panel.h);
-+	if (pix) {
++	{
 +		/* Each quadrant's inner part: away from the bilinear seam in the middle (and the edges). */
 +		blit.good = 0;
 +		blit.total = 0;
@@ -1726,20 +1797,18 @@ index 0000000..13b348a
 +				}
 +			}
 +		}
-+		const uint32_t at[4][2] = { { panel.w / 4u, panel.h / 4u }, { 3u * panel.w / 4u, panel.h / 4u },
-+			                    { panel.w / 4u, 3u * panel.h / 4u }, { 3u * panel.w / 4u, 3u * panel.h / 4u } };
 +		for (unsigned i = 0; i < 4; i++) {
 +			blit.samples[i] = *(volatile uint32_t *)(pix + (vm_offset_t)at[i][1] * panel.stride + at[i][0] * 4u);
 +		}
 +	}
-+	if (ran && pix && blit.total && (uint64_t)blit.good * 10u >= (uint64_t)blit.total * 9u) {
++	if (ran && blit.total && (uint64_t)blit.good * 10u >= (uint64_t)blit.total * 9u) {
 +		blit.state = "OK";
 +		blit.why = "THE MALI-G52 SCALED AN IMAGE";
 +		kprintf("A04S GPU BLIT OK %u/%u pixels in %u us\n", blit.good, blit.total, blit.r.us);
 +		return true;
 +	}
 +	blit.state = "FAIL";
-+	blit.why = !ran ? frag_failure(&blit.r) : !pix ? "NO MAPPING" : "PIXELS";
++	blit.why = !ran ? frag_failure(&blit.r) : "PIXELS";
 +	kprintf("A04S GPU BLIT FAIL %s %u/%u EXC %x\n", blit.why, blit.good, blit.total, blit.r.exc);
 +	return false;
 +}
@@ -1827,7 +1896,7 @@ index 0000000..13b348a
 +	    (uint64_t)slots[s].pages * 0x1000u || !a04s_gpu_allowed()) {
 +		return false;
 +	}
-+	blit_setup(SLOT_VA((unsigned)s) + off, w, h, stride);
++	blit_setup(SLOT_VA((unsigned)s) + off, w, h, stride, blit.variant);
 +	struct frag_result r = { 0 };
 +	bool ok = frag_job(PANEL_VA, panel.w, panel.h, panel.stride, SH_CLEAR, gpu_affinity, &r,
 +	    GPU_VA + BL_DCD_OFF, FRAME_MODE_ALWAYS, SWIZZLE_BGRA);
@@ -2136,12 +2205,17 @@ index 0000000..13b348a
 +	kprintf("GPUPANEL %s %s %ux%u STRIDE %u PA %llx BLOCKS %u GOOD %u/%u US %u CHECK %u MS\n", panel.state,
 +	    panel.why, panel.w, panel.h, panel.stride, panel.pa, panel.blocks, panel.good, panel.total, panel.r.us,
 +	    panel.check_ms);
-+	kprintf("GPUBLIT %s %s GOOD %u/%u US %u AT %x %x %x %x\n", blit.state, blit.why, blit.good, blit.total,
-+	    blit.r.us, blit.samples[0], blit.samples[1], blit.samples[2], blit.samples[3]);
++	kprintf("GPUBLIT %s %s VARIANT %x GOOD %u/%u US %u AT %x %x %x %x\n", blit.state, blit.why, blit.variant,
++	    blit.good, blit.total, blit.r.us, blit.samples[0], blit.samples[1], blit.samples[2], blit.samples[3]);
 +	if (blit.r.tried) {
 +		kprintf("GPUBLIT IRQ %x MMU %x GPU %x JS %x HEAD %x EXC %x FP %llx ASF %x@%x GF %x@%x\n", blit.r.jirq,
 +		    blit.r.mirq, blit.r.girq, blit.r.js_status, blit.r.head, blit.r.exc, blit.r.fault_ptr,
 +		    blit.r.as_fault, blit.r.as_addr, blit.r.gpu_fault, blit.r.gpu_faddr);
++	}
++	for (unsigned v = 0; v < blit.var_count; v++) {
++		kprintf("GPUBLITV %u %s US %u EXC %x AT %x %x %x %x C %x\n", v, blit.var_ran[v] ? "RAN" : "FAULT", blit.var_us[v],
++		    blit.var_exc[v], blit.var_samples[v][0], blit.var_samples[v][1], blit.var_samples[v][2],
++		    blit.var_samples[v][3], blit.var_samples[v][4]);
 +	}
 +	kprintf("GPUSCALE %s FRAMES %u FAILS %u US LAST %u AVG %u MAX %u REMAPS %u SLOTS %u:%u %u:%u\n",
 +	    present_broken ? "OFF (FAULT)" : present_ready ? "ON" : "NOT READY", present_frames, present_fails,
