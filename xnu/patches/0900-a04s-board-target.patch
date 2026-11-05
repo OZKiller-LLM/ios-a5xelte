@@ -3055,7 +3055,7 @@ index 0000000..36346cb
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
-index 9ad7fd6..087061d 100644
+index 9ad7fd6..1c812db 100644
 --- a/bsd/dev/a5xelte_emmc.c
 +++ b/bsd/dev/a5xelte_emmc.c
 @@ -7,6 +7,12 @@
@@ -3249,7 +3249,7 @@ index 9ad7fd6..087061d 100644
  
  static uint32_t
  emmc_le32(const uint8_t *p)
-@@ -326,6 +402,359 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
+@@ -326,6 +402,362 @@ emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
  	return crc;
  }
  
@@ -3601,7 +3601,10 @@ index 9ad7fd6..087061d 100644
 +	if (kernel_thread_start(a04s_heartbeat, NULL, &thread) == KERN_SUCCESS) {
 +		thread_deallocate(thread);
 +	}
-+	if (kernel_thread_start(a04s_sampler, NULL, &thread) == KERN_SUCCESS) {
++	/* The PID 1 sampler is a debugging aid, off unless a04ssample=1. */
++	unsigned int want_sampler = 0;
++	(void)PE_parse_boot_argn("a04ssample", &want_sampler, sizeof(want_sampler));
++	if (want_sampler == 1 && kernel_thread_start(a04s_sampler, NULL, &thread) == KERN_SUCCESS) {
 +		thread_deallocate(thread);
 +	}
 +}
@@ -3609,7 +3612,7 @@ index 9ad7fd6..087061d 100644
  static int
  emmc_find_root_partition(void)
  {
-@@ -434,6 +863,7 @@ emmc_find_root_partition(void)
+@@ -434,6 +866,7 @@ emmc_find_root_partition(void)
  	    emmc_writable ? "writable" : "read-only");
  	return 0;
  }
@@ -3617,7 +3620,7 @@ index 9ad7fd6..087061d 100644
  
  static int
  emmc_map_host(void)
-@@ -446,7 +876,7 @@ emmc_map_host(void)
+@@ -446,7 +879,7 @@ emmc_map_host(void)
  	}
  	if (SecureDTLookupEntry(NULL, "/a5xelte-emmc", &node) != kSuccess ||
  	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
@@ -3626,7 +3629,7 @@ index 9ad7fd6..087061d 100644
  		printf("A5XELTE eMMC: missing or unexpected ADT register window\n");
  		return ENXIO;
  	}
-@@ -464,9 +894,19 @@ emmc_map_host(void)
+@@ -464,9 +897,19 @@ emmc_map_host(void)
  void
  a5xelte_emmc_probe(void)
  {
@@ -3646,7 +3649,7 @@ index 9ad7fd6..087061d 100644
  }
  
  static int
-@@ -496,6 +936,9 @@ emmc_strategy(buf_t bp)
+@@ -496,6 +939,9 @@ emmc_strategy(buf_t bp)
  	if (!emmc_ready) {
  		error = ENXIO;
  	} else if (!(buf_flags(bp) & B_READ) && !emmc_writable) {
@@ -3656,7 +3659,7 @@ index 9ad7fd6..087061d 100644
  		error = EROFS;
  	} else if (buf_blkno(bp) < 0) {
  		error = EINVAL;
-@@ -519,11 +962,31 @@ emmc_strategy(buf_t bp)
+@@ -519,11 +965,31 @@ emmc_strategy(buf_t bp)
  		uint32_t take = MIN(count - n, 512u - skip);
  		uint32_t lba = (uint32_t)(emmc_first_lba + pos / 512u);
  		if (buf_flags(bp) & B_READ) {
@@ -3688,7 +3691,7 @@ index 9ad7fd6..087061d 100644
  			if (skip || take != 512u) {
  				error = emmc_read_sector(lba, emmc_bounce);
  			}
-@@ -531,6 +994,8 @@ emmc_strategy(buf_t bp)
+@@ -531,6 +997,8 @@ emmc_strategy(buf_t bp)
  				memcpy(emmc_bounce + skip, vaddr + n, take);
  				error = emmc_write_sector(lba, emmc_bounce);
  			}
@@ -3697,7 +3700,7 @@ index 9ad7fd6..087061d 100644
  		}
  		if (error) {
  			break;
-@@ -596,6 +1061,7 @@ emmc_psize(__unused dev_t dev)
+@@ -596,6 +1064,7 @@ emmc_psize(__unused dev_t dev)
  	return emmc_ready ? (int)MIN(emmc_nsectors * 512u / emmc_secsize, INT_MAX) : -1;
  }
  
@@ -3705,7 +3708,7 @@ index 9ad7fd6..087061d 100644
  static int
  emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
  {
-@@ -609,12 +1075,15 @@ emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
+@@ -609,12 +1078,15 @@ emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
  	    minphys, uio, (int)emmc_secsize) : EROFS;
  }
  
@@ -3721,7 +3724,7 @@ index 9ad7fd6..087061d 100644
  static const struct cdevsw emmc_cdevsw = {
  	.d_open = emmc_open, .d_close = emmc_close, .d_read = emmc_read,
  	.d_write = emmc_write, .d_ioctl = emmc_ioctl, .d_stop = eno_stop,
-@@ -623,6 +1092,8 @@ static const struct cdevsw emmc_cdevsw = {
+@@ -623,6 +1095,8 @@ static const struct cdevsw emmc_cdevsw = {
  	.d_reserved_2 = eno_putc, .d_type = D_DISK,
  };
  
@@ -3730,7 +3733,7 @@ index 9ad7fd6..087061d 100644
  /* _cnputs may execute in any context. Keep this path free of locks and I/O. */
  void a5xelte_log_append(const char *c, int size);
  void
-@@ -647,6 +1118,46 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
+@@ -647,6 +1121,46 @@ a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
  	*total = os_atomic_load(&emmc_log_total, relaxed);
  }
  
@@ -3777,7 +3780,7 @@ index 9ad7fd6..087061d 100644
  struct a5_log_header {
  	char magic[8];
  	uint32_t version, size;
-@@ -752,4 +1263,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
+@@ -752,4 +1266,5 @@ a5xelte_emmc_rootdev(dev_t *dev)
  	*dev = emmc_bdev;
  	return 0;
  }
@@ -4837,10 +4840,10 @@ index 00b0198..f99c3ad 100644
  	msr		SPSel, #1
  	b		EXT(LowResetVectorBase)
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index 76d70b9..552e163 100644
+index 76d70b9..9c3a4b9 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -1049,6 +1049,49 @@ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1049,6 +1049,65 @@ sweet_sample_task(const char *name, int pid, task_t task)
  	task_unlock(task);
  }
  
@@ -4866,21 +4869,37 @@ index 76d70b9..552e163 100644
 +			kprintf("UPC %llx\n", (uint64_t)get_saved_state_pc(ss));
 +			kprintf("ULR %llx\n", (uint64_t)get_saved_state_lr(ss));
 +		}
-+		if (thread->kernel_stack != 0) {
-+			arm_kernel_saved_state_t *state = (arm_kernel_saved_state_t *)thread->machine.kstackptr;
-+			uint64_t low = thread->kernel_stack, high = low + kernel_stack_size;
-+			uint64_t fp = state->fp;
++		uint64_t frames[13];
++		int nframes = 0;
++		spl_t s = splsched();
 +
-+			kprintf("K %llx\n", (uint64_t)VM_KERNEL_UNSLIDE((vm_offset_t)state->lr));
++		/* A kernel stack is walked only for a thread that is waiting, under its lock, so it can't
++		 * be given up meanwhile: v31 with 8 CPUs panicked reading the saved state of a thread that
++		 * had just dropped its stack on another CPU (kstackptr NULL, fault at 0x50, state->fp).
++		 * The frames are printed after the lock is released. */
++		thread_lock(thread);
++		vm_offset_t low = thread->kernel_stack;
++		vm_offset_t kstack = thread->machine.kstackptr;
++		if ((thread->state & (TH_WAIT | TH_RUN)) == TH_WAIT && low != 0 && kstack >= low &&
++		    kstack + sizeof(arm_kernel_saved_state_t) <= low + kernel_stack_size) {
++			const arm_kernel_saved_state_t *state = (const arm_kernel_saved_state_t *)kstack;
++			uint64_t high = low + kernel_stack_size, fp = state->fp;
++
++			frames[nframes++] = state->lr;
 +			for (int i = 0; i < 12 && fp >= low && fp + 16 <= high && (fp & 7) == 0; i++) {
 +				const uint64_t *frame = (const uint64_t *)fp;
 +
-+				kprintf("K %llx\n", (uint64_t)VM_KERNEL_UNSLIDE((vm_offset_t)frame[1]));
++				frames[nframes++] = frame[1];
 +				if (frame[0] <= fp) {
 +					break;
 +				}
 +				fp = frame[0];
 +			}
++		}
++		thread_unlock(thread);
++		splx(s);
++		for (int i = 0; i < nframes; i++) {
++			kprintf("K %llx\n", (uint64_t)VM_KERNEL_UNSLIDE((vm_offset_t)frames[i]));
 +		}
 +	}
 +	task_unlock(task);
