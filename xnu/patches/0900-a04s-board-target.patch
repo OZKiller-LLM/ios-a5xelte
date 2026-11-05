@@ -4915,10 +4915,22 @@ index b269868..717e4cf 100644
  	/* cpu_start() discards PE_cpu_start's return; do not silently carry on. */
  	if (rc != 0) {
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index f1e25f9..cb06d8e 100644
+index f1e25f9..daa9d2b 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -267,6 +267,23 @@ AppleCLCD::start(IOService *provider)
+@@ -72,6 +72,11 @@ extern "C" int herolte_gpu_present_map(uint32_t id, const uint64_t *pages, unsig
+ extern "C" bool herolte_gpu_present_draw(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h);
+ #define SWEET_FB_GPU_MAX_PAGES 2048     /* one 8 MiB GPU slot */
+ #endif
++#if defined(ARM64_BOARD_CONFIG_A04S)
++/* No CPU copies to the panel before this mach time (bsd/dev/a04s_gpu.c, the 7c-4b test). */
++extern "C" uint64_t sweet_fb_hold_until;
++uint64_t sweet_fb_hold_until;
++#endif
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -267,6 +272,23 @@ AppleCLCD::start(IOService *provider)
  		PE_parse_boot_argn("sweetfb_gpu", &gpu, sizeof(gpu));
  		fGpu = gpu != 0;
  	}
@@ -4942,7 +4954,7 @@ index f1e25f9..cb06d8e 100644
  #elif !defined(ARM64_BOARD_CONFIG_A5XELTE)
  	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
  		fLogicalW = SWEET_FB_LOGICAL_W;
-@@ -288,6 +305,16 @@ AppleCLCD::start(IOService *provider)
+@@ -288,6 +310,16 @@ AppleCLCD::start(IOService *provider)
  		SweetSurface *panel = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
  		fPixels = panel != NULL ? panel->kernelAddress() : 0;
  	} else
@@ -4959,7 +4971,7 @@ index f1e25f9..cb06d8e 100644
  #endif
  	{
  		fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
-@@ -419,7 +446,7 @@ AppleCLCD::showFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -419,7 +451,7 @@ AppleCLCD::showFired(OSObject *owner, IOTimerEventSource *sender)
  	}
  	IOLockLock(fb->fLock);
  	bool show = fb->fDirty && !fb->fPowerOff;
@@ -4968,7 +4980,7 @@ index f1e25f9..cb06d8e 100644
  	show = show && mach_absolute_time() >= sweet_fb_hold_until;
  #endif
  	if (show) {
-@@ -486,8 +513,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -486,8 +518,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		return;
  	}
  	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && fb->fShow == NULL;
@@ -4979,7 +4991,7 @@ index f1e25f9..cb06d8e 100644
  	if (flush && now < sweet_fb_hold_until) {
  		flush = false;
  	}
-@@ -820,7 +847,12 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -820,7 +852,12 @@ AppleCLCD::present(const uint8_t *rec)
  			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
  			    get32(a, 12), dx, dy, w, h);
  		}
