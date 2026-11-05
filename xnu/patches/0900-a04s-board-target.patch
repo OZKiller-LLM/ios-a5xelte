@@ -2571,10 +2571,10 @@ index 0000000..ac6bfa6
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_power.c b/bsd/dev/a04s_power.c
 new file mode 100644
-index 0000000..b23a13c
+index 0000000..83562d9
 --- /dev/null
 +++ b/bsd/dev/a04s_power.c
-@@ -0,0 +1,538 @@
+@@ -0,0 +1,680 @@
 +/*
 + * Galaxy A04s: the battery (fuel gauge), and read-only first looks at the speaker amp and the audio
 + * power domain.
@@ -2604,8 +2604,14 @@ index 0000000..b23a13c
 + *   RepSOC 0x06 1/256 %, VCell 0x09 78.125 uV, Current 0x0A and AvgCurrent 0x0B signed 312.5 uA
 + *   (positive = charging), RepCap 0x05 and FullCapRep 0x10 1 mAh, Temp 0x08 signed 1/256 C,
 + *   Status 0x00, TTE 0x11, Cycles 0x17, DesignCap 0x18, AvgVCell 0x19, DevName 0x21.
-+ * There is no charger driver (the SYV660 keeps S-Boot's settings): a charge current above 20 mA
-+ * is what marks a cable, as on the S7.
++ * Charger, with a04sfg=1 (a04schg=0 turns it off): the Silergy SY6970 at 0x6a on the same bus
++ * (device tree sy6970@6a; Android's module is syv660_charger). Register-compatible with TI's
++ * BQ25895 (Linux bq25890_charger.c reg_fields): 8-bit registers 0x00-0x14, read one byte at a time,
++ * and only read. Its settings stay as S-Boot left them. All of 0x00-0x14 once at start, then the
++ * status (0x0B), faults (0x0C, read twice: the first read returns the latched faults, the second the
++ * current ones), the ADC (0x0E, 0x11, 0x12), the input limit in use (0x13) and the ADC mode (0x02) on
++ * each poll. SweetBattery takes power-good as the cable and CHRG_STAT as charging or done; without
++ * an answer it falls back to the gauge's current (above 20 mA is charging), as on the S7.
 + *
 + * Speaker amp, with a04samp=1: its ID and status registers (0x03, 0x00; 16-bit, big-endian), once
 + * at root mount. The amp stays as S-Boot left it.
@@ -2682,6 +2688,21 @@ index 0000000..b23a13c
 +#define FG_DESIGNCAP            0x18u
 +#define FG_AVGVCELL             0x19u
 +#define FG_DEVNAME              0x21u
++#define CHG_ADDR                0x6au
++#define CHG_NREGS               0x15u           /* 0x00-0x14 */
++#define CHG_REG_IINLIM          0x00u
++#define CHG_REG_ADC             0x02u
++#define CHG_REG_CFG             0x03u
++#define CHG_REG_ICHG            0x04u
++#define CHG_REG_VREG            0x06u
++#define CHG_REG_TIMER           0x07u
++#define CHG_REG_STATUS          0x0bu
++#define CHG_REG_FAULT           0x0cu
++#define CHG_REG_BATV            0x0eu
++#define CHG_REG_VBUSV           0x11u
++#define CHG_REG_ICHGR           0x12u
++#define CHG_REG_IDPM            0x13u
++#define CHG_REG_PART            0x14u
 +#define AMP_STATUS              0x00u
 +#define AMP_ID                  0x03u
 +#define NO_TEMP                 (-9990)         /* tenths of a degree */
@@ -2711,17 +2732,21 @@ index 0000000..b23a13c
 +static const uint8_t fg_regs[] = { FG_STATUS, FG_REPCAP, FG_REPSOC, FG_TEMP, FG_VCELL, FG_CURRENT,
 +	FG_AVGCURRENT, FG_FULLCAPREP, FG_TTE, FG_CYCLES, FG_DESIGNCAP, FG_AVGVCELL, FG_DEVNAME };
 +static const uint8_t amp_regs[] = { AMP_STATUS, AMP_ID };
++static const uint8_t chg_regs[CHG_NREGS] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
++	0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14 };
 +struct i2c_dev {
 +	unsigned bus;
 +	uint8_t addr;
 +	bool big_endian;
++	unsigned width;                         /* bytes per register: 1 or 2 */
 +	const uint8_t *regs;
 +	unsigned nregs;
 +};
-+enum { DEV_FG = 0, DEV_AMP = 1 };
-+static const struct i2c_dev devs[2] = {
-+	{ 0, FG_ADDR, false, fg_regs, (unsigned)sizeof(fg_regs) },
-+	{ 1, AMP_ADDR, true, amp_regs, (unsigned)sizeof(amp_regs) },
++enum { DEV_FG = 0, DEV_AMP = 1, DEV_CHG = 2 };
++static const struct i2c_dev devs[3] = {
++	{ 0, FG_ADDR, false, 2, fg_regs, (unsigned)sizeof(fg_regs) },
++	{ 1, AMP_ADDR, true, 2, amp_regs, (unsigned)sizeof(amp_regs) },
++	{ 0, CHG_ADDR, false, 1, chg_regs, (unsigned)sizeof(chg_regs) },
 +};
 +
 +static LCK_GRP_DECLARE(a04s_power_grp, "a04s_power");
@@ -2741,6 +2766,15 @@ index 0000000..b23a13c
 +	const char *state;
 +	uint16_t id, status;
 +} amp = { .state = "OFF" };
++
++static struct {
++	const char *state;                      /* OFF, NO BUS, NO CHIP, OK, ERR */
++	uint8_t regs[CHG_NREGS];                /* the start-up dump */
++	uint8_t status, fault_latched, fault, batv, vbusv, ichgr, idpm, adc;
++	uint32_t reads, bad;
++	bool started;                           /* the start-up dump worked */
++	bool ok;                                /* the last poll worked */
++} chg = { .state = "OFF" };
 +
 +static uint32_t pd_aud_config, pd_aud_status, aud_pll;
 +static bool aud_pll_read;
@@ -2896,8 +2930,8 @@ index 0000000..b23a13c
 +}
 +
 +/*
-+ * One 16-bit register: START, address + W, the register number, repeated START, address + R, two
-+ * bytes (ACK, then NACK), STOP. Called with a04s_i2c_mtx held.
++ * One register: START, address + W, the register number, repeated START, address + R, the
++ * register's one or two bytes (the last one NACKed), STOP. Called with a04s_i2c_mtx held.
 + */
 +static bool
 +i2c_read16(unsigned dev_index, uint8_t reg, uint16_t *value)
@@ -2957,6 +2991,16 @@ index 0000000..b23a13c
 +	if (io_rd(b->va, IICSTAT) & STAT_LASTBIT) {
 +		return i2c_fail(b, "NACK READ", STAT_MASTER_RX, con);
 +	}
++	if (d->width == 1) {
++		io_wr(b->va, IICCON, con & ~CON_ACKEN);         /* the only byte, NACKed */
++		if (!i2c_wait_pend(b)) {
++			return i2c_fail(b, "TIMEOUT BYTE0", STAT_MASTER_RX, con);
++		}
++		uint8_t only = (uint8_t)io_rd(b->va, IICDS);
++		i2c_stop(b, STAT_MASTER_RX, con);
++		*value = only;
++		return true;
++	}
 +	io_wr(b->va, IICCON, con);                              /* first byte, ACKed */
 +	if (!i2c_wait_pend(b)) {
 +		return i2c_fail(b, "TIMEOUT BYTE0", STAT_MASTER_RX, con);
@@ -2970,6 +3014,80 @@ index 0000000..b23a13c
 +	i2c_stop(b, STAT_MASTER_RX, con);
 +	*value = d->big_endian ? (uint16_t)((b0 << 8) | b1) : (uint16_t)(b0 | (b1 << 8));
 +	return true;
++}
++
++static bool
++chg_reg(uint8_t reg, uint8_t *value)
++{
++	uint16_t v = 0;
++	if (!i2c_read16(DEV_CHG, reg, &v)) {
++		return false;
++	}
++	*value = (uint8_t)v;
++	return true;
++}
++
++/* The start-up dump and the part number. Called with a04s_i2c_mtx held, once the bus is usable. */
++static void
++chg_start(void)
++{
++	unsigned want = 1;
++	(void)PE_parse_boot_argn("a04schg", &want, sizeof(want));
++	if (want != 1) {
++		chg.state = "OFF";
++		return;
++	}
++	for (unsigned r = 0; r < CHG_NREGS; r++) {
++		if (!chg_reg((uint8_t)r, &chg.regs[r])) {
++			chg.state = r == 0 ? "NO CHIP" : "ERR";
++			return;
++		}
++	}
++	chg.fault_latched = chg.regs[CHG_REG_FAULT];
++	chg.state = "OK";
++	chg.started = true;
++	chg.ok = true;
++}
++
++/* Each poll: status, faults (twice), the ADC and the input limit in use. With a04s_i2c_mtx held. */
++static void
++chg_poll(void)
++{
++	if (!chg.started) {
++		return;
++	}
++	uint8_t first = 0;
++	bool ok = chg_reg(CHG_REG_STATUS, &chg.status) && chg_reg(CHG_REG_FAULT, &first) &&
++	    chg_reg(CHG_REG_FAULT, &chg.fault) && chg_reg(CHG_REG_BATV, &chg.batv) &&
++	    chg_reg(CHG_REG_VBUSV, &chg.vbusv) && chg_reg(CHG_REG_ICHGR, &chg.ichgr) &&
++	    chg_reg(CHG_REG_IDPM, &chg.idpm) && chg_reg(CHG_REG_ADC, &chg.adc);
++	chg.reads++;
++	chg.ok = ok;
++	if (!ok) {
++		chg.bad++;
++		chg.state = "ERR";
++		return;
++	}
++	chg.fault_latched |= first;
++	chg.state = "OK";
++}
++
++/*
++ * For SweetBattery: 0 with the charger's view of the cable, or -1 without an answer.
++ * external: power good. charging: pre-charge or fast charge. done: charge termination.
++ */
++int a04s_chg_state(int *external, int *charging, int *done);
++int
++a04s_chg_state(int *external, int *charging, int *done)
++{
++	if (!chg.ok) {
++		return -1;
++	}
++	unsigned stat = (chg.status >> 3) & 3u;
++	*external = (int)((chg.status >> 2) & 1u);
++	*charging = stat == 1u || stat == 2u;
++	*done = stat == 3u;
++	return 0;
 +}
 +
 +static bool
@@ -3001,6 +3119,11 @@ index 0000000..b23a13c
 +		fg.state = "OK";
 +		ok = true;
 +	}
++	if (buses[0].why) {
++		chg.state = "NO BUS";
++	} else {
++		chg_start();
++	}
 +	lck_mtx_unlock(&a04s_i2c_mtx);
 +	kprintf("A04S FG %s %s DEV %04x\n", fg.state, buses[0].why ? buses[0].why : buses[0].last_error, fg.devname);
 +	return ok ? 0 : -1;
@@ -3016,6 +3139,7 @@ index 0000000..b23a13c
 +	    fg_reg(FG_REPCAP, &rem) && fg_reg(FG_FULLCAPREP, &full) && fg_reg(FG_TEMP, &temp) &&
 +	    fg_reg(FG_AVGVCELL, &avgv) && fg_reg(FG_AVGCURRENT, &avgc) && fg_reg(FG_STATUS, &status) &&
 +	    fg_reg(FG_CYCLES, &cycles) && fg_reg(FG_TTE, &tte);
++	chg_poll();
 +	lck_mtx_unlock(&a04s_i2c_mtx);
 +	fg.reads++;
 +	fg.ok = ok;
@@ -3108,6 +3232,24 @@ index 0000000..b23a13c
 +	    fg.state, fg.devname, fg.percent, fg.mv, fg.avg_mv, fg.ma, fg.avg_ma, fg.rem, fg.full, fg.designcap,
 +	    fg.temp_dc / 10, (fg.temp_dc < 0 ? -fg.temp_dc : fg.temp_dc) % 10, fg.status, fg.cycles, fg.tte,
 +	    fg.reads, fg.bad);
++	static const char *const vbus_names[8] = { "NONE", "SDP", "CDP", "DCP", "HVDCP", "ADAPTER", "NONSTD", "OTG" };
++	static const char *const chrg_names[4] = { "NOT", "PRE", "FAST", "DONE" };
++	static const unsigned wd_secs[4] = { 0, 40, 80, 160 };
++	const uint8_t *r = chg.regs;
++	kprintf("CHG %s PN %u REV %u %s %s PG %u FAULT %02x NOW %02x VBUS %s%u MV BAT %u MV ICHGR %u MA "
++	    "IDPM %u MA ADC %s N %u/%u\n", chg.state, (r[CHG_REG_PART] >> 3) & 7u, r[CHG_REG_PART] & 3u,
++	    vbus_names[(chg.status >> 5) & 7u], chrg_names[(chg.status >> 3) & 3u], (chg.status >> 2) & 1u,
++	    chg.fault_latched, chg.fault, (chg.vbusv & 0x80u) ? "" : "NOT GOOD ", 2600u + (chg.vbusv & 0x7fu) * 100u,
++	    2304u + (chg.batv & 0x7fu) * 20u, (chg.ichgr & 0x7fu) * 50u, 100u + (chg.idpm & 0x3fu) * 50u,
++	    (chg.adc & 0x40u) ? "AUTO" : "ONESHOT", chg.reads, chg.bad);
++	kprintf("CHG SET IINLIM %u MA%s ICHG %u MA VREG %u MV CHG %s HIZ %u WD %u S TERM %u TIMER %u\n",
++	    100u + (r[CHG_REG_IINLIM] & 0x3fu) * 50u, (r[CHG_REG_IINLIM] & 0x40u) ? " (ILIM PIN)" : "",
++	    (r[CHG_REG_ICHG] & 0x7fu) * 64u, 3840u + ((r[CHG_REG_VREG] >> 2) & 0x3fu) * 16u,
++	    (r[CHG_REG_CFG] & 0x10u) ? "ON" : "OFF", (r[CHG_REG_IINLIM] >> 7) & 1u,
++	    wd_secs[(r[CHG_REG_TIMER] >> 4) & 3u], (r[CHG_REG_TIMER] >> 7) & 1u, (r[CHG_REG_TIMER] >> 3) & 1u);
++	kprintf("CHG REGS %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
++	    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15],
++	    r[16], r[17], r[18], r[19], r[20]);
 +	kprintf("AUD PD %x %x %s PLL %s%08x AMP %s ID %04x ST %04x\n", pd_aud_config, pd_aud_status,
 +	    (pd_aud_status & 1u) ? "ON" : "OFF", aud_pll_read ? "" : "NOT READ ", aud_pll, amp.state, amp.id,
 +	    amp.status);
@@ -4011,7 +4153,7 @@ index 0000000..e3b8eb3
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
-index 6d8a0fd..d471153 100644
+index 6d8a0fd..70101bc 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
 @@ -4,7 +4,7 @@
@@ -4023,7 +4165,7 @@ index 6d8a0fd..d471153 100644
  #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
  #include <IOKit/IOLib.h>
  #include <IOKit/IOWorkLoop.h>
-@@ -12,7 +12,19 @@
+@@ -12,7 +12,23 @@
  #include <IOKit/pwr_mgt/IOPMPowerSource.h>
  #include <libkern/c++/OSCollectionIterator.h>
  #include <pexpert/pexpert.h>
@@ -4038,13 +4180,41 @@ index 6d8a0fd..d471153 100644
 +    unsigned *rem_mah, unsigned *full_mah);
 +#define herolte_fg_init a04s_fg_init
 +#define herolte_fg_read a04s_fg_read
++/* The SY6970 charger's view of the cable, and the gauge's temperature (tenths of a degree,
++ * -9990 when unknown). Both read only. */
++extern "C" int a04s_chg_state(int *external, int *charging, int *done);
++extern "C" int a04s_fg_temp_dc(void);
 +#define BATTERY_DESIGN_MAH 5000u        /* SM-A047F, typical */
 +#elif defined(ARM64_BOARD_CONFIG_HEROLTE)
 +#define SWEET_BATTERY_MAXIM 1
  /* bsd/dev/herolte_battery.c: MAX77854 fuel gauge, read-only. */
  extern "C" int herolte_fg_init(void);
  extern "C" int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma,
-@@ -163,8 +175,8 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -131,12 +147,23 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	putNumber("AppleRawMaxCapacity", BATTERY_DESIGN_MAH);
+ 	putNumber("DesignCapacity", BATTERY_DESIGN_MAH);
+ 	putNumber("InstantAmperage", (UInt32)ma);
++#if defined(ARM64_BOARD_CONFIG_A04S)
++	/* iOS battery convention: centidegrees C. A04S: the gauge's, when it has one (0-90 C). */
++	int tempDc = measured ? a04s_fg_temp_dc() : -9990;
++	bool tempKnown = tempDc >= 0 && tempDc <= 900;
++	putNumber("Temperature", tempKnown ? (UInt32)(tempDc * 10) : 2500u);
++#else
+ 	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+ 	putNumber("Temperature", 2500);
++#endif
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+ 	putBool("SweetBatterySOCEstimated", measured);
++#if defined(ARM64_BOARD_CONFIG_A04S)
++	putBool("SweetBatteryTemperatureEstimated", !tempKnown);
++#else
+ 	putBool("SweetBatteryTemperatureEstimated", true);
++#endif
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+ 
+@@ -163,8 +190,8 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
  	int mode = measured ? 1 : 0;
  	if (mode != fLastMode) {
  		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
@@ -4055,7 +4225,7 @@ index 6d8a0fd..d471153 100644
  #else
  		    measured ? "PM6150 / estimated SOC" : "static fallback",
  #endif
-@@ -173,7 +185,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -173,7 +200,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
  	}
  }
  
@@ -4064,7 +4234,7 @@ index 6d8a0fd..d471153 100644
  /* Keep the proven single-byte observer command. Read two matching whole
   * words to reject most torn ADC samples without writing the QG HOLD bit.
   * This is a bounded consistency check, not a hardware snapshot guarantee. */
-@@ -218,7 +230,7 @@ SweetBattery::estimatePercent(unsigned mv)
+@@ -218,7 +245,7 @@ SweetBattery::estimatePercent(unsigned mv)
  }
  #endif
  
@@ -4073,7 +4243,32 @@ index 6d8a0fd..d471153 100644
  void
  SweetBattery::poll(void)
  {
-@@ -300,8 +312,8 @@ SweetBattery::start(IOService *provider)
+@@ -232,12 +259,23 @@ SweetBattery::poll(void)
+ 	}
+ 	/* No charger driver: the gauge's charge current marks a cable. */
+ 	bool charging = ma > 20;
++	bool external = charging, fullCharge = false;
++#if defined(ARM64_BOARD_CONFIG_A04S)
++	/* A04S: the SY6970's own status (a04s_power.c, read only) when it answers: power good is the
++	 * cable, CHRG_STAT pre-charge or fast charge is charging, termination is full. */
++	int chgExternal = 0, chgCharging = 0, chgDone = 0;
++	if (a04s_chg_state(&chgExternal, &chgCharging, &chgDone) == 0) {
++		external = chgExternal != 0;
++		charging = external && chgCharging != 0;
++		fullCharge = external && chgDone != 0;
++	}
++#endif
+ 	static unsigned logged;
+ 	if (logged++ % 10 == 0) {
+ 		IOLog("SWEET BATTERY: %u%% %umV %dmA rem=%umAh full=%umAh\n",
+ 		    percent, mv, ma, rem, full);
+ 	}
+-	publish(percent, mv, ma, charging, charging, charging, false, true, true);
++	publish(percent, mv, ma, external, external, charging, fullCharge, true, true);
+ }
+ #else
+ void
+@@ -300,8 +338,8 @@ SweetBattery::start(IOService *provider)
  	if (!IOPMPowerSource::start(provider)) {
  		return false;
  	}
