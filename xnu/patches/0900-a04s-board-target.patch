@@ -12,15 +12,16 @@ index 7dee125..cc95042 100644
  SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
  sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
 diff --git a/bsd/conf/files b/bsd/conf/files
-index a16d8e0..49df2c9 100644
+index a16d8e0..da29b50 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -106,6 +106,8 @@ bsd/dev/random/randomdev.c		standard
+@@ -106,6 +106,9 @@ bsd/dev/random/randomdev.c		standard
  bsd/dev/memdev.c			standard
  bsd/dev/sweet_ufs.c			standard
  bsd/dev/a5xelte_emmc.c			standard
 +bsd/dev/a04s_acpm.c			standard
 +bsd/dev/a04s_input.c			standard
++bsd/dev/a04s_gpu.c			standard
  bsd/dev/herolte_ufs.c			standard
  bsd/dev/herolte_touch.c			standard
  bsd/dev/herolte_battery.c		standard
@@ -479,12 +480,613 @@ index 0000000..61653da
 +}
 +
 +#endif /* A04S_EMMC_GUARD_H */
+diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
+new file mode 100644
+index 0000000..feb1f5c
+--- /dev/null
++++ b/bsd/dev/a04s_gpu.c
+@@ -0,0 +1,595 @@
++/*
++ * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
++ *
++ * Always, reads only (on the heartbeat):
++ *  - The TMU at 0x10070000 (exynos3830-tmu in the live device tree; register map from Samsung's
++ *    exynos_tmu_v2.c, EXYNOS9810/3830 block). LITTLE0 is sensor 1, LITTLE1 sensor 2, G3D sensor 3.
++ *    Each sensor's factory trim is TRIMINFO(n) at 4 * n (error1 bits 0-8, error2 bits 9-17), the
++ *    calibration type is TRIMINFO(0) bit 23, and the current codes are packed 9 bits apart from
++ *    CURRENT_TEMP1_0 (0x40: sensors 0, 1) and CURRENT_TEMP4_2 (0x44: sensors 2, 3, 4). One-point
++ *    trimming: temp = code - error1 + 25 (the DT's first_point_trim). Samsung's 850 kernel asks the
++ *    ACPM firmware for the temperature instead, so the raw registers are printed too: if the
++ *    packing is wrong, the codes show it. Read only behind CMU_PERI's BUSIF_TMU gate.
++ *  - PLL_G3D and the G3D muxes and dividers (cmucal-sfr.c), only if a04s_input.c's 7c-2 checks
++ *    passed (pd-g3d on, every gate on the way running, no Q-channel able to stop the clock).
++ *
++ * With the boot-arg a04sgpu=1 only, once, at root mount:
++ *  - It stops unless the 7c-2 checks passed, the ID is a Mali-G52 (0x7212), the GPU's data path to
++ *    DRAM is clocked (CMU_G3D LHS_AXI_D, CMU_CORE LHM_AXI_D_G3D), and the G3D sensor reads 5-75 C.
++ *  - GPU interrupts stay masked (everything is polled, and every poll is bounded). Soft reset, then
++ *    L2, shader core 0 and the tiler are powered, as Panfrost does. The clock and voltage stay as
++ *    S-Boot left them; the GPU's cycle counter measures the clock over 20 ms.
++ *  - One address space in Mali-LPAE (legacy) mode, as Panfrost runs Bifrost: TRANSTAB = tables | 7,
++ *    MEMATTR 0x888d88, TRANSCFG 0. The page tables map only GPU_DATA_PAGES pages of a private 64 KiB
++ *    block at 0xbc000000: above XNU's RAM (dram-base 0x92000000 + 0x2a000000), below the end of the
++ *    first RAM window (0xbc900000), which Android uses as plain RAM. The GPU can reach no other
++ *    memory, so nothing it does can touch XNU, the eMMC driver's buffers or any partition.
++ *  - One WRITE_VALUE job (type ZERO) on JS1, the S7's first job (herolte_gpu.c, Panfrost v7 layout:
++ *    the job header and Write Value payload are the same as Midgard's). Pass: the job completes
++ *    with no MMU or GPU fault and the 64-bit output, preset to a pattern, reads 0.
++ *  - The cores are powered off again. iOS keeps drawing on the CPU.
++ */
++#if defined(ARM64_BOARD_CONFIG_A04S)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <stdbool.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern bool a04s_gpu_path_ok(void);
++
++#define GATE_MANUAL             (1u << 20)
++#define GATE_CG_VAL             (1u << 21)
++#define GATE_AUTO               (1u << 28)
++#define QCH_ENABLE              (1u << 0)
++#define QCH_CLOCK_REQ           (1u << 1)
++
++/* TMU and its bus clock (CMU_PERI). */
++#define CMU_PERI_PA             0x10030000u
++#define GATE_PERI_TMU           0x2018u
++#define QCH_PERI_TMU            0x3004u
++#define TMU_PA                  0x10070000u
++#define TMU_TRIMINFO(n)         ((n) * 4u)
++#define TMU_CONTROL             0x20u
++#define TMU_STATUS              0x28u
++#define TMU_CUR_1_0             0x40u
++#define TMU_CUR_4_2             0x44u
++#define TMU_CODE_MASK           0x1ffu
++#define TMU_FIRST_TRIM          25
++#define TMU_SECOND_TRIM         85
++#define TMU_NO_TEMP             (-999)
++#define GPU_TEMP_MIN            5
++#define GPU_TEMP_MAX            75
++
++/* The G3D clock (cmucal-sfr.c). */
++#define CMU_TOP_PA              0x120e0000u
++#define TOP_MUX_G3D_SWITCH      0x1038u
++#define TOP_DIV_G3D_SWITCH      0x1844u
++#define CMU_CORE_PA             0x12000000u
++#define CORE_GATE_LHM_D_G3D     0x2070u
++#define CORE_QCH_LHM_D_G3D      0x30f4u
++#define CMU_G3D_PA              0x11400000u
++#define G3D_PLL_CON3            0x10cu
++#define G3D_SWITCH_USER         0x600u
++#define G3D_MUX_BUSD            0x1000u
++#define G3D_DIV_BUSP            0x1804u
++#define G3D_GATE_LHS_D          0x201cu
++#define G3D_QCH_LHS_D           0x3024u
++#define OSC_HZ                  26000000ull
++
++/* Mali-G52 (Bifrost, job manager) registers, as Panfrost's panfrost_regs.h. */
++#define GPU_PA                  0x11500000u
++#define GPU_ID                  0x000u
++#define GPU_IRQ_RAWSTAT         0x020u
++#define GPU_IRQ_CLEAR           0x024u
++#define GPU_IRQ_MASK            0x028u
++#define GPU_CMD                 0x030u
++#define GPU_STATUS              0x034u
++#define GPU_FAULT_STATUS        0x03cu
++#define GPU_FAULT_ADDR          0x040u
++#define GPU_CYCLE_LO            0x090u
++#define GPU_CYCLE_HI            0x094u
++#define SHADER_PRESENT          0x100u
++#define TILER_PRESENT           0x110u
++#define L2_PRESENT              0x120u
++#define SHADER_READY            0x140u
++#define TILER_READY             0x150u
++#define L2_READY                0x160u
++#define SHADER_PWRON            0x180u
++#define TILER_PWRON             0x190u
++#define L2_PWRON                0x1a0u
++#define SHADER_PWROFF           0x1c0u
++#define TILER_PWROFF            0x1d0u
++#define L2_PWROFF               0x1e0u
++#define GPU_CONFIG(n)           (0xf00u + 4u * (n))     /* JM, SHADER, TILER, L2_MMU */
++#define JOB_IRQ_RAWSTAT         0x1000u
++#define JOB_IRQ_CLEAR           0x1004u
++#define JOB_IRQ_MASK            0x1008u
++#define JS(n)                   (0x1800u + 0x80u * (n))
++#define JS_HEAD_LO              0x00u
++#define JS_HEAD_HI              0x04u
++#define JS_COMMAND              0x20u
++#define JS_STATUS               0x24u
++#define JS_HEAD_NEXT_LO         0x40u
++#define JS_HEAD_NEXT_HI         0x44u
++#define JS_AFFINITY_NEXT_LO     0x50u
++#define JS_AFFINITY_NEXT_HI     0x54u
++#define JS_CONFIG_NEXT          0x58u
++#define JS_COMMAND_NEXT         0x60u
++#define MMU_IRQ_RAWSTAT         0x2000u
++#define MMU_IRQ_CLEAR           0x2004u
++#define MMU_IRQ_MASK            0x2008u
++#define AS0                     0x2400u
++#define AS_TRANSTAB_LO          0x00u
++#define AS_TRANSTAB_HI          0x04u
++#define AS_MEMATTR_LO           0x08u
++#define AS_MEMATTR_HI           0x0cu
++#define AS_COMMAND              0x18u
++#define AS_FAULTSTATUS          0x1cu
++#define AS_FAULTADDR_LO         0x20u
++#define AS_STATUS               0x28u
++#define AS_TRANSCFG_LO          0x30u
++#define AS_TRANSCFG_HI          0x34u
++#define CMD_SOFT_RESET          1u
++#define CMD_CYCLE_START         5u
++#define CMD_CYCLE_STOP          6u
++#define IRQ_GPU_FAULT           (1u << 0)
++#define IRQ_MULTIPLE_FAULT      (1u << 7)
++#define IRQ_RESET_DONE          (1u << 8)
++#define JS_ACTIVE               0x08u
++#define JS_HARD_STOP            3u
++
++/* The private block: four page-table levels, then the data pages at GPU VA 0x02000000. */
++#define GPU_MEM_PA              0xbc000000ull
++#define GPU_MEM_BYTES           0x10000u
++#define GPU_DATA_OFF            0x4000u
++#define GPU_DATA_PAGES          4u
++#define GPU_VA                  0x02000000ull
++#define GPU_OUT_OFF             0x100u
++#define XNU_DRAM_END            0xbc000000ull
++#define RAM_WINDOW_END          0xbc900000ull
++#if GPU_MEM_PA < XNU_DRAM_END || GPU_MEM_PA + GPU_MEM_BYTES > RAM_WINDOW_END
++#error "the GPU block must stay outside XNU's RAM and inside the first RAM window"
++#endif
++#if GPU_DATA_OFF + GPU_DATA_PAGES * 0x1000u > GPU_MEM_BYTES
++#error "the data pages must stay inside the GPU block"
++#endif
++
++static vm_offset_t peri_va, tmu_va, top_va, core_va, g3d_va, gpu_va, mem_va;
++
++static struct {
++	const char *why;                        /* NULL once read */
++	uint32_t gate, qch, ctrl, status, trim0, trim[3], cur[2];
++	int cal;
++	int t[3];                               /* LITTLE0, LITTLE1, G3D */
++	int max_g3d;
++	uint32_t reads;
++} tmu = { .why = "NOT READ", .max_g3d = TMU_NO_TEMP };
++
++static struct {
++	const char *state;                      /* OFF, RUNNING, SKIP, OK, FAIL */
++	const char *why;
++	uint32_t before_status, before_l2, before_sc, before_tl;
++	uint32_t l2, sc, tl;                    /* ready masks after power-on */
++	uint32_t cfg[4];
++	uint32_t jirq, mirq, girq, js_status, head, as_fault, as_addr, gpu_fault, gpu_faddr, exc;
++	uint64_t output;
++	uint32_t us, mhz;
++	int reset;                              /* 1 done, 0 timed out, -1 not tried */
++	int temp;
++} job = { .state = "OFF", .why = "a04sgpu=0", .reset = -1, .temp = TMU_NO_TEMP };
++
++static inline uint32_t
++io_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++gpu_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(gpu_va + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static bool
++gate_running(uint32_t gate)
++{
++	return !(gate & GATE_MANUAL) || (gate & GATE_CG_VAL);
++}
++
++static bool
++qch_may_stop(uint32_t qch)
++{
++	return (qch & QCH_ENABLE) && !(qch & QCH_CLOCK_REQ);
++}
++
++static uint64_t
++us_since(uint64_t start)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
++	return ns / 1000u;
++}
++
++static int
++tmu_code_to_c(uint32_t code, uint32_t trim, int cal)
++{
++	int e1 = (int)(trim & TMU_CODE_MASK);
++	int e2 = (int)((trim >> 9) & TMU_CODE_MASK);
++	if (e1 == 0) {
++		return TMU_NO_TEMP;
++	}
++	if (cal == 1 && e2 > e1) {
++		return ((int)code - e1) * (TMU_SECOND_TRIM - TMU_FIRST_TRIM) / (e2 - e1) + TMU_FIRST_TRIM;
++	}
++	return (int)code - e1 + TMU_FIRST_TRIM;
++}
++
++/* Reads only. Sensor n's code: below 2 in CUR_1_0 at 9 * n, from 2 in CUR_4_2 at 9 * (n - 2). */
++static void
++tmu_read(void)
++{
++	if (!peri_va) {
++		peri_va = ml_io_map(CMU_PERI_PA, 0x4000);
++	}
++	if (!peri_va) {
++		tmu.why = "NO MAPPING";
++		return;
++	}
++	tmu.gate = io_rd(peri_va, GATE_PERI_TMU);
++	tmu.qch = io_rd(peri_va, QCH_PERI_TMU);
++	if (!gate_running(tmu.gate)) {
++		tmu.why = "GATE";
++		return;
++	}
++	if (qch_may_stop(tmu.qch)) {
++		tmu.why = "QCH";
++		return;
++	}
++	if (!tmu_va) {
++		tmu_va = ml_io_map(TMU_PA, 0x1000);
++	}
++	if (!tmu_va) {
++		tmu.why = "NO MAPPING";
++		return;
++	}
++	tmu.trim0 = io_rd(tmu_va, TMU_TRIMINFO(0));
++	tmu.cal = (int)((tmu.trim0 >> 23) & 1u);
++	for (unsigned i = 0; i < 3; i++) {
++		tmu.trim[i] = io_rd(tmu_va, TMU_TRIMINFO(i + 1));
++	}
++	tmu.ctrl = io_rd(tmu_va, TMU_CONTROL);
++	tmu.status = io_rd(tmu_va, TMU_STATUS);
++	tmu.cur[0] = io_rd(tmu_va, TMU_CUR_1_0);
++	tmu.cur[1] = io_rd(tmu_va, TMU_CUR_4_2);
++	uint32_t code[3] = {
++		(tmu.cur[0] >> 9) & TMU_CODE_MASK,      /* sensor 1 */
++		tmu.cur[1] & TMU_CODE_MASK,             /* sensor 2 */
++		(tmu.cur[1] >> 9) & TMU_CODE_MASK,      /* sensor 3 */
++	};
++	for (unsigned i = 0; i < 3; i++) {
++		tmu.t[i] = tmu_code_to_c(code[i], tmu.trim[i], tmu.cal);
++	}
++	if (tmu.t[2] > tmu.max_g3d) {
++		tmu.max_g3d = tmu.t[2];
++	}
++	tmu.reads++;
++	tmu.why = NULL;
++}
++
++/* The G52's temperature, if it can be trusted: NO_TEMP otherwise. */
++int a04s_gpu_temp(void);
++int
++a04s_gpu_temp(void)
++{
++	tmu_read();
++	if (tmu.why || tmu.t[2] == TMU_NO_TEMP || tmu.t[2] < -20 || tmu.t[2] > 125) {
++		return TMU_NO_TEMP;
++	}
++	return tmu.t[2];
++}
++
++static bool
++gpu_wait(uint32_t off, uint32_t mask, uint32_t want, unsigned max_us)
++{
++	for (unsigned us = 0; us <= max_us; us += 10) {
++		if ((io_rd(gpu_va, off) & mask) == want) {
++			return true;
++		}
++		delay(10);
++	}
++	return false;
++}
++
++static bool
++gpu_power(uint32_t on, uint32_t ready, uint32_t mask, uint32_t *got)
++{
++	gpu_wr(on, mask);
++	bool ok = gpu_wait(ready, mask, mask, 20000);
++	*got = io_rd(gpu_va, ready);
++	return ok;
++}
++
++static void
++gpu_cores_off(void)
++{
++	gpu_wr(TILER_PWROFF, io_rd(gpu_va, TILER_READY));
++	gpu_wr(SHADER_PWROFF, io_rd(gpu_va, SHADER_READY));
++	(void)gpu_wait(SHADER_READY, 0xffffffffu, 0, 20000);
++	gpu_wr(L2_PWROFF, io_rd(gpu_va, L2_READY));
++}
++
++static void
++gpu_zero(vm_offset_t va, size_t bytes)
++{
++	volatile uint64_t *q = (volatile uint64_t *)va;
++	for (size_t i = 0; i < bytes / 8; i++) {
++		q[i] = 0;
++	}
++}
++
++/* Level 0..2 tables chain to one level-3 table; its first GPU_DATA_PAGES entries are the data pages. */
++static void
++gpu_tables(void)
++{
++	gpu_zero(mem_va, GPU_MEM_BYTES);
++	volatile uint64_t *l0 = (volatile uint64_t *)mem_va;
++	volatile uint64_t *l1 = (volatile uint64_t *)(mem_va + 0x1000);
++	volatile uint64_t *l2 = (volatile uint64_t *)(mem_va + 0x2000);
++	volatile uint64_t *l3 = (volatile uint64_t *)(mem_va + 0x3000);
++	l0[0] = (GPU_MEM_PA + 0x1000) | 3;
++	l1[0] = (GPU_MEM_PA + 0x2000) | 3;
++	l2[(GPU_VA >> 21) & 0x1ff] = (GPU_MEM_PA + 0x3000) | 3;
++	for (unsigned i = 0; i < GPU_DATA_PAGES; i++) {
++		/* Mali-LPAE leaf: read/write, outer shareable, attribute 0 (non-cached). */
++		l3[i] = (GPU_MEM_PA + GPU_DATA_OFF + i * 0x1000ull) | 0x2c1;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++gpu_skip(const char *why)
++{
++	job.state = "SKIP";
++	job.why = why;
++	kprintf("A04S GPU JOB SKIP %s\n", why);
++}
++
++static void
++gpu_fail(const char *why)
++{
++	job.state = "FAIL";
++	job.why = why;
++	kprintf("A04S GPU JOB FAIL %s\n", why);
++}
++
++static void
++gpu_first_job(void)
++{
++	job.state = "RUNNING";
++	job.why = "CHECKS";
++	if (!a04s_gpu_path_ok()) {
++		gpu_skip("GPU PATH");
++		return;
++	}
++	if (!core_va || !g3d_va) {
++		gpu_skip("NO MAPPING");
++		return;
++	}
++	if (!gate_running(io_rd(g3d_va, G3D_GATE_LHS_D)) || !gate_running(io_rd(core_va, CORE_GATE_LHM_D_G3D))) {
++		gpu_skip("DATA GATE");
++		return;
++	}
++	job.temp = a04s_gpu_temp();
++	if (job.temp == TMU_NO_TEMP) {
++		gpu_skip("NO TEMP");
++		return;
++	}
++	if (job.temp < GPU_TEMP_MIN || job.temp > GPU_TEMP_MAX) {
++		gpu_skip("TEMP");
++		return;
++	}
++	gpu_va = ml_io_map(GPU_PA, 0x5000);
++	mem_va = ml_io_map((vm_offset_t)GPU_MEM_PA, GPU_MEM_BYTES);
++	if (!gpu_va || !mem_va) {
++		gpu_skip("NO MAPPING");
++		return;
++	}
++	job.before_status = io_rd(gpu_va, GPU_STATUS);
++	job.before_l2 = io_rd(gpu_va, L2_READY);
++	job.before_sc = io_rd(gpu_va, SHADER_READY);
++	job.before_tl = io_rd(gpu_va, TILER_READY);
++
++	job.why = "RESET";
++	gpu_wr(GPU_IRQ_MASK, 0);
++	gpu_wr(JOB_IRQ_MASK, 0);
++	gpu_wr(MMU_IRQ_MASK, 0);
++	gpu_wr(GPU_IRQ_CLEAR, 0xffffffffu);
++	gpu_wr(GPU_CMD, CMD_SOFT_RESET);
++	job.reset = gpu_wait(GPU_IRQ_RAWSTAT, IRQ_RESET_DONE, IRQ_RESET_DONE, 100000) ? 1 : 0;
++	gpu_wr(GPU_IRQ_CLEAR, 0xffffffffu);
++	gpu_wr(GPU_IRQ_MASK, 0);
++	gpu_wr(JOB_IRQ_MASK, 0);
++	gpu_wr(MMU_IRQ_MASK, 0);
++	if (job.reset != 1) {
++		gpu_fail("RESET");
++		return;
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		job.cfg[i] = io_rd(gpu_va, GPU_CONFIG(i));
++	}
++
++	job.why = "POWER";
++	uint32_t core0 = io_rd(gpu_va, SHADER_PRESENT) & 1u;
++	if (!core0 ||
++	    !gpu_power(L2_PWRON, L2_READY, io_rd(gpu_va, L2_PRESENT), &job.l2) ||
++	    !gpu_power(SHADER_PWRON, SHADER_READY, core0, &job.sc) ||
++	    !gpu_power(TILER_PWRON, TILER_READY, io_rd(gpu_va, TILER_PRESENT), &job.tl)) {
++		gpu_cores_off();
++		gpu_fail("POWER");
++		return;
++	}
++
++	/* The clock S-Boot left, from the GPU's own cycle counter. */
++	gpu_wr(GPU_CMD, CMD_CYCLE_START);
++	delay(100);
++	uint64_t t0 = mach_absolute_time();
++	uint32_t c0 = io_rd(gpu_va, GPU_CYCLE_LO);
++	delay(20000);
++	uint32_t c1 = io_rd(gpu_va, GPU_CYCLE_LO);
++	uint64_t us = us_since(t0);
++	gpu_wr(GPU_CMD, CMD_CYCLE_STOP);
++	job.mhz = us ? (uint32_t)((uint32_t)(c1 - c0) / us) : 0;
++
++	job.why = "MMU";
++	gpu_tables();
++	vm_offset_t hdr = mem_va + GPU_DATA_OFF;
++	*(volatile uint8_t *)(hdr + 16) = 1 | (2 << 1);         /* 64-bit descriptor, WRITE_VALUE */
++	*(volatile uint16_t *)(hdr + 18) = 1;                   /* job index */
++	*(volatile uint64_t *)(hdr + 32) = GPU_VA + GPU_OUT_OFF; /* payload: address */
++	*(volatile uint64_t *)(hdr + 40) = 3;                   /* type ZERO: write 64 zero bits */
++	volatile uint64_t *out = (volatile uint64_t *)(mem_va + GPU_DATA_OFF + GPU_OUT_OFF);
++	*out = 0xa5a5a5a55a5a5a5aull;
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	uint64_t transtab = GPU_MEM_PA | 7u;                    /* ADRMODE_TABLE | READ_INNER */
++	gpu_wr(AS0 + AS_TRANSTAB_LO, (uint32_t)transtab);
++	gpu_wr(AS0 + AS_TRANSTAB_HI, (uint32_t)(transtab >> 32));
++	gpu_wr(AS0 + AS_MEMATTR_LO, 0x888d88u);
++	gpu_wr(AS0 + AS_MEMATTR_HI, 0);
++	gpu_wr(AS0 + AS_TRANSCFG_LO, 0);                        /* ADRMODE_LEGACY */
++	gpu_wr(AS0 + AS_TRANSCFG_HI, 0);
++	gpu_wr(AS0 + AS_COMMAND, 1);                            /* UPDATE */
++	if (!gpu_wait(AS0 + AS_STATUS, 1u, 0, 100000)) {
++		gpu_cores_off();
++		gpu_fail("MMU UPDATE");
++		return;
++	}
++
++	job.why = "JOB";
++	uint32_t slot = JS(1);
++	gpu_wr(JOB_IRQ_CLEAR, 0xffffffffu);
++	gpu_wr(MMU_IRQ_CLEAR, 0xffffffffu);
++	gpu_wr(slot + JS_HEAD_NEXT_LO, (uint32_t)GPU_VA);
++	gpu_wr(slot + JS_HEAD_NEXT_HI, (uint32_t)(GPU_VA >> 32));
++	gpu_wr(slot + JS_AFFINITY_NEXT_LO, core0);
++	gpu_wr(slot + JS_AFFINITY_NEXT_HI, 0);
++	/* Thread priority 8, clean and invalidate the GPU caches at start and end, address space 0. */
++	gpu_wr(slot + JS_CONFIG_NEXT, (8u << 16) | (3u << 8) | (3u << 12));
++	uint64_t start = mach_absolute_time();
++	gpu_wr(slot + JS_COMMAND_NEXT, 1);                      /* START */
++	for (unsigned i = 0; i < 20000; i++) {
++		job.jirq = io_rd(gpu_va, JOB_IRQ_RAWSTAT);
++		job.mirq = io_rd(gpu_va, MMU_IRQ_RAWSTAT);
++		job.girq = io_rd(gpu_va, GPU_IRQ_RAWSTAT);
++		if ((job.jirq & ((1u << 1) | (1u << 17))) || job.mirq || (job.girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT))) {
++			break;
++		}
++		delay(10);
++	}
++	job.us = (uint32_t)us_since(start);
++	job.js_status = io_rd(gpu_va, slot + JS_STATUS);
++	job.head = io_rd(gpu_va, slot + JS_HEAD_LO);
++	job.as_fault = io_rd(gpu_va, AS0 + AS_FAULTSTATUS);
++	job.as_addr = io_rd(gpu_va, AS0 + AS_FAULTADDR_LO);
++	job.gpu_fault = io_rd(gpu_va, GPU_FAULT_STATUS);
++	job.gpu_faddr = io_rd(gpu_va, GPU_FAULT_ADDR);
++	job.exc = *(volatile uint32_t *)(mem_va + GPU_DATA_OFF);
++	job.output = *out;
++	if ((job.js_status & 0xffu) == JS_ACTIVE) {
++		gpu_wr(slot + JS_COMMAND, JS_HARD_STOP);
++		(void)gpu_wait(slot + JS_STATUS, 0xffu, 0, 10000);
++	}
++	gpu_wr(JOB_IRQ_CLEAR, 0xffffffffu);
++	gpu_wr(MMU_IRQ_CLEAR, 0xffffffffu);
++	gpu_wr(GPU_IRQ_CLEAR, 0xffffffffu);
++	gpu_cores_off();
++
++	bool ok = (job.jirq & (1u << 1)) && !(job.jirq & (1u << 17)) && !job.mirq &&
++	    !(job.girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT)) && job.output == 0;
++	if (ok) {
++		job.state = "OK";
++		job.why = "THE MALI-G52 RAN A JOB";
++		kprintf("A04S GPU JOB OK in %u us, %u MHz\n", job.us, job.mhz);
++	} else {
++		gpu_fail(job.jirq || job.mirq || job.girq ? "FAULT" : "TIMEOUT");
++	}
++}
++
++static void
++a04s_gpu_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	gpu_first_job();
++}
++
++/* Called by a04s_input_start() once 7c-2's checks have run. */
++void a04s_gpu_start(void);
++void
++a04s_gpu_start(void)
++{
++	top_va = ml_io_map(CMU_TOP_PA, 0x4000);
++	core_va = ml_io_map(CMU_CORE_PA, 0x4000);
++	if (a04s_gpu_path_ok()) {
++		g3d_va = ml_io_map(CMU_G3D_PA, 0x4000);
++	}
++	tmu_read();
++	unsigned want = 0;
++	(void)PE_parse_boot_argn("a04sgpu", &want, sizeof(want));
++	if (want != 1) {
++		return;
++	}
++	job.state = "STARTING";
++	job.why = "THREAD";
++	thread_t thread;
++	if (kernel_thread_start(a04s_gpu_thread, NULL, &thread) != KERN_SUCCESS) {
++		gpu_fail("NO THREAD");
++		return;
++	}
++	thread_deallocate(thread);
++}
++
++void a04s_gpu_report(void);
++void
++a04s_gpu_report(void)
++{
++	tmu_read();
++	if (tmu.why) {
++		kprintf("TMU SKIPPED %s G %x Q %x\n", tmu.why, tmu.gate, tmu.qch);
++	} else {
++		kprintf("TMU L0 %d L1 %d G3D %d MAX %d C CAL %d CTL %x ST %x N %u\n", tmu.t[0], tmu.t[1], tmu.t[2],
++		    tmu.max_g3d, tmu.cal, tmu.ctrl, tmu.status, tmu.reads);
++		kprintf("TMU RAW %08x %08x TRIM %08x %08x %08x %08x\n", tmu.cur[0], tmu.cur[1], tmu.trim0,
++		    tmu.trim[0], tmu.trim[1], tmu.trim[2]);
++	}
++	if (g3d_va && a04s_gpu_path_ok()) {
++		uint32_t pll = io_rd(g3d_va, G3D_PLL_CON3);
++		uint32_t m = (pll >> 16) & 0x3ffu, p = (pll >> 8) & 0x3fu, s = pll & 7u;
++		uint64_t mhz = p ? OSC_HZ * m / ((uint64_t)p << s) / 1000000u : 0;
++		kprintf("G3D PLL %08x M %u P %u S %u = %llu MHZ%s USER %x BUSD %x BUSP %x\n", pll, m, p, s, mhz,
++		    (pll & (1u << 31)) ? "" : " (OFF)", io_rd(g3d_va, G3D_SWITCH_USER), io_rd(g3d_va, G3D_MUX_BUSD),
++		    io_rd(g3d_va, G3D_DIV_BUSP));
++		kprintf("G3D TOP MUX %x DIV %x DATA %x/%x CORE %x/%x\n", top_va ? io_rd(top_va, TOP_MUX_G3D_SWITCH) : 0,
++		    top_va ? io_rd(top_va, TOP_DIV_G3D_SWITCH) : 0, io_rd(g3d_va, G3D_GATE_LHS_D),
++		    io_rd(g3d_va, G3D_QCH_LHS_D), core_va ? io_rd(core_va, CORE_GATE_LHM_D_G3D) : 0,
++		    core_va ? io_rd(core_va, CORE_QCH_LHM_D_G3D) : 0);
++	} else {
++		kprintf("G3D PLL SKIPPED\n");
++	}
++	kprintf("GPUJOB %s %s T %d RST %d PWR %x/%x/%x MHZ %u US %u OUT %llx\n", job.state, job.why, job.temp,
++	    job.reset, job.l2, job.sc, job.tl, job.mhz, job.us, job.output);
++	if (job.reset >= 0) {
++		kprintf("GPUJOB IRQ %x MMU %x GPU %x JS %x HEAD %x EXC %x ASF %x@%x GF %x@%x\n", job.jirq, job.mirq,
++		    job.girq, job.js_status, job.head, job.exc, job.as_fault, job.as_addr, job.gpu_fault, job.gpu_faddr);
++		kprintf("GPUJOB CFG %x %x %x %x BEFORE ST %x %x/%x/%x\n", job.cfg[0], job.cfg[1], job.cfg[2],
++		    job.cfg[3], job.before_status, job.before_l2, job.before_sc, job.before_tl);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_input.c b/bsd/dev/a04s_input.c
 new file mode 100644
-index 0000000..4c4b4bd
+index 0000000..3eeab86
 --- /dev/null
 +++ b/bsd/dev/a04s_input.c
-@@ -0,0 +1,1326 @@
+@@ -0,0 +1,1338 @@
 +/*
 + * Galaxy A04s, stage 7: the keys (7b), and read-only first looks at the touch path (7a-1) and
 + * the GPU's power domain (7c-1).
@@ -895,6 +1497,14 @@ index 0000000..4c4b4bd
 +qch_may_stop(uint32_t qch)
 +{
 +	return (qch & QCH_ENABLE) && !(qch & QCH_CLOCK_REQ);
++}
++
++/* Stage 7c-3 (a04s_gpu.c): 7c-2's checks passed and the ID is a Mali-G52's. */
++bool a04s_gpu_path_ok(void);
++bool
++a04s_gpu_path_ok(void)
++{
++	return gpu.why == NULL && (gpu.id >> 16) == 0x7212u;
 +}
 +
 +/* Stage 7c-2: the Mali's ID, if every check on the way passes. */
@@ -1744,6 +2354,8 @@ index 0000000..4c4b4bd
 +	}
 +	a04s_touch_gpu_probe(cmu_peri, cmu_cmgp);
 +	kprintf("A04S 7 PROBED\n");
++	extern void a04s_gpu_start(void);
++	a04s_gpu_start();
 +	cmu_cmgp_va = cmu_cmgp;
 +	a04s_touch_spi_start();
 +	if (!alive_pins) {
@@ -1809,6 +2421,8 @@ index 0000000..4c4b4bd
 +		kprintf("GPU ID %08x L2F %x ST %x SC %x L2 %x\n", gpu.id, gpu.l2_features, gpu.status,
 +		    gpu.shaders, gpu.l2);
 +	}
++	extern void a04s_gpu_report(void);
++	a04s_gpu_report();
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
