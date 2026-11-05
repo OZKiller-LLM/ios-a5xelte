@@ -483,10 +483,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..d01868a
+index 0000000..ad9cf15
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
-@@ -0,0 +1,1290 @@
+@@ -0,0 +1,1291 @@
 +/*
 + * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
 + *
@@ -536,7 +536,8 @@ index 0000000..d01868a
 + *    That 6 MiB of display memory is the only memory outside the private block the GPU can reach.
 + *    Passed on the phone (v39): 1152000 of 1152000 pixels in 1.6 ms.
 + *  - 7c-4c (v40; a04sshader=0 skips it): the first shader. Mesa 25.0.7 compiled "gradient" for GPU
-+ *    0x7212 offline (gpu/a04s/shaderc, CI run 42016363899, gradient.bin SHA-256 4f19e7a9...4abe):
++ *    0x7212 offline (gpu/a04s/shaderc, CI run 42016363899, gradient.bin SHA-256 4f19e7a9...4abe,
++ *    checked against the bytes below when they were copied in):
 + *    colour = (x / 720, y / 1600, 0.5, 1) from the preloaded pixel position. It runs as the panel's
 + *    pre-frame shader (Framebuffer Parameters: Pre Frame 0 = ALWAYS, Frame Shader DCDs), as
 + *    Panfrost's preload does on v7 (pan_fb_preload.c): a Draw with the renderer state, a viewport,
