@@ -167,15 +167,12 @@ compile_one(const char *dir, const char *name, nir_shader *s)
            info.bifrost.messages[0].enabled ? 1u : 0u, info.bifrost.messages[0].varying_index,
            info.bifrost.messages[0].texture ? 1u : 0u, info.bifrost.messages[0].zero_lod ? 1u : 0u,
            info.bifrost.messages[0].num_components);
-   fprintf(h, "#define A04S_SH_%s_WAIT_6 %u
-", name, info.bifrost.wait_6 ? 1u : 0u);
-   fprintf(h, "#define A04S_SH_%s_WAIT_7 %u
-", name, info.bifrost.wait_7 ? 1u : 0u);
+   fprintf(h, "#define A04S_SH_%s_WAIT_6 %u\n", name, info.bifrost.wait_6 ? 1u : 0u);
+   fprintf(h, "#define A04S_SH_%s_WAIT_7 %u\n", name, info.bifrost.wait_7 ? 1u : 0u);
    for (unsigned m = 0; m < 2; m++) {
       const struct bifrost_message_preload *msg = &info.bifrost.messages[m];
       fprintf(h, "/* message %u: enabled %u varying %u fp16 %u components %u texture %u skip %u zero_lod %u "
-              "texture_index %u */
-", m, msg->enabled ? 1u : 0u, msg->varying_index, msg->fp16 ? 1u : 0u,
+              "texture_index %u */\n", m, msg->enabled ? 1u : 0u, msg->varying_index, msg->fp16 ? 1u : 0u,
               msg->num_components, msg->texture ? 1u : 0u, msg->skip ? 1u : 0u, msg->zero_lod ? 1u : 0u,
               msg->texture_index);
    }
@@ -184,8 +181,7 @@ compile_one(const char *dir, const char *name, nir_shader *s)
       fprintf(h, " slot %u format %u", (unsigned)info.varyings.input[v].location,
               (unsigned)info.varyings.input[v].format);
    }
-   fprintf(h, " */
-");
+   fprintf(h, " */\n");
    fprintf(h, "static const unsigned char a04s_sh_%s[%u] __attribute__((aligned(128))) = {", name,
            binary.size);
    const unsigned char *p = binary.data;
