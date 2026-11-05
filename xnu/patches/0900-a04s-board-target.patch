@@ -3601,10 +3601,10 @@ index 0000000..ac6bfa6
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_power.c b/bsd/dev/a04s_power.c
 new file mode 100644
-index 0000000..8221564
+index 0000000..e8ada98
 --- /dev/null
 +++ b/bsd/dev/a04s_power.c
-@@ -0,0 +1,952 @@
+@@ -0,0 +1,1178 @@
 +/*
 + * Galaxy A04s: the battery (fuel gauge), and read-only first looks at the speaker amp and the audio
 + * power domain.
@@ -3612,8 +3612,9 @@ index 0000000..8221564
 + * I2C: the two buses used here are Samsung's plain s3c2440-i2c controllers (live device tree):
 + *  - bus 0, i2c@13830000: the MAX1726x fuel gauge at 0x36. Pins gpp0-0/1, function 2.
 + *  - bus 3, i2c@13860000: the FourSemi FS18xx speaker amp at 0x34. Pins gpp1-0/1, function 2.
-+ * The driver below can only read. A transfer sends the device's address and one register number,
-+ * then a repeated start and the read: no data byte is ever sent, and there is no write function.
++ * The driver below only reads, with one exception (v44, below): the charger's REG03 CHG_CONFIG bit.
++ * A read sends the device's address and one register number, then a repeated start and the read: it
++ * never sends a data byte. a04s_chg_write03() is the only function that does.
 + * Each device has a fixed list of registers it may read; anything else is refused. A bus is used
 + * only if its CMU_PERI PCLK gate is running, its Q-channel can't stop the clock, both pins have the
 + * I2C function, and the controller isn't busy. The bus runs at
@@ -3637,7 +3638,7 @@ index 0000000..8221564
 + * Charger, with a04sfg=1 (a04schg=0 turns it off): the Silergy SY6970 at 0x6a on the same bus
 + * (device tree sy6970@6a; Android's module is syv660_charger). Register-compatible with TI's
 + * BQ25895 (Linux bq25890_charger.c reg_fields): 8-bit registers 0x00-0x14, read one byte at a time,
-+ * and only read. Its settings stay as S-Boot left them. All of 0x00-0x14 once at start, then the
++ * and only read, except REG03's CHG_CONFIG with a04schgsafe=1 (v44). All its other settings stay as S-Boot left them. All of 0x00-0x14 once at start, then the
 + * status (0x0B), faults (0x0C, read twice: the first read returns the latched faults, the second the
 + * current ones), the ADC (0x0E, 0x11, 0x12), the input limit in use (0x13) and the ADC mode (0x02) on
 + * each poll. SweetBattery takes power-good as the cable and CHRG_STAT as charging or done; without
@@ -4215,6 +4216,159 @@ index 0000000..8221564
 +}
 +
 +/*
++ * v44, the one charger write, with a04schgsafe=1: REG03's CHG_CONFIG bit (bit 4), so charging can be
++ * stopped while the battery is too hot or too cold and started again afterwards. In the BQ25895
++ * register map the SY6970 follows, the chip charges only with CHG_CONFIG = 1 and its CE pin
++ * active. Clearing the bit alone stops charging, so the CE pin (silergy,chg_en, a GPIO) is not
++ * touched.
++ *
++ * REG03 only ever gets one of two values, both made from S-Boot's own REG03 (the start-up dump):
++ * that value itself, or that value with CHG_CONFIG cleared. Nothing can raise a current or a
++ * voltage, turn on OTG boost (bit 5), or reset the watchdog (bit 6). Writes are refused, and stay
++ * off for the rest of the boot, if:
++ *  - S-Boot's REG03 had CHG_CONFIG clear, or OTG or WD_RST set;
++ *  - the charger's watchdog is on (REG07 bits 5-4 not 0). A write puts the chip in host mode, and
++ *    an expiring watchdog would then reset every register to its defaults, 2048 mA among them;
++ *  - REG03 holds anything but those two values just before the write (someone else changed it);
++ *  - after the write, REG03 doesn't read back as written, or IINLIM, ICHG, IPRECHG/ITERM, VREG or
++ *    the timer register differ from their values read just before it.
++ * a04s_chg_write03() is the only function that sends a data byte on I2C, and only a04s_chg_set()
++ * calls it. Both stay separate functions (noinline), so tools/check_kernel_charger.py can check them
++ * in the built kernel.
++ */
++#define CHG_CFG_CHG             (1u << 4)       /* CHG_CONFIG */
++#define CHG_CFG_OTG             (1u << 5)       /* OTG_CONFIG */
++#define CHG_CFG_WDRST           (1u << 6)       /* WD_RST */
++#define CHG_TIMER_WD_MASK       (3u << 4)       /* REG07 WATCHDOG */
++#define CHG_REG_IPRE_ITERM      0x05u
++#define CHG_KEEP_N              5u
++
++static const uint8_t chg_keep[CHG_KEEP_N] = { CHG_REG_IINLIM, CHG_REG_ICHG, CHG_REG_IPRE_ITERM, CHG_REG_VREG,
++	                                      CHG_REG_TIMER };
++
++static struct {
++	const char *why;                        /* why writes went off, or "-" */
++	uint8_t now;                            /* REG03 as last read */
++	unsigned writes, stops, resumes, failures;
++	unsigned test_phase, test_at;
++	bool stopped, disabled;
++} chgw = { .why = "-" };
++
++/* START, 0x6a + W, register 0x03, one data byte, STOP: the only I2C write in this file. With
++ * a04s_i2c_mtx held. */
++static bool __attribute__((noinline))
++a04s_chg_write03(uint8_t value)
++{
++	struct i2c_bus *b = &buses[0];
++	if (b->why || (io_rd(b->va, IICSTAT) & STAT_START)) {
++		return false;
++	}
++	b->xfers++;
++	uint32_t con = CON_ACKEN | CON_TXDIV_512 | CON_SCALE_MAX | (b->irqen ? CON_IRQEN : 0);
++	io_wr(b->va, IICLC, LC_FILTER_ON);
++	io_wr(b->va, IICCON, con);
++	io_wr(b->va, IICSTAT, STAT_MASTER_TX | STAT_TXRXEN);
++	io_wr(b->va, IICDS, (uint32_t)CHG_ADDR << 1);
++	delay(1);
++	io_wr(b->va, IICSTAT, STAT_MASTER_TX | STAT_TXRXEN | STAT_START);
++	if (!i2c_wait_pend(b)) {
++		return i2c_fail(b, "W TIMEOUT ADDR", STAT_MASTER_TX, con);
++	}
++	uint32_t st = io_rd(b->va, IICSTAT);
++	if (st & STAT_ARBITR) {
++		return i2c_fail(b, "W ARBITRATION", STAT_MASTER_TX, con);
++	}
++	if (st & STAT_LASTBIT) {
++		return i2c_fail(b, "W NACK ADDR", STAT_MASTER_TX, con);
++	}
++	io_wr(b->va, IICDS, CHG_REG_CFG);
++	delay(1);
++	io_wr(b->va, IICCON, con);
++	if (!i2c_wait_pend(b)) {
++		return i2c_fail(b, "W TIMEOUT REG", STAT_MASTER_TX, con);
++	}
++	if (io_rd(b->va, IICSTAT) & STAT_LASTBIT) {
++		return i2c_fail(b, "W NACK REG", STAT_MASTER_TX, con);
++	}
++	io_wr(b->va, IICDS, value);
++	delay(1);
++	io_wr(b->va, IICCON, con);
++	if (!i2c_wait_pend(b)) {
++		return i2c_fail(b, "W TIMEOUT DATA", STAT_MASTER_TX, con);
++	}
++	if (io_rd(b->va, IICSTAT) & STAT_LASTBIT) {
++		return i2c_fail(b, "W NACK DATA", STAT_MASTER_TX, con);
++	}
++	i2c_stop(b, STAT_MASTER_TX, con);
++	return true;
++}
++
++static void
++chgw_refuse(const char *why)
++{
++	chgw.disabled = true;
++	chgw.why = why;
++	kprintf("A04S CHGSAFE WRITES OFF: %s\n", why);
++}
++
++/* Charging on (S-Boot's own REG03) or off (that value without CHG_CONFIG). With a04s_i2c_mtx held. */
++static bool __attribute__((noinline))
++a04s_chg_set(bool enable)
++{
++	if (chgw.disabled || !chg.started) {
++		return false;
++	}
++	uint8_t orig = chg.regs[CHG_REG_CFG];
++	if (!(orig & CHG_CFG_CHG) || (orig & (CHG_CFG_OTG | CHG_CFG_WDRST))) {
++		chgw_refuse("START VALUE");
++		return false;
++	}
++	uint8_t timer = 0, now = 0;
++	uint8_t before[CHG_KEEP_N] = { 0 };
++	bool read = chg_reg(CHG_REG_TIMER, &timer) && chg_reg(CHG_REG_CFG, &now);
++	for (unsigned i = 0; read && i < CHG_KEEP_N; i++) {
++		read = chg_reg(chg_keep[i], &before[i]);
++	}
++	if (!read) {
++		chgw.failures++;                /* the bus: tried again on the next sample */
++		return false;
++	}
++	chgw.now = now;
++	if (timer & CHG_TIMER_WD_MASK) {
++		chgw_refuse("WATCHDOG ON");
++		return false;
++	}
++	if (now != orig && now != (uint8_t)(orig & ~CHG_CFG_CHG)) {
++		chgw_refuse("REG03 CHANGED");
++		return false;
++	}
++	uint8_t value = enable ? orig : (uint8_t)(orig & ~CHG_CFG_CHG);
++	if (now == value) {
++		return true;
++	}
++	if (!a04s_chg_write03(value)) {
++		chgw.failures++;
++		return false;
++	}
++	chgw.writes++;
++	uint8_t back = 0;
++	if (!chg_reg(CHG_REG_CFG, &back) || back != value) {
++		chgw.now = back;
++		chgw_refuse("READBACK");
++		return false;
++	}
++	chgw.now = back;
++	for (unsigned i = 0; i < CHG_KEEP_N; i++) {
++		uint8_t after = 0;
++		if (!chg_reg(chg_keep[i], &after) || after != before[i]) {
++			chgw_refuse("OTHER REGISTER CHANGED");
++			return false;
++		}
++	}
++	return true;
++}
++
++/*
 + * v43, the battery thermistor through the SoC's ADC (adc@11C40000, samsung,exynos-adc-v3), with the
 + * boot-arg a04sadc=1. The device tree's battery node reads channel 1 (adc-temp) and channel 3
 + * (adc-in-bat), and its battery,temp_table_adc / temp_table_data turn channel 1's 12-bit value into
@@ -4237,7 +4391,7 @@ index 0000000..8221564
 + * for the report. A reading counts once three samples in a row are inside the table and within
 + * 3.0 C of each other, and stops counting on any sample outside it. Until then
 + * a04s_batt_temp_dc() gives the gauge's temperature instead. Charger safety is a dry run in v43:
-+ * the decision is logged and reported, and the charger is not written.
++ * the decision is logged and reported, and the charger is not written. v44 acts on it (chg_safety()).
 + */
 +#define CMU_CMGP_PA             0x11c00000u
 +#define CMGP_ADC_MUX            0x1000u
@@ -4282,8 +4436,7 @@ index 0000000..8221564
 +};
 +
 +enum { SAFE_UNKNOWN, SAFE_OK, SAFE_WARM, SAFE_HOT, SAFE_COLD };
-+static const char *const safe_names[] = { "UNKNOWN", "OK", "WOULD LIMIT 1280 MA (WARM)", "WOULD STOP (HOT)",
-+	                                  "WOULD STOP (COLD)" };
++static const char *const safe_names[] = { "UNKNOWN", "OK", "WARM (LIMIT 1280 MA)", "HOT", "COLD" };
 +
 +static vm_offset_t cmgp_va, adc_va;
 +static struct {
@@ -4294,6 +4447,7 @@ index 0000000..8221564
 +	unsigned steady, samples, timeouts, untrusted;
 +	int safe;
 +	bool trusted, checked, usable;
++	bool lost;                              /* a trusted reading went bad: charging stops */
 +} adc = { .state = "OFF", .temp_dc = NO_TEMP, .last_dc = NO_TEMP, .safe = SAFE_UNKNOWN };
 +
 +/* Whether the ADC may be used: decided once, with reads only. */
@@ -4399,6 +4553,63 @@ index 0000000..8221564
 +	return SAFE_OK;
 +}
 +
++/*
++ * v44: the decision acted on, with a04schgsafe=1 (without it, a dry run as in v43). Charging stops
++ * when the battery is HOT (above 50.0 C) or COLD (below 0 C), or when a trusted thermistor reading is
++ * lost (outside the table, which is above 90 C or below -20 C, an open or shorted thermistor, or the
++ * ADC timing out). It starts again only at OK or WARM with a trusted reading. WARM's 1280 mA limit
++ * needs no write: S-Boot's ICHG (448 mA here) is already below it, and the report shows it.
++ * a04schgtest=1 tests both writes at room temperature: once the reading is trusted, charging stops
++ * for 60 s, then starts again; a real HOT or COLD still wins.
++ */
++#define CHGTEST_SAMPLES         30u             /* 60 s at one sample every 2 s */
++
++static void
++chg_safety(int safe, bool lost)
++{
++	unsigned arm = 0, test = 0;
++	(void)PE_parse_boot_argn("a04schgsafe", &arm, sizeof(arm));
++	(void)PE_parse_boot_argn("a04schgtest", &test, sizeof(test));
++	if (arm != 1) {
++		return;
++	}
++	bool stop = lost || safe == SAFE_HOT || safe == SAFE_COLD;
++	bool resume = !lost && (safe == SAFE_OK || safe == SAFE_WARM);
++	const char *reason = lost ? "THERMISTOR LOST" : safe_names[safe];
++	if (test == 1 && resume) {
++		if (chgw.test_phase == 0) {
++			chgw.test_phase = 1;
++			chgw.test_at = adc.samples;
++			kprintf("A04S CHGSAFE TEST: STOP FOR 60 S AT %d\n", adc.temp_dc);
++		}
++		if (chgw.test_phase == 1) {
++			if (adc.samples - chgw.test_at < CHGTEST_SAMPLES) {
++				stop = true;
++				resume = false;
++				reason = "TEST";
++			} else {
++				chgw.test_phase = 2;
++				kprintf("A04S CHGSAFE TEST: START AGAIN AT %d\n", adc.temp_dc);
++			}
++		}
++	}
++	lck_mtx_lock(&a04s_i2c_mtx);
++	if (stop && !chgw.stopped) {
++		if (a04s_chg_set(false)) {
++			chgw.stopped = true;
++			chgw.stops++;
++			kprintf("A04S CHGSAFE CHARGING STOPPED: %s AT %d (REG03 %02x)\n", reason, adc.temp_dc, chgw.now);
++		}
++	} else if (resume && chgw.stopped) {
++		if (a04s_chg_set(true)) {
++			chgw.stopped = false;
++			chgw.resumes++;
++			kprintf("A04S CHGSAFE CHARGING ON AGAIN AT %d (REG03 %02x)\n", adc.temp_dc, chgw.now);
++		}
++	}
++	lck_mtx_unlock(&a04s_i2c_mtx);
++}
++
 +/* From the thermal thread (bsd/dev/a04s_gpu.c), every 2 s. Only that thread touches the ADC. */
 +void a04s_adc_sample(void);
 +void
@@ -4414,8 +4625,13 @@ index 0000000..8221564
 +		if (!adc_convert(ADC_CH_BATT, &v[i])) {
 +			adc.timeouts++;
 +			adc.state = "TIMEOUT";
++			if (adc.trusted) {
++				adc.untrusted++;
++				adc.lost = true;
++			}
 +			adc.trusted = false;
 +			adc.steady = 0;
++			chg_safety(SAFE_UNKNOWN, adc.lost);
 +			return;
 +		}
 +		lo = v[i] < v[lo] ? i : lo;
@@ -4437,6 +4653,7 @@ index 0000000..8221564
 +		adc.state = "OUT OF TABLE";
 +		if (adc.trusted) {
 +			adc.untrusted++;
++			adc.lost = true;
 +		}
 +		adc.trusted = false;
 +		adc.steady = 0;
@@ -4447,6 +4664,7 @@ index 0000000..8221564
 +		    adc.steady + 1u : 1u;
 +		if (!adc.trusted && adc.steady >= ADC_TRUST) {
 +			adc.trusted = true;
++			adc.lost = false;
 +			kprintf("A04S BATTERY TEMP %s%d.%d C FROM THE THERMISTOR (ADC %u)\n", dc < 0 ? "-" : "",
 +			    (dc < 0 ? -dc : dc) / 10, (dc < 0 ? -dc : dc) % 10, adc.raw);
 +		}
@@ -4456,9 +4674,10 @@ index 0000000..8221564
 +	adc.last_dc = dc;
 +	int safe = safe_decide(adc.trusted ? adc.temp_dc : NO_TEMP, adc.safe);
 +	if (safe != adc.safe) {
-+		kprintf("A04S CHGSAFE %s AT %d (DRY RUN, CHARGER NOT WRITTEN)\n", safe_names[safe], adc.temp_dc);
++		kprintf("A04S CHGSAFE %s AT %d\n", safe_names[safe], adc.temp_dc);
 +		adc.safe = safe;
 +	}
++	chg_safety(safe, adc.lost);
 +}
 +
 +/* The battery temperature in tenths of a degree, or NO_TEMP: the thermistor once it is trusted,
@@ -4533,6 +4752,13 @@ index 0000000..8221564
 +		    (ut < 0 ? -ut : ut) % 10);
 +		kprintf("BATT ADC CMGP MUX %x DIV %x G %x/%x Q %x/%x VER %x DAT %x\n", adc.mux, adc.div, adc.gate0, adc.gate1,
 +		    adc.dmyqch, adc.qch0, adc.ver, adc.dat);
++		unsigned arm = 0, test = 0;
++		(void)PE_parse_boot_argn("a04schgsafe", &arm, sizeof(arm));
++		(void)PE_parse_boot_argn("a04schgtest", &test, sizeof(test));
++		kprintf("CHGSAFE %s %s REG03 START %02x NOW %02x WRITES %u STOPS %u ON %u FAILS %u TEST %u/%u ICHG %u MA\n",
++		    arm != 1 ? "DRY RUN" : chgw.disabled ? "WRITES OFF" : chgw.stopped ? "STOPPED" : "ARMED", chgw.why,
++		    chg.regs[CHG_REG_CFG], chgw.now, chgw.writes, chgw.stops, chgw.resumes, chgw.failures, test, chgw.test_phase,
++		    (chg.regs[CHG_REG_ICHG] & 0x7fu) * 64u);
 +	}
 +	static const char *const vbus_names[8] = { "NONE", "SDP", "CDP", "DCP", "HVDCP", "ADAPTER", "NONSTD", "OTG" };
 +	static const char *const chrg_names[4] = { "NOT", "PRE", "FAST", "DONE" };
