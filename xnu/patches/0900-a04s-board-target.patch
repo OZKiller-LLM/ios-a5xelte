@@ -3601,10 +3601,10 @@ index 0000000..ac6bfa6
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_power.c b/bsd/dev/a04s_power.c
 new file mode 100644
-index 0000000..dcb7b13
+index 0000000..8221564
 --- /dev/null
 +++ b/bsd/dev/a04s_power.c
-@@ -0,0 +1,954 @@
+@@ -0,0 +1,952 @@
 +/*
 + * Galaxy A04s: the battery (fuel gauge), and read-only first looks at the speaker amp and the audio
 + * power domain.
@@ -4526,14 +4526,12 @@ index 0000000..dcb7b13
 +	{
 +		int t = adc.temp_dc == NO_TEMP ? 0 : adc.temp_dc, use = a04s_batt_temp_dc();
 +		int ut = use == NO_TEMP ? 0 : use;
-+		kprintf("BATT ADC %s T %s%d.%d C RAW %u (%u-%u) CH0 %u CH2 %u CH3 %u N %u TO %u LOST %u SAFE %s USE %s %s%d.%d
-+",
++		kprintf("BATT ADC %s T %s%d.%d C RAW %u (%u-%u) CH0 %u CH2 %u CH3 %u N %u TO %u LOST %u SAFE %s USE %s %s%d.%d\n",
 +		    adc.state, t < 0 ? "-" : "", (t < 0 ? -t : t) / 10, (t < 0 ? -t : t) % 10, adc.raw, adc.raw_min,
 +		    adc.raw_max, adc.ch[0], adc.ch[2], adc.ch[3], adc.samples, adc.timeouts, adc.untrusted, safe_names[adc.safe],
 +		    use == NO_TEMP ? "NONE" : (adc.trusted ? "ADC" : "FG"), ut < 0 ? "-" : "", (ut < 0 ? -ut : ut) / 10,
 +		    (ut < 0 ? -ut : ut) % 10);
-+		kprintf("BATT ADC CMGP MUX %x DIV %x G %x/%x Q %x/%x VER %x DAT %x
-+", adc.mux, adc.div, adc.gate0, adc.gate1,
++		kprintf("BATT ADC CMGP MUX %x DIV %x G %x/%x Q %x/%x VER %x DAT %x\n", adc.mux, adc.div, adc.gate0, adc.gate1,
 +		    adc.dmyqch, adc.qch0, adc.ver, adc.dat);
 +	}
 +	static const char *const vbus_names[8] = { "NONE", "SDP", "CDP", "DCP", "HVDCP", "ADAPTER", "NONSTD", "OTG" };
