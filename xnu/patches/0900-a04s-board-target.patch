@@ -483,10 +483,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..168625f
+index 0000000..55508d1
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
-@@ -0,0 +1,1074 @@
+@@ -0,0 +1,1078 @@
 +/*
 + * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
 + *
@@ -528,7 +528,9 @@ index 0000000..168625f
 + *  - 7c-4b (v38; a04spanel=0 skips it): the same clear on the panel. S-Boot's scan-out buffer
 + *    (bootloader_fb: 720x1600 XRGB8888 at 0xfa000000, 0xd00000 bytes reserved) is mapped into the
 + *    GPU as three 2 MiB blocks (Mali-LPAE leaves are type 1 at every level, as Panfrost's
-+ *    io-pgtable writes them), only if PE_current_console reports exactly that buffer. The panel is
++ *    io-pgtable writes them), from the board's A5XELTE_FB_* values (pexpert/arm64/A5XELTE.h), the
++ *    ones SweetFramebuffer scans out of. The boot leaves PE_current_console empty on this phone
++ *    (v38 read 0), as on the A5. The panel is
 + *    cleared green for PANEL_HOLD_MS, with SweetFramebuffer's copies held off meanwhile
 + *    (sweet_fb_hold_until, as on the S7), and every pixel is read back through an uncached mapping.
 + *    That 6 MiB of display memory is the only memory outside the private block the GPU can reach.
@@ -542,6 +544,7 @@ index 0000000..168625f
 +#include <kern/thread.h>
 +#include <mach/mach_time.h>
 +#include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>
 +#include <libkern/libkern.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -719,6 +722,9 @@ index 0000000..168625f
 +#error "the panel blocks must share the data pages' level-1 entry, above their level-2 entry"
 +#endif
 +extern uint64_t sweet_fb_hold_until;    /* iokit/Kernel/arm/SweetFramebuffer.cpp */
++#if A5XELTE_FB_PA != PANEL_PA || A5XELTE_FB_BLOCKS > PANEL_MAX_BLOCKS
++#error "the board's scan-out buffer must be the one the GPU maps"
++#endif
 +
 +static vm_offset_t peri_va, tmu_va, top_va, core_va, g3d_va, gpu_va, mem_va;
 +
@@ -1202,8 +1208,8 @@ index 0000000..168625f
 +}
 +
 +/*
-+ * 7c-4b, before the page tables are built: accept the console's buffer for the GPU only if it is
-+ * exactly S-Boot's scan-out buffer, in whole tiles, and fits the reserved region.
++ * 7c-4b, before the page tables are built: the board's scan-out buffer (the one SweetFramebuffer
++ * uses), accepted for the GPU only in whole tiles, with a sane stride, inside the reserved region.
 + */
 +static void
 +panel_probe(void)
@@ -1214,12 +1220,10 @@ index 0000000..168625f
 +		panel.why = "a04spanel=0";
 +		return;
 +	}
-+	PE_Video video = { 0 };
-+	(void)PE_current_console(&video);
-+	panel.pa = (uint64_t)video.v_baseAddr;
-+	panel.w = (uint32_t)video.v_width;
-+	panel.h = (uint32_t)video.v_height;
-+	panel.stride = (uint32_t)video.v_rowBytes;
++	panel.pa = A5XELTE_FB_PA;
++	panel.w = A5XELTE_FB_WIDTH;
++	panel.h = A5XELTE_FB_HEIGHT;
++	panel.stride = A5XELTE_FB_STRIDE;
 +	panel.state = "SKIP";
 +	uint64_t bytes = (uint64_t)panel.stride * panel.h;
 +	if (panel.pa != PANEL_PA) {
