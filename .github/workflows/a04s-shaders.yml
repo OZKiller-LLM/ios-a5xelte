@@ -1,0 +1,70 @@
+name: a04s-shaders
+
+# Galaxy A04s, stage 7c-4c: the Mali-G52's (Bifrost, arch 7) shaders, compiled offline with Mesa
+# 25.0.7's Panfrost compiler (gpu/a04s/shaderc). The artifact holds each shader's code, its
+# disassembly and a C header for the kernel. Only Mesa and this repository's code are used.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [a04s]
+    paths:
+      - "gpu/a04s/**"
+      - ".github/workflows/a04s-shaders.yml"
+
+concurrency:
+  group: a04s-shaders-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build bison flex pkg-config python3-venv \
+            libdrm-dev libexpat1-dev zlib1g-dev
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q mako pyyaml packaging setuptools meson
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - name: Build and compile the shaders
+        run: |
+          set -o pipefail
+          bash gpu/a04s/shaderc/build.sh "$RUNNER_TEMP/a04s-shaderc" out 2>&1 | tee build.log
+      # Artifacts and logs need a GitHub sign-in; check-run annotations are public, so the
+      # headers and disassembly are published there too.
+      - name: Publish the shaders as annotations
+        if: success()
+        run: |
+          python3 - out <<'PY'
+          import pathlib, sys
+          esc = lambda s: s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
+          for p in sorted(pathlib.Path(sys.argv[1]).glob('*')):
+              if p.suffix in ('.h', '.txt') or p.name == 'SHA256SUMS':
+                  print('::notice title=' + p.name + '::' + esc(p.read_text()[:60000]))
+          PY
+      - name: Report build errors as annotations
+        if: failure()
+        run: |
+          test -f build.log || exit 0
+          python3 - build.log <<'PY'
+          import re, sys
+          clean = [re.sub(r'\x1b\[[0-9;]*m', '', l) for l in open(sys.argv[1], errors='replace').read().splitlines()]
+          cc = re.compile(r'(:\d+:\d+: (fatal )?error:|^ld: (?!warning)|undefined reference|collect2|ERROR:|AssertionError|^FAILED:|meson.build:\d+:\d+:|a04s_shaderc:)')
+          hits = []
+          for i, l in enumerate(clean):
+              if cc.search(l):
+                  hits.append(' | '.join(x[:250] for x in clean[i:i + 4]))
+          esc = lambda s: s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
+          for l in hits[:9]:
+              print('::error title=build::' + esc(l[:900]))
+          print('::error title=build log tail::' + esc('\n'.join(l[:300] for l in clean[-60:])[-30000:]))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: a04s-shaders
+          path: out/
