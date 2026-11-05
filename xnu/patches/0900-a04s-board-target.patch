@@ -483,10 +483,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..b8d1f4e
+index 0000000..168625f
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
-@@ -0,0 +1,918 @@
+@@ -0,0 +1,1074 @@
 +/*
 + * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
 + *
@@ -524,7 +524,14 @@ index 0000000..b8d1f4e
 + *    allocation, Z format, tiler) and 64 B of padding, then the 64 B render target. A clear-only
 + *    batch has no tiler context in Panfrost (tiler pointer 0), and the sample-locations table is
 + *    Mesa's single-sampled entry (one sample and the origin at 128,128 in 1/256 pixel). Pass: done
-+ *    with no fault, and 4096 of 4096 pixels hold the clear colour. Nothing reaches the screen yet.
++ *    with no fault, and 4096 of 4096 pixels hold the clear colour. Passed on the phone (v37).
++ *  - 7c-4b (v38; a04spanel=0 skips it): the same clear on the panel. S-Boot's scan-out buffer
++ *    (bootloader_fb: 720x1600 XRGB8888 at 0xfa000000, 0xd00000 bytes reserved) is mapped into the
++ *    GPU as three 2 MiB blocks (Mali-LPAE leaves are type 1 at every level, as Panfrost's
++ *    io-pgtable writes them), only if PE_current_console reports exactly that buffer. The panel is
++ *    cleared green for PANEL_HOLD_MS, with SweetFramebuffer's copies held off meanwhile
++ *    (sweet_fb_hold_until, as on the S7), and every pixel is read back through an uncached mapping.
++ *    That 6 MiB of display memory is the only memory outside the private block the GPU can reach.
 + *  - The cores are powered off again. iOS keeps drawing on the CPU.
 + */
 +#if defined(ARM64_BOARD_CONFIG_A04S)
@@ -697,6 +704,21 @@ index 0000000..b8d1f4e
 +#if FRAG_RT_OFF + FRAG_W * FRAG_H * 4u > GPU_DATA_PAGES * 0x1000u
 +#error "the render target must stay inside the data pages"
 +#endif
++/* 7c-4b: the panel, S-Boot's scan-out buffer. */
++#define PANEL_PA                0xfa000000ull
++#define PANEL_RESERVED          0xd00000ull
++#define PANEL_VA                0x04000000ull
++#define BLOCK_2M                0x200000ull
++#define PANEL_MAX_BLOCKS        3u
++#define PANEL_COLOR             0xff00ff00u     /* green, the same in RGBA and BGRA */
++#define PANEL_HOLD_MS           4000u
++#if (PANEL_PA % BLOCK_2M) || (PANEL_VA % BLOCK_2M) || PANEL_MAX_BLOCKS * BLOCK_2M > PANEL_RESERVED
++#error "the panel mapping must be whole 2 MiB blocks inside the reserved buffer"
++#endif
++#if (PANEL_VA >> 30) != (GPU_VA >> 30) || (PANEL_VA >> 21) < (GPU_VA >> 21) + 1u
++#error "the panel blocks must share the data pages' level-1 entry, above their level-2 entry"
++#endif
++extern uint64_t sweet_fb_hold_until;    /* iokit/Kernel/arm/SweetFramebuffer.cpp */
 +
 +static vm_offset_t peri_va, tmu_va, top_va, core_va, g3d_va, gpu_va, mem_va;
 +
@@ -732,15 +754,31 @@ index 0000000..b8d1f4e
 +	int temp;
 +} job = { .state = "OFF", .why = "a04sgpu=0", .reset = -1, .temp = TMU_NO_TEMP };
 +
-+/* 7c-4a: the fragment clear. */
++/* One FRAGMENT job's outcome. */
++struct frag_result {
++	uint32_t jirq, mirq, girq, js_status, head, as_fault, as_addr, gpu_fault, gpu_faddr, exc;
++	uint64_t fault_ptr;
++	uint32_t us;
++	bool tried;                             /* the job was submitted */
++};
++
++/* 7c-4a: the private clear. */
 +static struct {
 +	const char *state;                      /* OFF, SKIP, OK, FAIL */
 +	const char *why;
-+	uint32_t jirq, mirq, girq, js_status, head, as_fault, as_addr, gpu_fault, gpu_faddr, exc;
-+	uint64_t fault_ptr;
-+	uint32_t us, good, first_bad, first_bad_at, corner[4];
-+	bool tried;                             /* the job was submitted */
++	struct frag_result r;
++	uint32_t good, first_bad, first_bad_at, corner[4];
 +} frag = { .state = "OFF", .why = "NOT RUN" };
++
++/* 7c-4b: the panel clear. */
++static struct {
++	const char *state;                      /* OFF, SKIP, OK, FAIL */
++	const char *why;
++	struct frag_result r;
++	uint64_t pa;
++	uint32_t w, h, stride, blocks;
++	uint32_t good, total, check_ms, samples[5];
++} panel = { .state = "OFF", .why = "NOT RUN" };
 +
 +static inline uint32_t
 +io_rd(vm_offset_t base, uint32_t off)
@@ -988,6 +1026,10 @@ index 0000000..b8d1f4e
 +		/* Mali-LPAE leaf: read/write, outer shareable, attribute 0 (non-cached). */
 +		l3[i] = (GPU_MEM_PA + GPU_DATA_OFF + i * 0x1000ull) | 0x2c1;
 +	}
++	/* 7c-4b: the panel's 2 MiB blocks, the same leaf attributes, only once panel_probe() accepted it. */
++	for (unsigned i = 0; i < panel.blocks; i++) {
++		l2[((PANEL_VA >> 21) & 0x1ff) + i] = (panel.pa + i * BLOCK_2M) | 0x2c1;
++	}
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +}
 +
@@ -1008,35 +1050,22 @@ index 0000000..b8d1f4e
 +}
 +
 +/*
-+ * 7c-4a: clear FRAG_W x FRAG_H RGBA8 pixels with a FRAGMENT job on JS0. Called with the cores on,
-+ * AS0 programmed and the page tables in place (gpu_first_job after its WRITE_VALUE passed).
++ * One FRAGMENT job on JS0 that clears a w x h RGBA8 render target at GPU VA rt_va (w and h whole
++ * 16-pixel tiles). The descriptors are built in the data pages; the cores must be on, AS0
++ * programmed and the page tables in place. True if the job completed with no fault.
 + */
-+static void
-+gpu_fragment_clear(uint32_t affinity)
++static bool
++frag_job(uint64_t rt_va, uint32_t w, uint32_t h, uint32_t stride, uint32_t color, uint32_t affinity,
++    struct frag_result *r)
 +{
-+	unsigned want = 1;
-+	(void)PE_parse_boot_argn("a04sfrag", &want, sizeof(want));
-+	if (want != 1) {
-+		frag.why = "a04sfrag=0";
-+		return;
-+	}
-+	if (!a04s_gpu_allowed()) {
-+		frag.state = "SKIP";
-+		frag.why = therm.level == LEVEL_OFF ? "THERMAL OFF" : level_names[therm.level];
-+		return;
-+	}
 +	vm_offset_t base = mem_va + GPU_DATA_OFF;
 +	gpu_zero(base + FRAG_JOB_OFF, FRAG_RT_OFF - FRAG_JOB_OFF);
-+	volatile uint32_t *px = (volatile uint32_t *)(base + FRAG_RT_OFF);
-+	for (unsigned i = 0; i < FRAG_W * FRAG_H; i++) {
-+		px[i] = FRAG_FILL;
-+	}
 +
 +	/* Job header: 64-bit, FRAGMENT, index 1. Payload at +32: tile bounds, framebuffer pointer. */
 +	volatile uint32_t *hdr = (volatile uint32_t *)(base + FRAG_JOB_OFF);
 +	hdr[4] = 1u | (JOB_FRAGMENT << 1) | (1u << 16);
 +	hdr[8] = 0;                                                     /* min tile x, y */
-+	hdr[9] = ((FRAG_H / 16u - 1u) << 16) | (FRAG_W / 16u - 1u);     /* max tile x, y */
++	hdr[9] = ((h / 16u - 1u) << 16) | (w / 16u - 1u);               /* max tile x, y */
 +	/* MFBD (bit 0), no ZS/CRC extension, render target count - 1 = 0, 64-byte aligned. */
 +	*(volatile uint64_t *)(base + FRAG_JOB_OFF + 40) = (GPU_VA + FRAG_FBD_OFF) | 1u;
 +
@@ -1049,9 +1078,9 @@ index 0000000..b8d1f4e
 +	volatile uint32_t *fb = (volatile uint32_t *)(base + FRAG_FBD_OFF);
 +	fb[0] = 0;                                                      /* pre/post frame: never */
 +	*(volatile uint64_t *)(base + FRAG_FBD_OFF + 16) = GPU_VA + FRAG_SAMPLES_OFF;   /* word 4 */
-+	fb[8] = ((FRAG_H - 1u) << 16) | (FRAG_W - 1u);                  /* width - 1, height - 1 */
++	fb[8] = ((h - 1u) << 16) | (w - 1u);                            /* width - 1, height - 1 */
 +	fb[9] = 0;                                                      /* bound min x, y */
-+	fb[10] = ((FRAG_H - 1u) << 16) | (FRAG_W - 1u);                 /* bound max x, y */
++	fb[10] = ((h - 1u) << 16) | (w - 1u);                           /* bound max x, y */
 +	fb[11] = (2u << 6) |            /* tie-break MINUS_180_IN_0_OUT, as Panfrost */
 +	    (8u << 9) |                 /* effective tile size log2(16 x 16) */
 +	    (1u << 24);                 /* colour buffer allocation 1 KiB (16 x 16 x 4, shr 10) */
@@ -1068,11 +1097,11 @@ index 0000000..b8d1f4e
 +	    (1u << 15) |                /* dithering, as Panfrost */
 +	    (0x688u << 16) |            /* identity swizzle: R, G, B, A */
 +	    (1u << 31);                 /* clean pixel write: the tile is cleared */
-+	*(volatile uint64_t *)(base + FRAG_RT_DESC_OFF + 32) = GPU_VA + FRAG_RT_OFF;     /* word 8 */
-+	rt[10] = FRAG_W * 4u;           /* row stride */
++	*(volatile uint64_t *)(base + FRAG_RT_DESC_OFF + 32) = rt_va;  /* word 8 */
++	rt[10] = stride;                /* row stride */
 +	rt[11] = 0;                     /* surface stride */
 +	for (unsigned i = 12; i < 16; i++) {
-+		rt[i] = FRAG_COLOR;     /* clear colour */
++		rt[i] = color;          /* clear colour */
 +	}
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +
@@ -1086,36 +1115,65 @@ index 0000000..b8d1f4e
 +	gpu_wr(slot + JS_AFFINITY_NEXT_LO, affinity);
 +	gpu_wr(slot + JS_AFFINITY_NEXT_HI, 0);
 +	gpu_wr(slot + JS_CONFIG_NEXT, (8u << 16) | (3u << 8) | (3u << 12));
-+	frag.tried = true;
++	r->tried = true;
 +	uint64_t start = mach_absolute_time();
 +	gpu_wr(slot + JS_COMMAND_NEXT, 1);                              /* START */
 +	for (unsigned i = 0; i < 20000; i++) {
-+		frag.jirq = io_rd(gpu_va, JOB_IRQ_RAWSTAT);
-+		frag.mirq = io_rd(gpu_va, MMU_IRQ_RAWSTAT);
-+		frag.girq = io_rd(gpu_va, GPU_IRQ_RAWSTAT);
-+		if ((frag.jirq & ((1u << 0) | (1u << 16))) || frag.mirq ||
-+		    (frag.girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT))) {
++		r->jirq = io_rd(gpu_va, JOB_IRQ_RAWSTAT);
++		r->mirq = io_rd(gpu_va, MMU_IRQ_RAWSTAT);
++		r->girq = io_rd(gpu_va, GPU_IRQ_RAWSTAT);
++		if ((r->jirq & ((1u << 0) | (1u << 16))) || r->mirq ||
++		    (r->girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT))) {
 +			break;
 +		}
 +		delay(10);
 +	}
-+	frag.us = (uint32_t)us_since(start);
-+	frag.js_status = io_rd(gpu_va, slot + JS_STATUS);
-+	frag.head = io_rd(gpu_va, slot + JS_HEAD_LO);
-+	frag.as_fault = io_rd(gpu_va, AS0 + AS_FAULTSTATUS);
-+	frag.as_addr = io_rd(gpu_va, AS0 + AS_FAULTADDR_LO);
-+	frag.gpu_fault = io_rd(gpu_va, GPU_FAULT_STATUS);
-+	frag.gpu_faddr = io_rd(gpu_va, GPU_FAULT_ADDR);
-+	frag.exc = hdr[0];
-+	frag.fault_ptr = *(volatile uint64_t *)(base + FRAG_JOB_OFF + 8);
-+	if ((frag.js_status & 0xffu) == JS_ACTIVE) {
++	r->us = (uint32_t)us_since(start);
++	r->js_status = io_rd(gpu_va, slot + JS_STATUS);
++	r->head = io_rd(gpu_va, slot + JS_HEAD_LO);
++	r->as_fault = io_rd(gpu_va, AS0 + AS_FAULTSTATUS);
++	r->as_addr = io_rd(gpu_va, AS0 + AS_FAULTADDR_LO);
++	r->gpu_fault = io_rd(gpu_va, GPU_FAULT_STATUS);
++	r->gpu_faddr = io_rd(gpu_va, GPU_FAULT_ADDR);
++	r->exc = hdr[0];
++	r->fault_ptr = *(volatile uint64_t *)(base + FRAG_JOB_OFF + 8);
++	if ((r->js_status & 0xffu) == JS_ACTIVE) {
 +		gpu_wr(slot + JS_COMMAND, JS_HARD_STOP);
 +		(void)gpu_wait(slot + JS_STATUS, 0xffu, 0, 10000);
 +	}
 +	gpu_wr(JOB_IRQ_CLEAR, 0xffffffffu);
 +	gpu_wr(MMU_IRQ_CLEAR, 0xffffffffu);
 +	gpu_wr(GPU_IRQ_CLEAR, 0xffffffffu);
++	return (r->jirq & 1u) && !(r->jirq & (1u << 16)) && !r->mirq &&
++	       !(r->girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT));
++}
 +
++static const char *
++frag_failure(const struct frag_result *r)
++{
++	return r->jirq || r->mirq || r->girq ? "FAULT" : "TIMEOUT";
++}
++
++/* 7c-4a: FRAG_W x FRAG_H pixels in the private pages. */
++static bool
++gpu_fragment_clear(uint32_t affinity)
++{
++	unsigned want = 1;
++	(void)PE_parse_boot_argn("a04sfrag", &want, sizeof(want));
++	if (want != 1) {
++		frag.why = "a04sfrag=0";
++		return false;
++	}
++	if (!a04s_gpu_allowed()) {
++		frag.state = "SKIP";
++		frag.why = therm.level == LEVEL_OFF ? "THERMAL OFF" : level_names[therm.level];
++		return false;
++	}
++	volatile uint32_t *px = (volatile uint32_t *)(mem_va + GPU_DATA_OFF + FRAG_RT_OFF);
++	for (unsigned i = 0; i < FRAG_W * FRAG_H; i++) {
++		px[i] = FRAG_FILL;
++	}
++	bool ran = frag_job(GPU_VA + FRAG_RT_OFF, FRAG_W, FRAG_H, FRAG_W * 4u, FRAG_COLOR, affinity, &frag.r);
 +	frag.good = 0;
 +	frag.first_bad_at = 0xffffffffu;
 +	for (unsigned i = 0; i < FRAG_W * FRAG_H; i++) {
@@ -1131,16 +1189,99 @@ index 0000000..b8d1f4e
 +	frag.corner[1] = px[FRAG_W - 1u];
 +	frag.corner[2] = px[(FRAG_H - 1u) * FRAG_W];
 +	frag.corner[3] = px[FRAG_W * FRAG_H - 1u];
-+	bool ran = (frag.jirq & 1u) && !(frag.jirq & (1u << 16)) && !frag.mirq &&
-+	    !(frag.girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT));
 +	if (ran && frag.good == FRAG_W * FRAG_H) {
 +		frag.state = "OK";
 +		frag.why = "THE MALI-G52 CLEARED A RENDER TARGET";
-+		kprintf("A04S GPU FRAGMENT OK %u/%u pixels in %u us\n", frag.good, FRAG_W * FRAG_H, frag.us);
++		kprintf("A04S GPU FRAGMENT OK %u/%u pixels in %u us\n", frag.good, FRAG_W * FRAG_H, frag.r.us);
++		return true;
++	}
++	frag.state = "FAIL";
++	frag.why = !ran ? frag_failure(&frag.r) : "PIXELS";
++	kprintf("A04S GPU FRAGMENT FAIL %s %u/%u EXC %x\n", frag.why, frag.good, FRAG_W * FRAG_H, frag.r.exc);
++	return false;
++}
++
++/*
++ * 7c-4b, before the page tables are built: accept the console's buffer for the GPU only if it is
++ * exactly S-Boot's scan-out buffer, in whole tiles, and fits the reserved region.
++ */
++static void
++panel_probe(void)
++{
++	unsigned want = 1;
++	(void)PE_parse_boot_argn("a04spanel", &want, sizeof(want));
++	if (want != 1) {
++		panel.why = "a04spanel=0";
++		return;
++	}
++	PE_Video video = { 0 };
++	(void)PE_current_console(&video);
++	panel.pa = (uint64_t)video.v_baseAddr;
++	panel.w = (uint32_t)video.v_width;
++	panel.h = (uint32_t)video.v_height;
++	panel.stride = (uint32_t)video.v_rowBytes;
++	panel.state = "SKIP";
++	uint64_t bytes = (uint64_t)panel.stride * panel.h;
++	if (panel.pa != PANEL_PA) {
++		panel.why = "NOT THE BOOT BUFFER";
++	} else if (panel.w == 0 || panel.h == 0 || panel.w % 16u || panel.h % 16u || panel.w > 4096u || panel.h > 4096u) {
++		panel.why = "SIZE";
++	} else if (panel.stride < panel.w * 4u || panel.stride % 16u) {
++		panel.why = "STRIDE";
++	} else if (bytes > PANEL_MAX_BLOCKS * BLOCK_2M) {
++		panel.why = "TOO LARGE";
 +	} else {
-+		frag.state = "FAIL";
-+		frag.why = !ran ? (frag.jirq || frag.mirq || frag.girq ? "FAULT" : "TIMEOUT") : "PIXELS";
-+		kprintf("A04S GPU FRAGMENT FAIL %s %u/%u EXC %x\n", frag.why, frag.good, FRAG_W * FRAG_H, frag.exc);
++		panel.blocks = (uint32_t)((bytes + BLOCK_2M - 1u) / BLOCK_2M);
++		panel.state = "READY";
++		panel.why = "MAPPED";
++	}
++}
++
++/* 7c-4b: the whole panel cleared green, held PANEL_HOLD_MS, read back. */
++static void
++gpu_panel_clear(uint32_t affinity)
++{
++	if (panel.blocks == 0) {
++		return;                 /* panel_probe() said why */
++	}
++	if (!a04s_gpu_allowed()) {
++		panel.state = "SKIP";
++		panel.why = therm.level == LEVEL_OFF ? "THERMAL OFF" : level_names[therm.level];
++		return;
++	}
++	uint64_t hold;
++	nanoseconds_to_absolutetime((uint64_t)PANEL_HOLD_MS * 1000000ull, &hold);
++	sweet_fb_hold_until = mach_absolute_time() + hold;
++	bool ran = frag_job(PANEL_VA, panel.w, panel.h, panel.stride, PANEL_COLOR, affinity, &panel.r);
++	vm_offset_t pix = ml_io_map((vm_offset_t)panel.pa, (vm_size_t)panel.stride * panel.h);
++	if (pix) {
++		uint64_t start = mach_absolute_time();
++		panel.total = panel.w * panel.h;
++		panel.good = 0;
++		for (uint32_t y = 0; y < panel.h; y++) {
++			volatile uint32_t *row = (volatile uint32_t *)(pix + (vm_offset_t)y * panel.stride);
++			for (uint32_t x = 0; x < panel.w; x++) {
++				if (row[x] == PANEL_COLOR) {
++					panel.good++;
++				}
++			}
++		}
++		panel.check_ms = (uint32_t)(us_since(start) / 1000u);
++		const uint32_t at[5][2] = { { 0, 0 }, { panel.w - 1u, 0 }, { 0, panel.h - 1u },
++			                    { panel.w - 1u, panel.h - 1u }, { panel.w / 2u, panel.h / 2u } };
++		for (unsigned i = 0; i < 5; i++) {
++			panel.samples[i] = *(volatile uint32_t *)(pix + (vm_offset_t)at[i][1] * panel.stride + at[i][0] * 4u);
++		}
++	}
++	/* The console keeps printing over the panel, so a few rows of text may differ: 90% is a pass. */
++	if (ran && pix && (uint64_t)panel.good * 10u >= (uint64_t)panel.total * 9u) {
++		panel.state = "OK";
++		panel.why = "THE MALI-G52 DREW THE SCREEN";
++		kprintf("A04S GPU PANEL OK %u/%u pixels in %u us\n", panel.good, panel.total, panel.r.us);
++	} else {
++		panel.state = "FAIL";
++		panel.why = !ran ? frag_failure(&panel.r) : !pix ? "NO MAPPING" : "PIXELS";
++		kprintf("A04S GPU PANEL FAIL %s %u/%u EXC %x\n", panel.why, panel.good, panel.total, panel.r.exc);
 +	}
 +}
 +
@@ -1231,6 +1372,7 @@ index 0000000..b8d1f4e
 +	job.mhz = us ? (uint32_t)((uint32_t)(c1 - c0) / us) : 0;
 +
 +	job.why = "MMU";
++	panel_probe();
 +	gpu_tables();
 +	vm_offset_t hdr = mem_va + GPU_DATA_OFF;
 +	*(volatile uint8_t *)(hdr + 16) = 1 | (JOB_WRITE_VALUE << 1);   /* 64-bit descriptor, WRITE_VALUE */
@@ -1296,7 +1438,12 @@ index 0000000..b8d1f4e
 +	bool ok = (job.jirq & (1u << 1)) && !(job.jirq & (1u << 17)) && !job.mirq &&
 +	    !(job.girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT)) && job.output == 0;
 +	if (ok) {
-+		gpu_fragment_clear(core0);
++		if (gpu_fragment_clear(core0)) {
++			gpu_panel_clear(core0);
++		} else if (panel.blocks) {
++			panel.state = "SKIP";
++			panel.why = "NO PRIVATE CLEAR";
++		}
 +	} else {
 +		frag.why = "NO FIRST JOB";
 +	}
@@ -1397,11 +1544,20 @@ index 0000000..b8d1f4e
 +		    job.cfg[3], job.before_status, job.before_l2, job.before_sc, job.before_tl);
 +	}
 +	kprintf("GPUFRAG %s %s %ux%u GOOD %u/%u US %u CORNERS %x %x %x %x\n", frag.state, frag.why, FRAG_W, FRAG_H,
-+	    frag.good, FRAG_W * FRAG_H, frag.us, frag.corner[0], frag.corner[1], frag.corner[2], frag.corner[3]);
-+	if (frag.tried) {
-+		kprintf("GPUFRAG IRQ %x MMU %x GPU %x JS %x HEAD %x EXC %x FP %llx ASF %x@%x GF %x@%x BAD %x@%u\n",
-+		    frag.jirq, frag.mirq, frag.girq, frag.js_status, frag.head, frag.exc, frag.fault_ptr, frag.as_fault,
-+		    frag.as_addr, frag.gpu_fault, frag.gpu_faddr, frag.first_bad, frag.first_bad_at);
++	    frag.good, FRAG_W * FRAG_H, frag.r.us, frag.corner[0], frag.corner[1], frag.corner[2], frag.corner[3]);
++	if (frag.r.tried) {
++		kprintf("GPUFRAG IRQ %x MMU %x GPU %x JS %x HEAD %x EXC %x ASF %x@%x GF %x@%x BAD %x@%u\n",
++		    frag.r.jirq, frag.r.mirq, frag.r.girq, frag.r.js_status, frag.r.head, frag.r.exc, frag.r.as_fault,
++		    frag.r.as_addr, frag.r.gpu_fault, frag.r.gpu_faddr, frag.first_bad, frag.first_bad_at);
++	}
++	kprintf("GPUPANEL %s %s %ux%u STRIDE %u PA %llx BLOCKS %u GOOD %u/%u US %u CHECK %u MS\n", panel.state,
++	    panel.why, panel.w, panel.h, panel.stride, panel.pa, panel.blocks, panel.good, panel.total, panel.r.us,
++	    panel.check_ms);
++	if (panel.r.tried) {
++		kprintf("GPUPANEL IRQ %x MMU %x GPU %x JS %x HEAD %x EXC %x ASF %x@%x GF %x@%x AT %x %x %x %x %x\n",
++		    panel.r.jirq, panel.r.mirq, panel.r.girq, panel.r.js_status, panel.r.head, panel.r.exc, panel.r.as_fault,
++		    panel.r.as_addr, panel.r.gpu_fault, panel.r.gpu_faddr, panel.samples[0], panel.samples[1],
++		    panel.samples[2], panel.samples[3], panel.samples[4]);
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
@@ -4759,7 +4915,7 @@ index b269868..717e4cf 100644
  	/* cpu_start() discards PE_cpu_start's return; do not silently carry on. */
  	if (rc != 0) {
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index f1e25f9..b794b60 100644
+index f1e25f9..cb06d8e 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -267,6 +267,23 @@ AppleCLCD::start(IOService *provider)
@@ -4803,6 +4959,26 @@ index f1e25f9..b794b60 100644
  #endif
  	{
  		fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -419,7 +446,7 @@ AppleCLCD::showFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	IOLockLock(fb->fLock);
+ 	bool show = fb->fDirty && !fb->fPowerOff;
+-#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#if defined(ARM64_BOARD_CONFIG_HEROLTE) || defined(ARM64_BOARD_CONFIG_A04S)
+ 	show = show && mach_absolute_time() >= sweet_fb_hold_until;
+ #endif
+ 	if (show) {
+@@ -486,8 +513,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && fb->fShow == NULL;
+-#if defined(ARM64_BOARD_CONFIG_HEROLTE)
+-	/* bsd/dev/herolte_gpu.c holds the panel for its GPU-drawn test frames. */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE) || defined(ARM64_BOARD_CONFIG_A04S)
++	/* bsd/dev/herolte_gpu.c (A04S: a04s_gpu.c) holds the panel for its GPU-drawn test frames. */
+ 	if (flush && now < sweet_fb_hold_until) {
+ 		flush = false;
+ 	}
 @@ -820,7 +847,12 @@ AppleCLCD::present(const uint8_t *rec)
  			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
  			    get32(a, 12), dx, dy, w, h);
