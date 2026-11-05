@@ -483,10 +483,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..55508d1
+index 0000000..d01868a
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
-@@ -0,0 +1,1078 @@
+@@ -0,0 +1,1290 @@
 +/*
 + * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
 + *
@@ -534,6 +534,17 @@ index 0000000..55508d1
 + *    cleared green for PANEL_HOLD_MS, with SweetFramebuffer's copies held off meanwhile
 + *    (sweet_fb_hold_until, as on the S7), and every pixel is read back through an uncached mapping.
 + *    That 6 MiB of display memory is the only memory outside the private block the GPU can reach.
++ *    Passed on the phone (v39): 1152000 of 1152000 pixels in 1.6 ms.
++ *  - 7c-4c (v40; a04sshader=0 skips it): the first shader. Mesa 25.0.7 compiled "gradient" for GPU
++ *    0x7212 offline (gpu/a04s/shaderc, CI run 42016363899, gradient.bin SHA-256 4f19e7a9...4abe):
++ *    colour = (x / 720, y / 1600, 0.5, 1) from the preloaded pixel position. It runs as the panel's
++ *    pre-frame shader (Framebuffer Parameters: Pre Frame 0 = ALWAYS, Frame Shader DCDs), as
++ *    Panfrost's preload does on v7 (pan_fb_preload.c): a Draw with the renderer state, a viewport,
++ *    a thread storage descriptor and a full-panel rectangle; the renderer state with the shader,
++ *    32 registers a thread, the fragment-position and coverage preloads, early pixel kill; one
++ *    fixed-function blend for render target 0 (opaque, source only, RGBA8_TB memory format, F32
++ *    registers). The tiles are cleared black first. Every pixel is checked against the expected
++ *    gradient, 2 steps either way per channel.
 + *  - The cores are powered off again. iOS keeps drawing on the CPU.
 + */
 +#if defined(ARM64_BOARD_CONFIG_A04S)
@@ -715,6 +726,39 @@ index 0000000..55508d1
 +#define PANEL_MAX_BLOCKS        3u
 +#define PANEL_COLOR             0xff00ff00u     /* green, the same in RGBA and BGRA */
 +#define PANEL_HOLD_MS           4000u
++/* 7c-4c: the gradient shader and its descriptors, after the private render target's pixels. */
++#define SH_CODE_OFF             0x5000u         /* 128-byte aligned */
++#define SH_DCD_OFF              0x5400u         /* three Draws: pre-frame 0, 1, post-frame */
++#define SH_RSD_OFF              0x5600u         /* Renderer State, then the Blend for RT 0 */
++#define SH_TSD_OFF              0x5700u
++#define SH_VIEWPORT_OFF         0x5740u
++#define SH_RECT_OFF             0x5780u
++#define SH_END_OFF              0x57c0u
++#define SH_GRADIENT_WORK_REGS   32u             /* Mesa: 32 work registers */
++#define SH_CLEAR                0xff000000u     /* black, under the shader */
++#define SH_HOLD_MS              6000u
++#define FRAME_MODE_ALWAYS       1u
++#if SH_CODE_OFF < FRAG_RT_OFF + FRAG_W * FRAG_H * 4u || SH_END_OFF > GPU_DATA_PAGES * 0x1000u
++#error "the shader's pages must follow the private render target inside the data pages"
++#endif
++#if SH_GRADIENT_WORK_REGS > 32u
++#error "the renderer state below assumes 32 registers a thread"
++#endif
++/* Mesa 25.0.7 a04s_gradient for GPU 0x7212 (gpu/a04s/shaderc): 128 bytes, preload r59 (pixel
++ * position) and r60 (coverage). */
++static const unsigned char a04s_sh_gradient[128] __attribute__((aligned(128))) = {
++	0x29, 0x51, 0x30, 0xbc, 0x6b, 0x68, 0xcb, 0x80, 0xa3, 0x33, 0x07, 0x00,
++	0x04, 0x00, 0x40, 0x02, 0x21, 0x51, 0x82, 0xb0, 0x0b, 0x38, 0x07, 0x20,
++	0xe0, 0x33, 0x57, 0x02, 0x00, 0x60, 0xc0, 0x39, 0x05, 0x08, 0x43, 0xc0,
++	0x7b, 0x18, 0xcb, 0x80, 0x83, 0xa5, 0x02, 0x08, 0x6d, 0xd9, 0x01, 0x38,
++	0x72, 0x70, 0x3d, 0xa2, 0x03, 0x00, 0x00, 0xf8, 0x63, 0x0b, 0xb6, 0x3a,
++	0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
++};
 +#if (PANEL_PA % BLOCK_2M) || (PANEL_VA % BLOCK_2M) || PANEL_MAX_BLOCKS * BLOCK_2M > PANEL_RESERVED
 +#error "the panel mapping must be whole 2 MiB blocks inside the reserved buffer"
 +#endif
@@ -785,6 +829,14 @@ index 0000000..55508d1
 +	uint32_t w, h, stride, blocks;
 +	uint32_t good, total, check_ms, samples[5];
 +} panel = { .state = "OFF", .why = "NOT RUN" };
++
++/* 7c-4c: the gradient shader over the panel. */
++static struct {
++	const char *state;                      /* OFF, SKIP, OK, FAIL */
++	const char *why;
++	struct frag_result r;
++	uint32_t good, total, samples[5], want[5];
++} shade = { .state = "OFF", .why = "NOT RUN" };
 +
 +static inline uint32_t
 +io_rd(vm_offset_t base, uint32_t off)
@@ -1062,7 +1114,7 @@ index 0000000..55508d1
 + */
 +static bool
 +frag_job(uint64_t rt_va, uint32_t w, uint32_t h, uint32_t stride, uint32_t color, uint32_t affinity,
-+    struct frag_result *r)
++    struct frag_result *r, uint64_t frame_dcds, uint32_t frame_modes)
 +{
 +	vm_offset_t base = mem_va + GPU_DATA_OFF;
 +	gpu_zero(base + FRAG_JOB_OFF, FRAG_RT_OFF - FRAG_JOB_OFF);
@@ -1082,8 +1134,9 @@ index 0000000..55508d1
 +
 +	/* Framebuffer Parameters (v7.xml), words 0-15; words 16-31 are padding. */
 +	volatile uint32_t *fb = (volatile uint32_t *)(base + FRAG_FBD_OFF);
-+	fb[0] = 0;                                                      /* pre/post frame: never */
++	fb[0] = frame_modes;                                            /* pre 0, pre 1, post (3 bits each) */
 +	*(volatile uint64_t *)(base + FRAG_FBD_OFF + 16) = GPU_VA + FRAG_SAMPLES_OFF;   /* word 4 */
++	*(volatile uint64_t *)(base + FRAG_FBD_OFF + 24) = frame_dcds;  /* word 6: Frame Shader DCDs */
 +	fb[8] = ((h - 1u) << 16) | (w - 1u);                            /* width - 1, height - 1 */
 +	fb[9] = 0;                                                      /* bound min x, y */
 +	fb[10] = ((h - 1u) << 16) | (w - 1u);                           /* bound max x, y */
@@ -1179,7 +1232,7 @@ index 0000000..55508d1
 +	for (unsigned i = 0; i < FRAG_W * FRAG_H; i++) {
 +		px[i] = FRAG_FILL;
 +	}
-+	bool ran = frag_job(GPU_VA + FRAG_RT_OFF, FRAG_W, FRAG_H, FRAG_W * 4u, FRAG_COLOR, affinity, &frag.r);
++	bool ran = frag_job(GPU_VA + FRAG_RT_OFF, FRAG_W, FRAG_H, FRAG_W * 4u, FRAG_COLOR, affinity, &frag.r, 0, 0);
 +	frag.good = 0;
 +	frag.first_bad_at = 0xffffffffu;
 +	for (unsigned i = 0; i < FRAG_W * FRAG_H; i++) {
@@ -1242,21 +1295,21 @@ index 0000000..55508d1
 +}
 +
 +/* 7c-4b: the whole panel cleared green, held PANEL_HOLD_MS, read back. */
-+static void
++static bool
 +gpu_panel_clear(uint32_t affinity)
 +{
 +	if (panel.blocks == 0) {
-+		return;                 /* panel_probe() said why */
++		return false;           /* panel_probe() said why */
 +	}
 +	if (!a04s_gpu_allowed()) {
 +		panel.state = "SKIP";
 +		panel.why = therm.level == LEVEL_OFF ? "THERMAL OFF" : level_names[therm.level];
-+		return;
++		return false;
 +	}
 +	uint64_t hold;
 +	nanoseconds_to_absolutetime((uint64_t)PANEL_HOLD_MS * 1000000ull, &hold);
 +	sweet_fb_hold_until = mach_absolute_time() + hold;
-+	bool ran = frag_job(PANEL_VA, panel.w, panel.h, panel.stride, PANEL_COLOR, affinity, &panel.r);
++	bool ran = frag_job(PANEL_VA, panel.w, panel.h, panel.stride, PANEL_COLOR, affinity, &panel.r, 0, 0);
 +	vm_offset_t pix = ml_io_map((vm_offset_t)panel.pa, (vm_size_t)panel.stride * panel.h);
 +	if (pix) {
 +		uint64_t start = mach_absolute_time();
@@ -1282,10 +1335,156 @@ index 0000000..55508d1
 +		panel.state = "OK";
 +		panel.why = "THE MALI-G52 DREW THE SCREEN";
 +		kprintf("A04S GPU PANEL OK %u/%u pixels in %u us\n", panel.good, panel.total, panel.r.us);
++		return true;
++	}
++	panel.state = "FAIL";
++	panel.why = !ran ? frag_failure(&panel.r) : !pix ? "NO MAPPING" : "PIXELS";
++	kprintf("A04S GPU PANEL FAIL %s %u/%u EXC %x\n", panel.why, panel.good, panel.total, panel.r.exc);
++	return false;
++}
++
++static inline void
++put64(vm_offset_t at, uint64_t v)
++{
++	*(volatile uint64_t *)at = v;
++}
++
++/* IEEE-754 single bits of a small whole number, so no floating point runs in the kernel. */
++static uint32_t
++f32_bits(uint32_t v)
++{
++	if (v == 0) {
++		return 0;
++	}
++	unsigned e = 31u - (unsigned)__builtin_clz(v);
++	uint32_t mant = e <= 23u ? (v << (23u - e)) & 0x7fffffu : (v >> (e - 23u)) & 0x7fffffu;
++	return ((127u + e) << 23) | mant;
++}
++
++static bool
++channel_near(uint32_t got, uint32_t want, unsigned shift)
++{
++	uint32_t g = (got >> shift) & 0xffu, w = (want >> shift) & 0xffu;
++	return g + 2u >= w && g <= w + 2u;
++}
++
++/* The gradient's pixel at (x, y): R x/720, G y/1600, B 0.5, A 1, in the RGBA8 bytes it writes. */
++static uint32_t
++gradient_want(uint32_t x, uint32_t y)
++{
++	uint32_t r = (x * 255u + panel.w / 2u) / panel.w;
++	uint32_t g = (y * 255u + panel.h / 2u) / panel.h;
++	return 0xff000000u | (128u << 16) | (g << 8) | r;
++}
++
++/* 7c-4c: Mesa's gradient as the panel's pre-frame shader, held SH_HOLD_MS, checked pixel by pixel. */
++static void
++gpu_shader_gradient(uint32_t affinity)
++{
++	unsigned want = 1;
++	(void)PE_parse_boot_argn("a04sshader", &want, sizeof(want));
++	if (want != 1) {
++		shade.why = "a04sshader=0";
++		return;
++	}
++	if (!a04s_gpu_allowed()) {
++		shade.state = "SKIP";
++		shade.why = therm.level == LEVEL_OFF ? "THERMAL OFF" : level_names[therm.level];
++		return;
++	}
++	vm_offset_t base = mem_va + GPU_DATA_OFF;
++	gpu_zero(base + SH_CODE_OFF, SH_END_OFF - SH_CODE_OFF);
++	volatile uint8_t *code = (volatile uint8_t *)(base + SH_CODE_OFF);
++	for (unsigned i = 0; i < sizeof(a04s_sh_gradient); i++) {
++		code[i] = a04s_sh_gradient[i];
++	}
++
++	/* Draw (v7.xml), pre-frame 0: 64-bit, four components a vertex; tiles stay dirty (written). */
++	vm_offset_t dcd = base + SH_DCD_OFF;
++	*(volatile uint32_t *)dcd = 3u;
++	put64(dcd + 16, GPU_VA + SH_RECT_OFF);          /* word 4: position */
++	put64(dcd + 56, GPU_VA + SH_RSD_OFF);           /* word 14: renderer state */
++	put64(dcd + 96, GPU_VA + SH_VIEWPORT_OFF);      /* word 24: viewport */
++	put64(dcd + 112, GPU_VA + SH_TSD_OFF);          /* word 28: thread storage */
++
++	/* Renderer State (v7.xml), as pan_shader_prepare_rsd() and pan_preload_emit_rsd() fill it. */
++	volatile uint32_t *rsd = (volatile uint32_t *)(base + SH_RSD_OFF);
++	put64(base + SH_RSD_OFF, GPU_VA + SH_CODE_OFF); /* shader; no samplers, textures or varyings */
++	rsd[4] = (2u << 8) |            /* depth source: fixed function */
++	    (2u << 12) |                /* 32 registers a thread */
++	    (1u << 19) |                /* allow forward pixel kill */
++	    (1u << 20);                 /* allow being killed; pixel kill and ZS update force early (0) */
++	rsd[8] = 0xffffu | (7u << 24);  /* sample mask, depth function ALWAYS */
++	rsd[9] = 0xffffu;               /* stencil masks, stencil off */
++	rsd[10] = 0x024fff00u;          /* stencil front: ALWAYS, REPLACE x3, mask 0xff */
++	rsd[11] = 0x024fff00u;          /* stencil back, the same */
++	rsd[12] = (1u << 7) | (1u << 11);       /* preload coverage (r60) and fragment position (r59) */
++
++	/* Blend for render target 0, right after the renderer state (pan_preload_emit_blend). */
++	volatile uint32_t *blend = rsd + 16;
++	blend[0] = (1u << 9) | (1u << 11);      /* enable, round to the framebuffer's precision */
++	blend[1] = 0xf0122122u;         /* RGB and alpha: A = src, B = src, C = zero; colour mask 0xf */
++	blend[2] = 1u | (3u << 3);      /* opaque; fixed function, four components, RT 0 */
++	blend[3] = (237u << 12) | (1u << 24);   /* memory format RGBA8_TB, RGBA order; registers F32 */
++
++	/* Thread storage: no TLS, no workgroup memory (as the S7's Local Storage word 1 = 31). */
++	*(volatile uint32_t *)(base + SH_TSD_OFF + 4) = 31u;
++
++	/* Viewport: infinite bounds, depth 0..1, scissor the whole panel. */
++	volatile uint32_t *vp = (volatile uint32_t *)(base + SH_VIEWPORT_OFF);
++	vp[0] = 0xff800000u;
++	vp[1] = 0xff800000u;
++	vp[2] = 0x7f800000u;
++	vp[3] = 0x7f800000u;
++	vp[4] = 0;
++	vp[5] = 0x3f800000u;
++	vp[6] = 0;
++	vp[7] = ((panel.h - 1u) << 16) | (panel.w - 1u);
++
++	/* The rectangle (x, y, z, w) at the four corners. */
++	volatile uint32_t *rect = (volatile uint32_t *)(base + SH_RECT_OFF);
++	const uint32_t xs[4] = { 0, panel.w, 0, panel.w }, ys[4] = { 0, 0, panel.h, panel.h };
++	for (unsigned i = 0; i < 4; i++) {
++		rect[4 * i + 0] = f32_bits(xs[i]);
++		rect[4 * i + 1] = f32_bits(ys[i]);
++		rect[4 * i + 2] = 0;
++		rect[4 * i + 3] = 0x3f800000u;
++	}
++
++	uint64_t hold;
++	nanoseconds_to_absolutetime((uint64_t)SH_HOLD_MS * 1000000ull, &hold);
++	sweet_fb_hold_until = mach_absolute_time() + hold;
++	bool ran = frag_job(PANEL_VA, panel.w, panel.h, panel.stride, SH_CLEAR, affinity, &shade.r,
++	    GPU_VA + SH_DCD_OFF, FRAME_MODE_ALWAYS);
++	vm_offset_t pix = ml_io_map((vm_offset_t)panel.pa, (vm_size_t)panel.stride * panel.h);
++	if (pix) {
++		shade.total = panel.w * panel.h;
++		shade.good = 0;
++		for (uint32_t y = 0; y < panel.h; y++) {
++			volatile uint32_t *row = (volatile uint32_t *)(pix + (vm_offset_t)y * panel.stride);
++			for (uint32_t x = 0; x < panel.w; x++) {
++				uint32_t v = row[x], w = gradient_want(x, y);
++				if (channel_near(v, w, 0) && channel_near(v, w, 8) && channel_near(v, w, 16) &&
++				    channel_near(v, w, 24)) {
++					shade.good++;
++				}
++			}
++		}
++		const uint32_t at[5][2] = { { 0, 0 }, { panel.w - 1u, 0 }, { 0, panel.h - 1u },
++			                    { panel.w - 1u, panel.h - 1u }, { panel.w / 2u, panel.h / 2u } };
++		for (unsigned i = 0; i < 5; i++) {
++			shade.samples[i] = *(volatile uint32_t *)(pix + (vm_offset_t)at[i][1] * panel.stride + at[i][0] * 4u);
++			shade.want[i] = gradient_want(at[i][0], at[i][1]);
++		}
++	}
++	if (ran && pix && (uint64_t)shade.good * 10u >= (uint64_t)shade.total * 9u) {
++		shade.state = "OK";
++		shade.why = "THE MALI-G52 RAN A SHADER";
++		kprintf("A04S GPU SHADER OK %u/%u pixels in %u us\n", shade.good, shade.total, shade.r.us);
 +	} else {
-+		panel.state = "FAIL";
-+		panel.why = !ran ? frag_failure(&panel.r) : !pix ? "NO MAPPING" : "PIXELS";
-+		kprintf("A04S GPU PANEL FAIL %s %u/%u EXC %x\n", panel.why, panel.good, panel.total, panel.r.exc);
++		shade.state = "FAIL";
++		shade.why = !ran ? frag_failure(&shade.r) : !pix ? "NO MAPPING" : "PIXELS";
++		kprintf("A04S GPU SHADER FAIL %s %u/%u EXC %x\n", shade.why, shade.good, shade.total, shade.r.exc);
 +	}
 +}
 +
@@ -1443,7 +1642,12 @@ index 0000000..55508d1
 +	    !(job.girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT)) && job.output == 0;
 +	if (ok) {
 +		if (gpu_fragment_clear(core0)) {
-+			gpu_panel_clear(core0);
++			if (gpu_panel_clear(core0)) {
++				IOSleep(2000);          /* the green, then the gradient */
++				gpu_shader_gradient(core0);
++			} else {
++				shade.why = "NO PANEL CLEAR";
++			}
 +		} else if (panel.blocks) {
 +			panel.state = "SKIP";
 +			panel.why = "NO PRIVATE CLEAR";
@@ -1557,6 +1761,14 @@ index 0000000..55508d1
 +	kprintf("GPUPANEL %s %s %ux%u STRIDE %u PA %llx BLOCKS %u GOOD %u/%u US %u CHECK %u MS\n", panel.state,
 +	    panel.why, panel.w, panel.h, panel.stride, panel.pa, panel.blocks, panel.good, panel.total, panel.r.us,
 +	    panel.check_ms);
++	kprintf("GPUSHADER %s %s GOOD %u/%u US %u AT %x %x %x %x %x WANT %x %x %x %x %x\n", shade.state, shade.why,
++	    shade.good, shade.total, shade.r.us, shade.samples[0], shade.samples[1], shade.samples[2], shade.samples[3],
++	    shade.samples[4], shade.want[0], shade.want[1], shade.want[2], shade.want[3], shade.want[4]);
++	if (shade.r.tried) {
++		kprintf("GPUSHADER IRQ %x MMU %x GPU %x JS %x HEAD %x EXC %x FP %llx ASF %x@%x GF %x@%x\n", shade.r.jirq,
++		    shade.r.mirq, shade.r.girq, shade.r.js_status, shade.r.head, shade.r.exc, shade.r.fault_ptr,
++		    shade.r.as_fault, shade.r.as_addr, shade.r.gpu_fault, shade.r.gpu_faddr);
++	}
 +	if (panel.r.tried) {
 +		kprintf("GPUPANEL IRQ %x MMU %x GPU %x JS %x HEAD %x EXC %x ASF %x@%x GF %x@%x AT %x %x %x %x %x\n",
 +		    panel.r.jirq, panel.r.mirq, panel.r.girq, panel.r.js_status, panel.r.head, panel.r.exc, panel.r.as_fault,
