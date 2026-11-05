@@ -483,7 +483,7 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..f4752e7
+index 0000000..13b348a
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
 @@ -0,0 +1,1681 @@
@@ -774,8 +774,8 @@ index 0000000..f4752e7
 +#define SLOT_COUNT              2u
 +#define SLOT_TABLES             4u              /* 4 x 2 MiB = 8 MiB a slot */
 +#define SLOT_PAGES              (SLOT_TABLES * 512u)
-+#define SLOT_VA(i)              (0x08000000ull + (uint64_t)(i) * 0x800000ull)
-+#define SLOT_L3_OFF(i)          (0x10000u + (uint32_t)(i) * SLOT_TABLES * 0x1000u)
++#define SLOT_VA(i)              (0x08000000ull + (i) * 0x800000ull)     /* no casts: used in #if */
++#define SLOT_L3_OFF(i)          (0x10000u + (i) * SLOT_TABLES * 0x1000u)
 +#if BL_END_OFF > GPU_DATA_PAGES * 0x1000u || SH_END_OFF > BL_TEX_OFF
 +#error "the blit descriptors must follow the gradient's inside the data pages"
 +#endif
