@@ -483,10 +483,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..8927644
+index 0000000..c7ea944
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
-@@ -0,0 +1,1764 @@
+@@ -0,0 +1,2214 @@
 +/*
 + * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
 + *
@@ -576,6 +576,7 @@ index 0000000..8927644
 +#include <stdbool.h>
 +#include <kern/clock.h>
 +#include <kern/thread.h>
++#include <kern/locks.h>
 +#include <mach/mach_time.h>
 +#include <pexpert/pexpert.h>
 +#include <pexpert/arm64/board_config.h>
@@ -940,6 +941,10 @@ index 0000000..8927644
 +static uint64_t present_total_us;
 +static struct frag_result present_fault;
 +static uint32_t gpu_affinity;
++/* 7c-5a: one GPU at a time for the boot tests' AS0 jobs, the present path and user jobs. */
++static LCK_GRP_DECLARE(a04s_gpu_grp, "a04s_gpu");
++static LCK_MTX_DECLARE(a04s_gpu_mtx, &a04s_gpu_grp);
++static uint32_t present_busy;
 +
 +static inline uint32_t
 +io_rd(vm_offset_t base, uint32_t off)
@@ -1876,12 +1881,18 @@ index 0000000..8927644
 +			v = i;
 +		}
 +	}
++	if (!lck_mtx_try_lock(&a04s_gpu_mtx)) {
++		present_busy++;
++		return -1;
++	}
 +	volatile uint64_t *l3 = (volatile uint64_t *)(mem_va + SLOT_L3_OFF(v));
 +	for (unsigned i = 0; i < SLOT_PAGES; i++) {
 +		l3[i] = i < n ? (pages[i] | 0x2c1) : 0;
 +	}
 +	__asm__ volatile ("dsb sy" ::: "memory");
-+	if (!gpu_as_update()) {
++	bool updated = gpu_as_update();
++	lck_mtx_unlock(&a04s_gpu_mtx);
++	if (!updated) {
 +		present_broken = true;
 +		kprintf("A04S GPU PRESENT OFF: MMU update timed out\n");
 +		return -1;
@@ -1905,10 +1916,15 @@ index 0000000..8927644
 +	    (uint64_t)slots[s].pages * 0x1000u || !a04s_gpu_allowed()) {
 +		return false;
 +	}
++	if (!lck_mtx_try_lock(&a04s_gpu_mtx)) {
++		present_busy++;         /* a user job is running: this frame takes the CPU copy */
++		return false;
++	}
 +	blit_setup(SLOT_VA((unsigned)s) + off, w, h, stride, blit.variant);
 +	struct frag_result r = { 0 };
 +	bool ok = frag_job(PANEL_VA, panel.w, panel.h, panel.stride, SH_CLEAR, gpu_affinity, &r,
 +	    GPU_VA + BL_DCD_OFF, FRAME_MODE_ALWAYS, SWIZZLE_BGRA);
++	lck_mtx_unlock(&a04s_gpu_mtx);
 +	if (!ok) {
 +		present_fails++;
 +		present_fault = r;
@@ -1924,6 +1940,433 @@ index 0000000..8927644
 +		present_max_us = r.us;
 +	}
 +	return true;
++}
++
++/*
++ * 7c-5a: the kernel half of user GPU jobs (the IOKit service and user client are 7c-5b). User jobs
++ * run in their own address space, AS1, so they can't reach the panel, the private block or the
++ * present slots: those are mapped in AS0 only. AS1's tables sit in the window above XNU's RAM,
++ * after the private block: L0, L1 and L2 at UPT_PA, then up to 512 level-3 tables, enough for the
++ * whole 1 GiB user range (GPU VA 0x40000000-0x80000000, handed out in 64 KiB chunks). A page may
++ * be mapped only if it is XNU's RAM (0x92000000-0xbc000000 or 0x880000000-0x8eba00000, the loader's
++ * two windows as the ADT gives them) or the self-test's own buffer, so a user mapping can never
++ * cover the GPU's tables, the private block or the panel.
++ *
++ * Jobs run one at a time under a04s_gpu_mtx, polled for at most 1 s and then hard-stopped, and
++ * each first checks the thermal limit. After a fault in AS1, AS1 is updated again so the next job
++ * starts clean; AS0 is not touched. The present path only tries the lock: while a user job runs,
++ * that frame takes the CPU copy.
++ *
++ * a04sgpu_selftest=1, after the boot tests: a WRITE_VALUE (ZERO) job in AS1 on a buffer mapped in
++ * AS1 (must work), the same job aimed at AS0's private GPU VA (must fault in AS1, and the private
++ * page must keep its marker: the isolation test), then 7c-4a's private clear in AS0 (must still work).
++ */
++#define AS1                     (AS0 + 0x40u)
++#define GPU_AS_PRESENT          0x018u
++#define UPT_PA                  0xbc100000ull
++#define UPT_L3_MAX              512u
++#define UPT_BYTES               ((3u + UPT_L3_MAX) * 0x1000u)
++#define UTEST_PA                0xbc400000ull           /* the self-test's buffer */
++#define UTEST_BYTES             0x10000u
++#define UTEST_PAGES             16u
++#define USER_VA_BASE            0x40000000ull
++#define USER_VA_END             0x80000000ull
++#define USER_CHUNK              0x10000ull
++#define USER_CHUNKS             16384u                  /* (USER_VA_END - USER_VA_BASE) / USER_CHUNK */
++#define USER_JOB_POLLS          100000u                 /* 10 us each: 1 s */
++#define UTEST_MARKER            0x1234567887654321ull
++#if UPT_PA < GPU_MEM_PA + GPU_MEM_BYTES || UTEST_PA < UPT_PA + UPT_BYTES || UTEST_PA + UTEST_BYTES > RAM_WINDOW_END
++#error "AS1's tables and the self-test buffer must sit in the window, clear of the private block and of each other"
++#endif
++#if UTEST_PAGES * 0x1000u != UTEST_BYTES
++#error "UTEST_PAGES must cover UTEST_BYTES"
++#endif
++
++static vm_offset_t upt_va, utest_va;
++static uint64_t user_used[USER_CHUNKS / 64u];
++static uint16_t user_l3_of[512];
++static unsigned user_l3_used;
++static bool user_ready;
++static uint32_t user_affinity;
++static struct {
++	const char *state;                      /* OFF, RUNNING, OK, FAIL */
++	const char *why;
++	uint32_t wv_status, wv_us, iso_status, iso_fault, iso_addr;
++	uint64_t wv_output, iso_output;
++	uint32_t jobs, faults, l3;
++	bool as0_ok;
++	struct frag_result as0;
++} uj = { .state = "OFF", .why = "a04sgpu_selftest=0" };
++
++/* Whether a physical page may be mapped for user jobs. */
++static bool
++user_page_ok(uint64_t pa)
++{
++	if (pa == 0 || (pa & 0xfffu)) {
++		return false;
++	}
++	return (pa >= 0x92000000ull && pa < 0xbc000000ull) || (pa >= 0x880000000ull && pa < 0x8eba00000ull) ||
++	       (pa >= UTEST_PA && pa < UTEST_PA + UTEST_BYTES);
++}
++
++/* AS1 from its tables; also flushes AS1's TLB. With a04s_gpu_mtx held. */
++static bool
++user_as_update(void)
++{
++	uint64_t transtab = UPT_PA | 7u;                        /* ADRMODE_TABLE | READ_INNER */
++	gpu_wr(AS1 + AS_TRANSTAB_LO, (uint32_t)transtab);
++	gpu_wr(AS1 + AS_TRANSTAB_HI, (uint32_t)(transtab >> 32));
++	gpu_wr(AS1 + AS_MEMATTR_LO, 0x888d88u);
++	gpu_wr(AS1 + AS_MEMATTR_HI, 0);
++	gpu_wr(AS1 + AS_TRANSCFG_LO, 0);                        /* ADRMODE_LEGACY, as AS0 */
++	gpu_wr(AS1 + AS_TRANSCFG_HI, 0);
++	gpu_wr(AS1 + AS_COMMAND, 1);                            /* UPDATE */
++	return gpu_wait(AS1 + AS_STATUS, 1u, 0, 100000);
++}
++
++/* AS1's top tables, empty below L2, and the cores on. With a04s_gpu_mtx held. */
++static bool
++user_up_locked(void)
++{
++	if (user_ready) {
++		return true;
++	}
++	if (!gpu_va || !mem_va || !(io_rd(gpu_va, GPU_AS_PRESENT) & 2u)) {
++		uj.why = "NO AS1";
++		return false;
++	}
++	if (!upt_va) {
++		upt_va = ml_io_map((vm_offset_t)UPT_PA, UPT_BYTES);
++	}
++	if (!upt_va) {
++		uj.why = "NO MAPPING";
++		return false;
++	}
++	uint32_t core0 = io_rd(gpu_va, SHADER_PRESENT) & 1u, got = 0;
++	if (!core0 || !gpu_power(L2_PWRON, L2_READY, io_rd(gpu_va, L2_PRESENT), &got) ||
++	    !gpu_power(SHADER_PWRON, SHADER_READY, core0, &got) ||
++	    !gpu_power(TILER_PWRON, TILER_READY, io_rd(gpu_va, TILER_PRESENT), &got)) {
++		uj.why = "POWER";
++		return false;
++	}
++	gpu_zero(upt_va, 3u * 0x1000u);
++	volatile uint64_t *l0 = (volatile uint64_t *)upt_va;
++	volatile uint64_t *l1 = (volatile uint64_t *)(upt_va + 0x1000);
++	l0[0] = (UPT_PA + 0x1000) | 3;
++	l1[(USER_VA_BASE >> 30) & 0x1ffu] = (UPT_PA + 0x2000) | 3;      /* the whole user range: one L2 table */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (unsigned i = 0; i < 512u; i++) {
++		user_l3_of[i] = 0;
++	}
++	user_l3_used = 0;
++	if (!user_as_update()) {
++		uj.why = "AS1 UPDATE";
++		return false;
++	}
++	user_affinity = core0;
++	user_ready = true;
++	return true;
++}
++
++/* n consecutive 64 KiB chunks of user GPU VA, or 0. With a04s_gpu_mtx held. */
++static uint64_t
++user_va_alloc_locked(uint64_t bytes)
++{
++	unsigned n = (unsigned)((bytes + USER_CHUNK - 1u) / USER_CHUNK);
++	if (n == 0 || n > USER_CHUNKS) {
++		return 0;
++	}
++	unsigned run = 0;
++	for (unsigned c = 0; c < USER_CHUNKS; c++) {
++		if (user_used[c / 64u] & (1ull << (c % 64u))) {
++			run = 0;
++		} else if (++run == n) {
++			unsigned first = c + 1u - n;
++			for (unsigned k = first; k <= c; k++) {
++				user_used[k / 64u] |= 1ull << (k % 64u);
++			}
++			return USER_VA_BASE + first * USER_CHUNK;
++		}
++	}
++	return 0;
++}
++
++static void
++user_va_free_locked(uint64_t va, unsigned pages)
++{
++	if (va < USER_VA_BASE || va >= USER_VA_END || pages == 0) {
++		return;
++	}
++	unsigned first = (unsigned)((va - USER_VA_BASE) / USER_CHUNK);
++	unsigned count = (unsigned)(((uint64_t)pages * 0x1000u + USER_CHUNK - 1u) / USER_CHUNK);
++	for (unsigned k = first; k < first + count && k < USER_CHUNKS; k++) {
++		user_used[k / 64u] &= ~(1ull << (k % 64u));
++	}
++}
++
++/* AS1 PTEs for n 4 KiB pages at va (pages NULL: unmap), every page checked first. With the lock. */
++static bool
++user_set_locked(uint64_t va, const uint64_t *pages, unsigned n)
++{
++	for (unsigned i = 0; i < n; i++) {
++		uint64_t a = va + (uint64_t)i * 0x1000u;
++		if (a < USER_VA_BASE || a >= USER_VA_END || (pages != NULL && !user_page_ok(pages[i]))) {
++			return false;
++		}
++	}
++	volatile uint64_t *l2 = (volatile uint64_t *)(upt_va + 0x2000);
++	for (unsigned i = 0; i < n; i++) {
++		uint64_t a = va + (uint64_t)i * 0x1000u;
++		unsigned l2i = (unsigned)((a >> 21) & 0x1ffu);
++		if (user_l3_of[l2i] == 0) {
++			if (pages == NULL) {
++				continue;
++			}
++			if (user_l3_used >= UPT_L3_MAX) {
++				return false;
++			}
++			uint32_t table = 0x3000u + user_l3_used * 0x1000u;
++			gpu_zero(upt_va + table, 0x1000);
++			user_l3_of[l2i] = (uint16_t)(++user_l3_used);
++			l2[l2i] = (UPT_PA + table) | 3;
++		}
++		volatile uint64_t *l3 = (volatile uint64_t *)(upt_va + 0x3000u + (user_l3_of[l2i] - 1u) * 0x1000u);
++		l3[(a >> 12) & 0x1ffu] = pages != NULL ? (pages[i] | 0x2c1) : 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return user_as_update();
++}
++
++/* One job chain at GPU VA jc on slot js, in AS1. 0 if it finished cleanly, else the slot's status,
++ * or 0xffffffff on a timeout. With a04s_gpu_mtx held. */
++static uint32_t
++user_run_locked(unsigned js, uint64_t jc, uint32_t *fault, uint32_t *faddr, uint64_t *us)
++{
++	uint32_t slot = JS(js);
++	uint32_t done = 1u << js, failed = 1u << (16u + js);
++	gpu_wr(JOB_IRQ_CLEAR, 0xffffffffu);
++	gpu_wr(MMU_IRQ_CLEAR, 0xffffffffu);
++	gpu_wr(GPU_IRQ_CLEAR, 0xffffffffu);
++	gpu_wr(slot + JS_HEAD_NEXT_LO, (uint32_t)jc);
++	gpu_wr(slot + JS_HEAD_NEXT_HI, (uint32_t)(jc >> 32));
++	gpu_wr(slot + JS_AFFINITY_NEXT_LO, user_affinity);
++	gpu_wr(slot + JS_AFFINITY_NEXT_HI, 0);
++	/* Thread priority 8, clean and invalidate the GPU caches at start and end, address space 1. */
++	gpu_wr(slot + JS_CONFIG_NEXT, (8u << 16) | (3u << 8) | (3u << 12) | 1u);
++	uint64_t start = mach_absolute_time();
++	gpu_wr(slot + JS_COMMAND_NEXT, 1);                      /* START */
++	uint32_t jirq = 0, mirq = 0, girq = 0;
++	for (unsigned i = 0; i < USER_JOB_POLLS; i++) {
++		jirq = io_rd(gpu_va, JOB_IRQ_RAWSTAT);
++		mirq = io_rd(gpu_va, MMU_IRQ_RAWSTAT);
++		girq = io_rd(gpu_va, GPU_IRQ_RAWSTAT);
++		if ((jirq & (done | failed)) || mirq || (girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT))) {
++			break;
++		}
++		delay(10);
++	}
++	*us = us_since(start);
++	uint32_t st = io_rd(gpu_va, slot + JS_STATUS);
++	*fault = io_rd(gpu_va, AS1 + AS_FAULTSTATUS);
++	*faddr = io_rd(gpu_va, AS1 + AS_FAULTADDR_LO);
++	bool answered = (jirq & (done | failed)) || mirq || (girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT));
++	if ((st & 0xffu) == JS_ACTIVE) {
++		gpu_wr(slot + JS_COMMAND, JS_HARD_STOP);
++		(void)gpu_wait(slot + JS_STATUS, 0xffu, 0, 10000);
++	}
++	gpu_wr(JOB_IRQ_CLEAR, 0xffffffffu);
++	gpu_wr(MMU_IRQ_CLEAR, 0xffffffffu);
++	gpu_wr(GPU_IRQ_CLEAR, 0xffffffffu);
++	if (mirq) {
++		(void)user_as_update();         /* AS1 back in service for the next job */
++	}
++	if ((jirq & done) && !(jirq & failed) && !mirq && !(girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT))) {
++		return 0;
++	}
++	if (!answered) {
++		return 0xffffffffu;
++	}
++	return st ? st : 0xfffffffdu;
++}
++
++/* For 7c-5b's user client: bring AS1 up (the boot tests must have passed). */
++bool a04s_gpu_user_up(void);
++bool
++a04s_gpu_user_up(void)
++{
++	if (job.state[0] != 'O' || job.state[1] != 'K') {
++		return false;
++	}
++	lck_mtx_lock(&a04s_gpu_mtx);
++	bool ok = user_up_locked();
++	lck_mtx_unlock(&a04s_gpu_mtx);
++	return ok;
++}
++
++/* A GPU register (GPU_ID, *_PRESENT, *_FEATURES...), for GetParam; 0 outside the block or before. */
++uint32_t a04s_gpu_reg(uint32_t off);
++uint32_t
++a04s_gpu_reg(uint32_t off)
++{
++	if (!gpu_va || !user_ready || off >= 0x1000u || (off & 3u)) {
++		return 0;
++	}
++	return io_rd(gpu_va, off);
++}
++
++uint64_t a04s_gpu_user_va_alloc(uint64_t bytes);
++uint64_t
++a04s_gpu_user_va_alloc(uint64_t bytes)
++{
++	lck_mtx_lock(&a04s_gpu_mtx);
++	uint64_t va = user_ready ? user_va_alloc_locked(bytes) : 0;
++	lck_mtx_unlock(&a04s_gpu_mtx);
++	return va;
++}
++
++bool a04s_gpu_user_map(uint64_t va, const uint64_t *pages, unsigned n);
++bool
++a04s_gpu_user_map(uint64_t va, const uint64_t *pages, unsigned n)
++{
++	if (pages == NULL || n == 0) {
++		return false;
++	}
++	lck_mtx_lock(&a04s_gpu_mtx);
++	bool ok = user_ready && user_set_locked(va, pages, n);
++	lck_mtx_unlock(&a04s_gpu_mtx);
++	return ok;
++}
++
++/* Unmap n pages at va and give the VA back. */
++void a04s_gpu_user_unmap(uint64_t va, unsigned n);
++void
++a04s_gpu_user_unmap(uint64_t va, unsigned n)
++{
++	lck_mtx_lock(&a04s_gpu_mtx);
++	if (user_ready) {
++		(void)user_set_locked(va, NULL, n);
++		user_va_free_locked(va, n);
++	}
++	lck_mtx_unlock(&a04s_gpu_mtx);
++}
++
++/* Run the job chain at user GPU VA jc on slot js (0 fragment, 1 the rest) and wait (at most 1 s).
++ * 0: finished cleanly; 0xfffffffe: the thermal limit; else the slot's status or 0xffffffff. */
++uint32_t a04s_gpu_user_submit(unsigned js, uint64_t jc, uint64_t *us);
++uint32_t
++a04s_gpu_user_submit(unsigned js, uint64_t jc, uint64_t *us)
++{
++	if (js > 1 || jc < USER_VA_BASE || jc >= USER_VA_END) {
++		return 0xffffffffu;
++	}
++	if (!a04s_gpu_allowed()) {
++		return 0xfffffffeu;
++	}
++	uint32_t fault = 0, faddr = 0, st = 0xffffffffu;
++	uint64_t t = 0;
++	lck_mtx_lock(&a04s_gpu_mtx);
++	if (user_ready) {
++		st = user_run_locked(js, jc, &fault, &faddr, &t);
++		uj.jobs++;
++		if (fault) {
++			uj.faults++;
++		}
++	}
++	lck_mtx_unlock(&a04s_gpu_mtx);
++	if (us != NULL) {
++		*us = t;
++	}
++	return st;
++}
++
++/* A WRITE_VALUE (ZERO) job header at the start of the self-test buffer, writing 64 bits at target. */
++static void
++utest_write_value(uint64_t target)
++{
++	gpu_zero(utest_va, 0x100);
++	*(volatile uint8_t *)(utest_va + 16) = 1 | (JOB_WRITE_VALUE << 1);     /* 64-bit descriptor, WRITE_VALUE */
++	*(volatile uint16_t *)(utest_va + 18) = 1;                              /* job index */
++	*(volatile uint64_t *)(utest_va + 32) = target;                         /* payload: address */
++	*(volatile uint64_t *)(utest_va + 40) = 3;                              /* type ZERO */
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* a04sgpu_selftest=1, from gpu_first_job() once the first job passed. */
++static void
++user_selftest(uint32_t core0)
++{
++	unsigned want = 0;
++	(void)PE_parse_boot_argn("a04sgpu_selftest", &want, sizeof(want));
++	if (want != 1) {
++		return;
++	}
++	uj.state = "RUNNING";
++	uj.why = "SETUP";
++	uint64_t pages[UTEST_PAGES];
++	for (unsigned i = 0; i < UTEST_PAGES; i++) {
++		pages[i] = UTEST_PA + i * 0x1000ull;
++	}
++	lck_mtx_lock(&a04s_gpu_mtx);
++	if (!user_up_locked()) {
++		lck_mtx_unlock(&a04s_gpu_mtx);
++		uj.state = "FAIL";
++		kprintf("A04S GPU USER FAIL %s\n", uj.why);
++		return;
++	}
++	if (!utest_va) {
++		utest_va = ml_io_map((vm_offset_t)UTEST_PA, UTEST_BYTES);
++	}
++	uint64_t va = utest_va ? user_va_alloc_locked(UTEST_BYTES) : 0;
++	if (va == 0 || !user_set_locked(va, pages, UTEST_PAGES)) {
++		lck_mtx_unlock(&a04s_gpu_mtx);
++		uj.state = "FAIL";
++		uj.why = "MAP";
++		kprintf("A04S GPU USER FAIL MAP\n");
++		return;
++	}
++	uj.l3 = user_l3_used;
++	uint64_t us = 0;
++	uint32_t fault = 0, faddr = 0;
++
++	/* 1: in AS1, on AS1's own buffer. */
++	uj.why = "WRITE_VALUE";
++	utest_write_value(va + 0x100u);
++	volatile uint64_t *out = (volatile uint64_t *)(utest_va + 0x100);
++	*out = 0xa5a5a5a55a5a5a5aull;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uj.wv_status = user_run_locked(1, va, &fault, &faddr, &us);
++	uj.wv_us = (uint32_t)us;
++	uj.wv_output = *out;
++
++	/* 2: in AS1, aimed at AS0's private page: not mapped in AS1, so it must fault. */
++	uj.why = "ISOLATION";
++	volatile uint64_t *priv = (volatile uint64_t *)(mem_va + GPU_DATA_OFF + GPU_OUT_OFF);
++	*priv = UTEST_MARKER;
++	utest_write_value(GPU_VA + GPU_OUT_OFF);
++	uj.iso_status = user_run_locked(1, va, &uj.iso_fault, &uj.iso_addr, &us);
++	uj.iso_output = *priv;
++
++	/* 3: AS0 still works: 7c-4a's private clear. */
++	uj.why = "AS0 AFTER";
++	uj.as0_ok = frag_job(GPU_VA + FRAG_RT_OFF, FRAG_W, FRAG_H, FRAG_W * 4u, FRAG_COLOR, core0, &uj.as0, 0, 0,
++	    SWIZZLE_RGBA);
++
++	(void)user_set_locked(va, NULL, UTEST_PAGES);
++	user_va_free_locked(va, UTEST_PAGES);
++	lck_mtx_unlock(&a04s_gpu_mtx);
++
++	bool wv_ok = uj.wv_status == 0 && uj.wv_output == 0;
++	bool iso_ok = uj.iso_status != 0 && uj.iso_fault != 0 && uj.iso_output == UTEST_MARKER;
++	if (wv_ok && iso_ok && uj.as0_ok) {
++		uj.state = "OK";
++		uj.why = "AS1 RUNS JOBS AND CAN'T REACH AS0";
++	} else {
++		uj.state = "FAIL";
++		uj.why = !wv_ok ? "WRITE_VALUE" : !iso_ok ? "ISOLATION" : "AS0 AFTER";
++	}
++	kprintf("A04S GPU USER %s %s: WV %x OUT %llx, ISO %x FAULT %x@%x PRIV %llx, AS0 %s\n", uj.state, uj.why,
++	    uj.wv_status, uj.wv_output, uj.iso_status, uj.iso_fault, uj.iso_addr, uj.iso_output,
++	    uj.as0_ok ? "OK" : "FAIL");
 +}
 +
 +static void
@@ -2106,8 +2549,12 @@ index 0000000..8927644
 +	} else {
 +		frag.why = "NO FIRST JOB";
 +	}
++	if (ok) {
++		user_selftest(core0);
++	}
 +	if (!present_ready) {
 +		gpu_cores_off();        /* with sweetfb_gpu=1 and every test passed, they stay on for iOS frames */
++		user_ready = false;     /* a04s_gpu_user_up() powers them again */
 +	}
 +	if (ok) {
 +		job.state = "OK";
@@ -2230,6 +2677,9 @@ index 0000000..8927644
 +	    present_broken ? "OFF (FAULT)" : present_ready ? "ON" : "NOT READY", present_frames, present_fails,
 +	    present_last_us, present_frames ? (uint32_t)(present_total_us / present_frames) : 0, present_max_us,
 +	    present_remaps, slots[0].id, slots[0].pages, slots[1].id, slots[1].pages);
++	kprintf("GPUUSER %s %s AS1 %s L3 %u WV %x OUT %llx US %u ISO %x FAULT %x@%x PRIV %llx AS0 %s JOBS %u FAULTS %u BUSY %u\n",
++	    uj.state, uj.why, user_ready ? "UP" : "DOWN", uj.l3, uj.wv_status, uj.wv_output, uj.wv_us, uj.iso_status, uj.iso_fault,
++	    uj.iso_addr, uj.iso_output, uj.as0_ok ? "OK" : "-", uj.jobs, uj.faults, present_busy);
 +	if (present_fails) {
 +		kprintf("GPUSCALE FAULT IRQ %x MMU %x GPU %x JS %x EXC %x ASF %x@%x GF %x@%x\n", present_fault.jirq,
 +		    present_fault.mirq, present_fault.girq, present_fault.js_status, present_fault.exc,
@@ -3601,10 +4051,10 @@ index 0000000..ac6bfa6
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_power.c b/bsd/dev/a04s_power.c
 new file mode 100644
-index 0000000..57d122f
+index 0000000..870d666
 --- /dev/null
 +++ b/bsd/dev/a04s_power.c
-@@ -0,0 +1,1326 @@
+@@ -0,0 +1,1754 @@
 +/*
 + * Galaxy A04s: the battery (fuel gauge), and read-only first looks at the speaker amp and the audio
 + * power domain.
@@ -3615,7 +4065,8 @@ index 0000000..57d122f
 + * The driver below only reads, with one exception (v44, v45, below): the charger's REG03 CHG_CONFIG
 + * bit and REG04 ICHG, each from a fixed set of values. A read sends the device's address and one
 + * register number, then a repeated start and the read: it never sends a data byte. Only chg_send(),
-+ * inside a04s_chg_write03() and a04s_chg_write04(), does.
++ * inside a04s_chg_write03() and a04s_chg_write04(), does. The only GPIO writes are AFC's (v46,
++ * afc_pin(), three pins of the device tree's gpio_afc node, with a04safc=1).
 + * Each device has a fixed list of registers it may read; anything else is refused. A bus is used
 + * only if its CMU_PERI PCLK gate is running, its Q-channel can't stop the clock, both pins have the
 + * I2C function, and the controller isn't busy. The bus runs at
@@ -3661,8 +4112,11 @@ index 0000000..57d122f
 +#include <kern/locks.h>
 +#include <pexpert/pexpert.h>
 +#include <libkern/libkern.h>
++#include <mach/boolean.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
++extern void IOSleep(unsigned int milliseconds);
 +
 +#define GATE_MANUAL             (1u << 20)
 +#define GATE_CG_VAL             (1u << 21)
@@ -4270,6 +4724,7 @@ index 0000000..57d122f
 +	uint8_t now;                            /* REG03 as last read */
 +	uint8_t ichg_code;                      /* REG04's ICHG as last written, 0 before the first */
 +	uint8_t vbus;                           /* VBUS_STAT at the last sample */
++	uint8_t status, reg03, reg04, reg13;    /* REG0B, REG03, REG04, REG13 as read each sample (v46) */
 +	unsigned writes, stops, resumes, failures, ichg_changes;
 +	unsigned test_phase, test_at;
 +	bool stopped, disabled;
@@ -4667,6 +5122,408 @@ index 0000000..57d122f
 +}
 +
 +/*
++ * v46, 15 W charging by Samsung AFC, with a04safc=1 (and a04schgsafe=1, a04schgfast=1). Written from
++ * the protocol as Samsung's A04s driver does it (drivers/muic/afc_gpio/afc_charger.c, GPL, not
++ * copied): the phone bit-bangs Samsung's AFC on the USB D- line through three GPIOs from the
++ * device tree's gpio_afc node:
++ *   - data,   GPA1-1 (pinctrl@11850000, ALIVE): driven for the phone's pulses, read for the brick's;
++ *   - switch, GPG0-0 (pinctrl@139b0000, PERI): 1 routes D- from the USB PHY to the data pin;
++ *   - hvdcp,  GPA2-2 (ALIVE): Samsung's afc_dpdm_ctrl, 1 while an AFC-capable brick is attached.
++ * These are the only GPIO writes here, and only through afc_pin(): output 0, output 1 or input, on
++ * those three pins, each pin's own CON and DAT bits only (GPA1-0, the volume-down key, shares the
++ * bank and is never touched). A pin is used only if S-Boot left it as a GPIO input or output.
++ * The switch is always put back to 0 (D- to USB) after an exchange.
++ *
++ * The charger's REG02 is not written: with HVDCP_EN = 1 the SY6970 asks a QC brick for a higher
++ * voltage by itself, and HV_TYPE's power-on value is 12 V (the SY6970 datasheet); S-Boot leaves
++ * HVDCP off and v46 keeps it off. The only voltage asked for is AFC's 9 V, Android's own maximum
++ * (battery,max_input_voltage 9000 mV).
++ *
++ * One exchange (UI 160 us, MPING 16 UI, DATA_DELAY 8 UI, SYNC UI/4), with interrupts off for each
++ * phase (at most about 7 ms): MPING; the brick's SPING (the line high again within MPING); the
++ * request byte (a sync pulse, MSB first one UI a bit, odd parity, a sync pulse, MPING), 0x46 for 9 V
++ * or 0x08 for 5 V; SPING; the brick's data; a closing MPING and SPING. Up to 3 exchanges in each of
++ * 3 rounds, VBUS read from the charger's ADC after each (REG11: 3.8-7.5 V is 5 V, 7.5-10.5 V is 9 V).
++ *
++ * When: on a wall adapter (VBUS_STAT DCP, power good) with VBUS at 5 V, a trusted battery reading
++ * and SAFE OK (under 42.0 C), at least 1.2 s after it was first seen, and once a plug-in. At 9 V,
++ * VBUS is checked every sample: above 10.5 V charging stops at once (REG03) and the brick is asked
++ * back to 5 V; below 7.5 V the brick has dropped to 5 V. Leaving SAFE OK, losing the reading,
++ * charging stopped, or writes off: the brick is asked back to 5 V (a 16 ms reset pulse, 200 ms,
++ * then 0x08). The cable gone: hvdcp and switch to 0. The ICHG steps stay as in v45 (2112 mA at
++ * most); at 9 V they need about half the input current.
++ */
++#define ALIVE_PINS_PA           0x11850000u
++#define AFC_UI_US               160u
++#define AFC_MPING_US            (AFC_UI_US * 16u)
++#define AFC_DATA_DELAY_US       (AFC_UI_US * 8u)
++#define AFC_SYNC_US             (AFC_UI_US / 4u)
++#define AFC_RESET_US            (AFC_UI_US * 100u)
++#define AFC_REQ_9V              0x46u
++#define AFC_REQ_5V              0x08u
++#define AFC_OPS                 3u
++#define AFC_ROUNDS              3u
++#define AFC_SETTLE_SAMPLES      1u              /* one 2 s sample after the plug-in: Samsung waits 1.2 s */
++#define VBUS_5V_MIN_MV          3800u
++#define VBUS_9V_MIN_MV          7500u
++#define VBUS_MAX_MV             10500u
++#define PIN_FUNC_IN             0x0u
++#define PIN_FUNC_OUT            0x1u
++
++#define AFC_PIN_DATA            0u
++#define AFC_PIN_SWITCH          1u
++#define AFC_PIN_HVDCP           2u
++#define AFC_PINS                3u
++#define PIN_LOW                 0u
++#define PIN_HIGH                1u
++#define PIN_INPUT               2u
++static const struct {
++	uint32_t pa;
++	uint32_t bank;
++	unsigned pin;
++} afc_pins[AFC_PINS] = {
++	{ ALIVE_PINS_PA, 0x020u, 1 },   /* gpa1-1, gpio_afc_data */
++	{ PERI_PINS_PA, 0x000u, 0 },    /* gpg0-0, gpio_afc_switch */
++	{ ALIVE_PINS_PA, 0x040u, 2 },   /* gpa2-2, gpio_afc_hvdcp */
++};
++
++enum { AFC_IDLE, AFC_WAIT, AFC_AT_9V, AFC_AT_5V, AFC_NO_ANSWER, AFC_OFF };
++static const char *const afc_names[] = { "IDLE", "WAITING", "9V", "5V", "NO ANSWER", "OFF" };
++static vm_offset_t afc_alive_va;
++static struct {
++	int state;
++	const char *why;
++	uint32_t con_was[AFC_PINS], dat_was[AFC_PINS];
++	unsigned seen, tries, nacks, answers, ok9, back5, over, mv, max_mv;
++	bool checked, usable;
++} afc = { .state = AFC_IDLE, .why = "-" };
++
++/* XNU's delay() takes an int; the AFC times are unsigned. */
++static inline void
++afc_us(unsigned us)
++{
++	delay((int)us);
++}
++
++static vm_offset_t
++afc_bank_va(unsigned p)
++{
++	return afc_pins[p].pa == ALIVE_PINS_PA ? afc_alive_va : pins_va;
++}
++
++/* The only GPIO writes in this file: pin p (one of the three) to output low, output high or input. */
++static void __attribute__((noinline))
++afc_pin(unsigned p, unsigned mode)
++{
++	if (p >= AFC_PINS || mode > PIN_INPUT || !afc.usable) {
++		return;
++	}
++	vm_offset_t va = afc_bank_va(p);
++	uint32_t bank = afc_pins[p].bank, shift = afc_pins[p].pin * 4u, bit = 1u << afc_pins[p].pin;
++	if (mode != PIN_INPUT) {
++		uint32_t dat = io_rd(va, bank + PIN_DAT);
++		io_wr(va, bank + PIN_DAT, mode == PIN_HIGH ? (dat | bit) : (dat & ~bit));
++	}
++	uint32_t con = io_rd(va, bank + PIN_CON);
++	uint32_t want = (con & ~(0xfu << shift)) | ((mode == PIN_INPUT ? PIN_FUNC_IN : PIN_FUNC_OUT) << shift);
++	if (want != con) {
++		io_wr(va, bank + PIN_CON, want);
++	}
++}
++
++static bool
++afc_pin_high(unsigned p)
++{
++	return (io_rd(afc_bank_va(p), afc_pins[p].bank + PIN_DAT) >> afc_pins[p].pin) & 1u;
++}
++
++/* Whether the three pins may be used: read only, once. */
++static bool
++afc_check(void)
++{
++	if (afc.checked) {
++		return afc.usable;
++	}
++	afc.checked = true;
++	if (!afc_alive_va) {
++		afc_alive_va = ml_io_map(ALIVE_PINS_PA, 0x1000);
++	}
++	if (!pins_va) {
++		pins_va = ml_io_map(PERI_PINS_PA, 0x1000);
++	}
++	if (!afc_alive_va || !pins_va) {
++		afc.why = "NO MAPPING";
++		return false;
++	}
++	for (unsigned p = 0; p < AFC_PINS; p++) {
++		vm_offset_t va = afc_bank_va(p);
++		afc.con_was[p] = (io_rd(va, afc_pins[p].bank + PIN_CON) >> (afc_pins[p].pin * 4u)) & 0xfu;
++		afc.dat_was[p] = (io_rd(va, afc_pins[p].bank + PIN_DAT) >> afc_pins[p].pin) & 1u;
++		if (afc.con_was[p] != PIN_FUNC_IN && afc.con_was[p] != PIN_FUNC_OUT) {
++			afc.why = "PIN FUNCTION";
++			return false;
++		}
++	}
++	afc.usable = true;
++	afc_pin(AFC_PIN_SWITCH, PIN_LOW);       /* D- to USB, as Samsung's probe leaves it */
++	afc_pin(AFC_PIN_DATA, PIN_LOW);
++	return true;
++}
++
++/* VBUS in mV from the charger's ADC (REG11), or 0 without power good or an answer. Takes the I2C lock. */
++static unsigned
++afc_vbus_mv(void)
++{
++	uint8_t v = 0;
++	lck_mtx_lock(&a04s_i2c_mtx);
++	bool ok = chg.started && chg_reg(CHG_REG_VBUSV, &v);
++	lck_mtx_unlock(&a04s_i2c_mtx);
++	if (!ok || !(v & 0x80u)) {
++		return 0;
++	}
++	unsigned mv = 2600u + (v & 0x7fu) * 100u;
++	afc.mv = mv;
++	afc.max_mv = mv > afc.max_mv ? mv : afc.max_mv;
++	return mv;
++}
++
++static unsigned
++afc_level(unsigned mv)
++{
++	return mv > VBUS_5V_MIN_MV && mv <= VBUS_9V_MIN_MV ? 5u : mv > VBUS_9V_MIN_MV && mv < VBUS_MAX_MV ? 9u : 0u;
++}
++
++static void
++afc_mping(void)
++{
++	afc_pin(AFC_PIN_DATA, PIN_HIGH);
++	afc_us(AFC_MPING_US);
++	afc_pin(AFC_PIN_DATA, PIN_LOW);
++}
++
++/* The brick's SPING: the line high again within the MPING window, then low within DATA_DELAY. */
++static bool
++afc_sping(void)
++{
++	afc_pin(AFC_PIN_DATA, PIN_INPUT);
++	afc_us(AFC_MPING_US - 3u * AFC_UI_US);
++	if (!afc_pin_high(AFC_PIN_DATA)) {
++		return false;
++	}
++	for (unsigned t = 0; t < AFC_DATA_DELAY_US && afc_pin_high(AFC_PIN_DATA); t += AFC_UI_US) {
++		afc_us(AFC_UI_US);
++	}
++	return true;
++}
++
++static void
++afc_sync(void)
++{
++	afc_pin(AFC_PIN_DATA, PIN_HIGH);
++	afc_us(AFC_SYNC_US);
++	afc_pin(AFC_PIN_DATA, PIN_LOW);
++	afc_us(AFC_SYNC_US);
++}
++
++static void
++afc_send(uint8_t byte)
++{
++	afc_pin(AFC_PIN_DATA, PIN_LOW);
++	afc_us(AFC_UI_US);
++	afc_sync();
++	if (!(byte & 0x80u)) {
++		afc_pin(AFC_PIN_DATA, PIN_HIGH);
++		afc_us(AFC_SYNC_US);
++	}
++	unsigned ones = 0;
++	for (unsigned m = 0x80u; m != 0; m >>= 1) {
++		afc_pin(AFC_PIN_DATA, (byte & m) ? PIN_HIGH : PIN_LOW);
++		ones += (byte & m) ? 1u : 0u;
++		afc_us(AFC_UI_US);
++	}
++	afc_pin(AFC_PIN_DATA, (ones % 2u) ? PIN_LOW : PIN_HIGH);    /* odd parity */
++	afc_us(AFC_UI_US);
++	if (!(ones % 2u)) {
++		afc_pin(AFC_PIN_DATA, PIN_LOW);
++		afc_us(AFC_SYNC_US);
++	}
++	afc_sync();
++	afc_mping();
++}
++
++/* The brick's data after DATA_DELAY: read for at most MPING + 2 DATA_DELAY; true if it pulsed. */
++static bool
++afc_receive(void)
++{
++	afc_pin(AFC_PIN_DATA, PIN_INPUT);
++	afc_us(AFC_DATA_DELAY_US);
++	bool seen = false;
++	for (unsigned t = 0; t < AFC_MPING_US + 2u * AFC_DATA_DELAY_US; t += AFC_UI_US) {
++		seen = seen || afc_pin_high(AFC_PIN_DATA);
++		afc_us(AFC_UI_US);
++	}
++	return seen;
++}
++
++/* One exchange asking for request; true if the brick answered every step. Interrupts off per phase. */
++static bool __attribute__((noinline))
++afc_exchange(uint8_t request)
++{
++	boolean_t was = ml_set_interrupts_enabled(FALSE);
++	afc_mping();
++	bool ok = afc_sping();
++	(void)ml_set_interrupts_enabled(was);
++	if (!ok) {
++		afc.nacks++;
++		return false;
++	}
++	was = ml_set_interrupts_enabled(FALSE);
++	afc_send(request);
++	ok = afc_sping();
++	(void)ml_set_interrupts_enabled(was);
++	if (!ok) {
++		afc.nacks++;
++		return false;
++	}
++	was = ml_set_interrupts_enabled(FALSE);
++	bool data = afc_receive();
++	afc_mping();
++	ok = afc_sping();
++	(void)ml_set_interrupts_enabled(was);
++	afc_pin(AFC_PIN_DATA, PIN_LOW);
++	if (data) {
++		afc.answers++;
++	}
++	return ok;
++}
++
++/* Ask for 9 or 5 V and check VBUS; returns the level reached (0 unknown). The switch ends at 0. */
++static unsigned
++afc_request(unsigned volts)
++{
++	afc.tries++;
++	if (volts == 5u) {
++		afc_pin(AFC_PIN_DATA, PIN_HIGH);        /* reset */
++		afc_us(AFC_RESET_US);
++		afc_pin(AFC_PIN_DATA, PIN_LOW);
++		IOSleep(200);
++	}
++	unsigned level = afc_level(afc_vbus_mv());
++	afc_pin(AFC_PIN_SWITCH, PIN_HIGH);
++	for (unsigned round = 0; round < AFC_ROUNDS && level != volts; round++) {
++		for (unsigned op = 0; op < AFC_OPS && level != volts; op++) {
++			(void)afc_exchange((uint8_t)(volts == 9u ? AFC_REQ_9V : AFC_REQ_5V));
++			IOSleep(20);
++			level = afc_level(afc_vbus_mv());
++		}
++		IOSleep(50);
++		level = afc_level(afc_vbus_mv());
++	}
++	afc_pin(AFC_PIN_SWITCH, PIN_LOW);
++	afc_pin(AFC_PIN_DATA, PIN_LOW);
++	return level;
++}
++
++/* Every sample, from chg_safety() after the ICHG step, without the I2C lock. pg: the charger's power
++ * good. wall: power good on a wall adapter (VBUS_STAT DCP, or HVDCP should the chip report it). */
++static void
++afc_sample(int safe, bool lost, bool pg, bool wall)
++{
++	unsigned want = 0;
++	(void)PE_parse_boot_argn("a04safc", &want, sizeof(want));
++	if (want != 1) {
++		afc.state = AFC_OFF;
++		afc.why = "a04safc=0";
++		return;
++	}
++	if (!afc_check()) {
++		afc.state = AFC_OFF;
++		return;
++	}
++	if (pg && afc_vbus_mv() >= VBUS_MAX_MV && afc.state != AFC_AT_9V) {
++		afc.over++;
++		lck_mtx_lock(&a04s_i2c_mtx);
++		bool stopped = a04s_chg_set(false);
++		lck_mtx_unlock(&a04s_i2c_mtx);
++		if (stopped) {
++			chgw.stopped = true;
++			chgw.stops++;
++		}
++		kprintf("A04S AFC VBUS %u MV OVER %u WITHOUT A REQUEST: CHARGING %s\n", afc.mv, VBUS_MAX_MV,
++		    stopped ? "STOPPED" : "NOT STOPPED");
++		afc.state = AFC_NO_ANSWER;
++		afc.why = "OVER VOLTAGE";
++		return;
++	}
++	if (!pg) {
++		if (afc.state != AFC_IDLE) {
++			afc_pin(AFC_PIN_HVDCP, PIN_LOW);
++			afc_pin(AFC_PIN_SWITCH, PIN_LOW);
++			afc.state = AFC_IDLE;
++			afc.why = "UNPLUGGED";
++		}
++		afc.seen = 0;
++		return;
++	}
++	bool may = wall && safe == SAFE_OK && !lost && adc.trusted && !chgw.stopped && !chgw.disabled;
++	if (afc.state == AFC_AT_9V) {
++		unsigned mv = afc_vbus_mv();
++		if (mv >= VBUS_MAX_MV) {
++			afc.over++;
++			lck_mtx_lock(&a04s_i2c_mtx);
++			bool stopped = a04s_chg_set(false);
++			lck_mtx_unlock(&a04s_i2c_mtx);
++			if (stopped) {
++				chgw.stopped = true;
++				chgw.stops++;
++			}
++			kprintf("A04S AFC VBUS %u MV OVER %u: CHARGING %s, BACK TO 5 V\n", mv, VBUS_MAX_MV,
++			    stopped ? "STOPPED" : "NOT STOPPED");
++			(void)afc_request(5u);
++			afc.state = AFC_AT_5V;
++			afc.why = "OVER VOLTAGE";
++		} else if (afc_level(mv) != 9u) {
++			afc.state = AFC_AT_5V;
++			afc.why = "BRICK DROPPED 9 V";
++		} else if (!may) {
++			unsigned level = afc_request(5u);
++			afc.back5++;
++			afc.state = AFC_AT_5V;
++			afc.why = level == 5u ? "BACK TO 5 V (TEMPERATURE OR STOP)" : "5 V NOT CONFIRMED";
++			kprintf("A04S AFC BACK TO 5 V: %s, VBUS %u MV\n", afc.why, afc.mv);
++		}
++		return;
++	}
++	if (afc.state != AFC_IDLE && afc.state != AFC_WAIT) {
++		return;                 /* once a plug-in: 5 V, no answer, or off until unplugged */
++	}
++	if (!may || afc_level(afc_vbus_mv()) != 5u) {
++		afc.state = AFC_WAIT;
++		afc.why = "CONDITIONS";
++		return;
++	}
++	if (afc.seen++ < AFC_SETTLE_SAMPLES) {
++		afc.state = AFC_WAIT;
++		afc.why = "SETTLING";
++		return;
++	}
++	afc_pin(AFC_PIN_HVDCP, PIN_HIGH);
++	IOSleep(1200);
++	unsigned level = afc_request(9u);
++	if (level == 9u) {
++		afc.ok9++;
++		afc.state = AFC_AT_9V;
++		afc.why = "9 V";
++	} else {
++		afc_pin(AFC_PIN_HVDCP, PIN_LOW);
++		afc.state = AFC_NO_ANSWER;
++		afc.why = afc.answers ? "ANSWERED, VBUS NOT 9 V" : "NO AFC BRICK";
++	}
++	kprintf("A04S AFC %s: VBUS %u MV (MAX %u), %u NACKS, %u ANSWERS\n", afc_names[afc.state], afc.mv, afc.max_mv,
++	    afc.nacks, afc.answers);
++}
++
++/*
 + * v44: the decision acted on, with a04schgsafe=1 (without it, a dry run as in v43). Charging stops
 + * when the battery is HOT (above 50.0 C) or COLD (below 0 C), or when a trusted thermistor reading is
 + * lost (outside the table, which is above 90 C or below -20 C, an open or shorted thermistor, or the
@@ -4674,13 +5531,18 @@ index 0000000..57d122f
 + * a04schgtest=1 tests both writes at room temperature: once the reading is trusted, charging stops
 + * for 60 s, then starts again; a real HOT or COLD still wins.
 + *
-+ * v45, with a04schgfast=1 as well: while charging and on a wall adapter (VBUS_STAT DCP, power good)
-+ * with a trusted reading, ICHG follows Samsung's wired steps for the temperature (ichg_band()). A
-+ * step down is taken at once, a step up only 2.0 C inside the new band. Anything else (a PC port,
-+ * no cable, the reading not trusted or lost, charging stopped) puts S-Boot's ICHG back.
++ * v45, with a04schgfast=1 as well: while charging and on a wall adapter (power good, VBUS_STAT DCP,
++ * or HVDCP should the chip report it at 9 V) with a trusted reading, ICHG follows Samsung's wired
++ * steps for the temperature (ichg_band()). A step down is taken at once, a step up only 2.0 C inside
++ * the new band. Anything else (a PC port, no cable, the reading not trusted or lost, charging
++ * stopped) puts S-Boot's ICHG back.
++ *
++ * v46: REG03, REG04, the status (REG0B) and the input limit status (REG13) are read every sample for
++ * the report, and AFC (afc_sample()) runs after, without the I2C lock.
 + */
 +#define CHGTEST_SAMPLES         30u             /* 60 s at one sample every 2 s */
 +#define ICHG_HYST_DC            20
++#define CHG_VBUS_HVDCP          4u
 +
 +static void
 +chg_safety(int safe, bool lost)
@@ -4712,6 +5574,7 @@ index 0000000..57d122f
 +			}
 +		}
 +	}
++	bool pg = false, wall = false;
 +	lck_mtx_lock(&a04s_i2c_mtx);
 +	if (stop && !chgw.stopped) {
 +		if (a04s_chg_set(false)) {
@@ -4726,17 +5589,23 @@ index 0000000..57d122f
 +			kprintf("A04S CHGSAFE CHARGING ON AGAIN AT %d (REG03 %02x)\n", adc.temp_dc, chgw.now);
 +		}
 +	}
++	if (chg.started) {
++		uint8_t st = 0;
++		if (chg_reg(CHG_REG_STATUS, &st)) {
++			chgw.status = st;
++			chgw.vbus = (uint8_t)((st >> 5) & 7u);
++			pg = (st & CHG_STAT_PG) != 0;
++			wall = pg && (chgw.vbus == CHG_VBUS_DCP || chgw.vbus == CHG_VBUS_HVDCP);
++		}
++		(void)chg_reg(CHG_REG_CFG, &chgw.reg03);
++		(void)chg_reg(CHG_REG_ICHG, &chgw.reg04);
++		(void)chg_reg(CHG_REG_IDPM, &chgw.reg13);
++	}
 +	if (chg.started && !chgw.disabled) {
 +		unsigned orig = chg.regs[CHG_REG_ICHG] & CHG_ICHG_MASK;
 +		unsigned have = chgw.ichg_code ? chgw.ichg_code : orig;
 +		unsigned want = orig;
-+		uint8_t st = 0;
-+		bool dcp = false;
-+		if (chg_reg(CHG_REG_STATUS, &st)) {
-+			chgw.vbus = (uint8_t)((st >> 5) & 7u);
-+			dcp = chgw.vbus == CHG_VBUS_DCP && (st & CHG_STAT_PG);
-+		}
-+		if (fast == 1 && dcp && !chgw.stopped && !lost && adc.trusted) {
++		if (fast == 1 && wall && !chgw.stopped && !lost && adc.trusted) {
 +			want = ichg_band(adc.temp_dc);
 +			if (want > have && (ichg_band(adc.temp_dc - ICHG_HYST_DC) != want ||
 +			    ichg_band(adc.temp_dc + ICHG_HYST_DC) != want)) {
@@ -4752,6 +5621,9 @@ index 0000000..57d122f
 +		}
 +	}
 +	lck_mtx_unlock(&a04s_i2c_mtx);
++	if (fast == 1) {
++		afc_sample(safe, lost, pg, wall);
++	}
 +}
 +
 +/* From the thermal thread (bsd/dev/a04s_gpu.c), every 2 s. Only that thread touches the ADC. */
@@ -4907,6 +5779,12 @@ index 0000000..57d122f
 +		    chg.regs[CHG_REG_CFG], chgw.now, chgw.writes, chgw.stops, chgw.resumes, chgw.failures, test, chgw.test_phase);
 +		kprintf("CHGSAFE ICHG %u MA (S-BOOT %u) FAST %u VBUS %u CHANGES %u\n",
 +		    chgw.ichg_code ? chgw.ichg_code * 64u : ichg_sboot, ichg_sboot, fast, chgw.vbus, chgw.ichg_changes);
++		kprintf("CHGSAFE NOW REG03 %02x REG04 %02x STAT %02x REG13 %02x (VDPM %u IDPM %u) THERM %u\n",
++		    chgw.reg03, chgw.reg04, chgw.status, chgw.reg13, (chgw.reg13 >> 7) & 1u, (chgw.reg13 >> 6) & 1u,
++		    (chg.batv >> 7) & 1u);             /* THERM_STAT, REG0E bit 7 */
++		kprintf("AFC %s %s VBUS %u MV (MAX %u) TRIES %u NACKS %u ANSWERS %u 9V %u BACK %u OVER %u PINS %x/%x %x/%x %x/%x\n",
++		    afc_names[afc.state], afc.why, afc.mv, afc.max_mv, afc.tries, afc.nacks, afc.answers, afc.ok9, afc.back5,
++		    afc.over, afc.con_was[0], afc.dat_was[0], afc.con_was[1], afc.dat_was[1], afc.con_was[2], afc.dat_was[2]);
 +	}
 +	static const char *const vbus_names[8] = { "NONE", "SDP", "CDP", "DCP", "HVDCP", "ADAPTER", "NONSTD", "OTG" };
 +	static const char *const chrg_names[4] = { "NOT", "PRE", "FAST", "DONE" };
