@@ -483,10 +483,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..8e7c993
+index 0000000..b8d1f4e
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
-@@ -0,0 +1,734 @@
+@@ -0,0 +1,918 @@
 +/*
 + * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
 + *
@@ -516,6 +516,15 @@ index 0000000..8e7c993
 + *  - One WRITE_VALUE job (type ZERO) on JS1, the S7's first job (herolte_gpu.c, Panfrost v7 layout:
 + *    the job header and Write Value payload are the same as Midgard's). Pass: the job completes
 + *    with no MMU or GPU fault and the 64-bit output, preset to a pattern, reads 0.
++ *  - 7c-4a (v37; a04sfrag=0 skips it): after that job, one FRAGMENT job on JS0 clears a 64x64
++ *    RGBA8 render target in the same private pages, and every pixel is read back. Bifrost (v7)
++ *    layout from Mesa 25.0.7 (genxml/v7.xml, pan_desc.c, pan_samples.c, pan_jm.c): the fragment
++ *    payload has the bounds in 16x16 tiles and the framebuffer pointer tagged MFBD with one render
++ *    target; the framebuffer is Parameters (64 B: sample locations, size, bounds, tile size,
++ *    allocation, Z format, tiler) and 64 B of padding, then the 64 B render target. A clear-only
++ *    batch has no tiler context in Panfrost (tiler pointer 0), and the sample-locations table is
++ *    Mesa's single-sampled entry (one sample and the origin at 128,128 in 1/256 pixel). Pass: done
++ *    with no fault, and 4096 of 4096 pixels hold the clear colour. Nothing reaches the screen yet.
 + *  - The cores are powered off again. iOS keeps drawing on the CPU.
 + */
 +#if defined(ARM64_BOARD_CONFIG_A04S)
@@ -661,9 +670,22 @@ index 0000000..8e7c993
 +#define GPU_MEM_PA              0xbc000000ull
 +#define GPU_MEM_BYTES           0x10000u
 +#define GPU_DATA_OFF            0x4000u
-+#define GPU_DATA_PAGES          4u
++#define GPU_DATA_PAGES          8u
 +#define GPU_VA                  0x02000000ull
 +#define GPU_OUT_OFF             0x100u
++/* 7c-4a, offsets in the data pages: the fragment job, the sample locations, the framebuffer
++ * descriptor (Parameters, padding, one render target) and the render target's pixels. */
++#define FRAG_JOB_OFF            0x200u
++#define FRAG_SAMPLES_OFF        0x400u
++#define FRAG_FBD_OFF            0x800u
++#define FRAG_RT_DESC_OFF        (FRAG_FBD_OFF + 128u)
++#define FRAG_RT_OFF             0x1000u
++#define FRAG_W                  64u
++#define FRAG_H                  64u
++#define FRAG_COLOR              0xff40c020u     /* A B G R bytes: R 0x20, G 0xc0, B 0x40, A 0xff */
++#define FRAG_FILL               0x5a5a5a5au
++#define JOB_FRAGMENT            9u
++#define JOB_WRITE_VALUE         2u
 +#define XNU_DRAM_END            0xbc000000ull
 +#define RAM_WINDOW_END          0xbc900000ull
 +#if GPU_MEM_PA < XNU_DRAM_END || GPU_MEM_PA + GPU_MEM_BYTES > RAM_WINDOW_END
@@ -671,6 +693,9 @@ index 0000000..8e7c993
 +#endif
 +#if GPU_DATA_OFF + GPU_DATA_PAGES * 0x1000u > GPU_MEM_BYTES
 +#error "the data pages must stay inside the GPU block"
++#endif
++#if FRAG_RT_OFF + FRAG_W * FRAG_H * 4u > GPU_DATA_PAGES * 0x1000u
++#error "the render target must stay inside the data pages"
 +#endif
 +
 +static vm_offset_t peri_va, tmu_va, top_va, core_va, g3d_va, gpu_va, mem_va;
@@ -706,6 +731,16 @@ index 0000000..8e7c993
 +	int reset;                              /* 1 done, 0 timed out, -1 not tried */
 +	int temp;
 +} job = { .state = "OFF", .why = "a04sgpu=0", .reset = -1, .temp = TMU_NO_TEMP };
++
++/* 7c-4a: the fragment clear. */
++static struct {
++	const char *state;                      /* OFF, SKIP, OK, FAIL */
++	const char *why;
++	uint32_t jirq, mirq, girq, js_status, head, as_fault, as_addr, gpu_fault, gpu_faddr, exc;
++	uint64_t fault_ptr;
++	uint32_t us, good, first_bad, first_bad_at, corner[4];
++	bool tried;                             /* the job was submitted */
++} frag = { .state = "OFF", .why = "NOT RUN" };
 +
 +static inline uint32_t
 +io_rd(vm_offset_t base, uint32_t off)
@@ -972,6 +1007,143 @@ index 0000000..8e7c993
 +	kprintf("A04S GPU JOB FAIL %s\n", why);
 +}
 +
++/*
++ * 7c-4a: clear FRAG_W x FRAG_H RGBA8 pixels with a FRAGMENT job on JS0. Called with the cores on,
++ * AS0 programmed and the page tables in place (gpu_first_job after its WRITE_VALUE passed).
++ */
++static void
++gpu_fragment_clear(uint32_t affinity)
++{
++	unsigned want = 1;
++	(void)PE_parse_boot_argn("a04sfrag", &want, sizeof(want));
++	if (want != 1) {
++		frag.why = "a04sfrag=0";
++		return;
++	}
++	if (!a04s_gpu_allowed()) {
++		frag.state = "SKIP";
++		frag.why = therm.level == LEVEL_OFF ? "THERMAL OFF" : level_names[therm.level];
++		return;
++	}
++	vm_offset_t base = mem_va + GPU_DATA_OFF;
++	gpu_zero(base + FRAG_JOB_OFF, FRAG_RT_OFF - FRAG_JOB_OFF);
++	volatile uint32_t *px = (volatile uint32_t *)(base + FRAG_RT_OFF);
++	for (unsigned i = 0; i < FRAG_W * FRAG_H; i++) {
++		px[i] = FRAG_FILL;
++	}
++
++	/* Job header: 64-bit, FRAGMENT, index 1. Payload at +32: tile bounds, framebuffer pointer. */
++	volatile uint32_t *hdr = (volatile uint32_t *)(base + FRAG_JOB_OFF);
++	hdr[4] = 1u | (JOB_FRAGMENT << 1) | (1u << 16);
++	hdr[8] = 0;                                                     /* min tile x, y */
++	hdr[9] = ((FRAG_H / 16u - 1u) << 16) | (FRAG_W / 16u - 1u);     /* max tile x, y */
++	/* MFBD (bit 0), no ZS/CRC extension, render target count - 1 = 0, 64-byte aligned. */
++	*(volatile uint64_t *)(base + FRAG_JOB_OFF + 40) = (GPU_VA + FRAG_FBD_OFF) | 1u;
++
++	/* pan_samples.c, single-sampled: position 0 and the origin at (128, 128). */
++	volatile uint32_t *sp = (volatile uint32_t *)(base + FRAG_SAMPLES_OFF);
++	sp[0] = 0x00800080u;
++	sp[32] = 0x00800080u;
++
++	/* Framebuffer Parameters (v7.xml), words 0-15; words 16-31 are padding. */
++	volatile uint32_t *fb = (volatile uint32_t *)(base + FRAG_FBD_OFF);
++	fb[0] = 0;                                                      /* pre/post frame: never */
++	*(volatile uint64_t *)(base + FRAG_FBD_OFF + 16) = GPU_VA + FRAG_SAMPLES_OFF;   /* word 4 */
++	fb[8] = ((FRAG_H - 1u) << 16) | (FRAG_W - 1u);                  /* width - 1, height - 1 */
++	fb[9] = 0;                                                      /* bound min x, y */
++	fb[10] = ((FRAG_H - 1u) << 16) | (FRAG_W - 1u);                 /* bound max x, y */
++	fb[11] = (2u << 6) |            /* tie-break MINUS_180_IN_0_OUT, as Panfrost */
++	    (8u << 9) |                 /* effective tile size log2(16 x 16) */
++	    (1u << 24);                 /* colour buffer allocation 1 KiB (16 x 16 x 4, shr 10) */
++	fb[12] = 1u << 16;              /* Z internal format D24, Panfrost's default without ZS */
++	fb[13] = 0;                     /* Z clear 0.0 */
++	/* words 14-15: tiler 0, a clear-only batch (pan_jm.c makes one only for draws) */
++
++	/* Render Target (v7.xml) at +128. */
++	volatile uint32_t *rt = (volatile uint32_t *)(base + FRAG_RT_DESC_OFF);
++	rt[0] = 1u << 26;               /* internal format R8G8B8A8, buffer offset 0 */
++	rt[1] = 1u |                    /* write enable */
++	    (19u << 3) |                /* writeback format R8G8B8A8 */
++	    (2u << 8) |                 /* block format linear */
++	    (1u << 15) |                /* dithering, as Panfrost */
++	    (0x688u << 16) |            /* identity swizzle: R, G, B, A */
++	    (1u << 31);                 /* clean pixel write: the tile is cleared */
++	*(volatile uint64_t *)(base + FRAG_RT_DESC_OFF + 32) = GPU_VA + FRAG_RT_OFF;     /* word 8 */
++	rt[10] = FRAG_W * 4u;           /* row stride */
++	rt[11] = 0;                     /* surface stride */
++	for (unsigned i = 12; i < 16; i++) {
++		rt[i] = FRAG_COLOR;     /* clear colour */
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	uint32_t slot = JS(0);
++	uint64_t va = GPU_VA + FRAG_JOB_OFF;
++	gpu_wr(JOB_IRQ_CLEAR, 0xffffffffu);
++	gpu_wr(MMU_IRQ_CLEAR, 0xffffffffu);
++	gpu_wr(GPU_IRQ_CLEAR, 0xffffffffu);
++	gpu_wr(slot + JS_HEAD_NEXT_LO, (uint32_t)va);
++	gpu_wr(slot + JS_HEAD_NEXT_HI, (uint32_t)(va >> 32));
++	gpu_wr(slot + JS_AFFINITY_NEXT_LO, affinity);
++	gpu_wr(slot + JS_AFFINITY_NEXT_HI, 0);
++	gpu_wr(slot + JS_CONFIG_NEXT, (8u << 16) | (3u << 8) | (3u << 12));
++	frag.tried = true;
++	uint64_t start = mach_absolute_time();
++	gpu_wr(slot + JS_COMMAND_NEXT, 1);                              /* START */
++	for (unsigned i = 0; i < 20000; i++) {
++		frag.jirq = io_rd(gpu_va, JOB_IRQ_RAWSTAT);
++		frag.mirq = io_rd(gpu_va, MMU_IRQ_RAWSTAT);
++		frag.girq = io_rd(gpu_va, GPU_IRQ_RAWSTAT);
++		if ((frag.jirq & ((1u << 0) | (1u << 16))) || frag.mirq ||
++		    (frag.girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT))) {
++			break;
++		}
++		delay(10);
++	}
++	frag.us = (uint32_t)us_since(start);
++	frag.js_status = io_rd(gpu_va, slot + JS_STATUS);
++	frag.head = io_rd(gpu_va, slot + JS_HEAD_LO);
++	frag.as_fault = io_rd(gpu_va, AS0 + AS_FAULTSTATUS);
++	frag.as_addr = io_rd(gpu_va, AS0 + AS_FAULTADDR_LO);
++	frag.gpu_fault = io_rd(gpu_va, GPU_FAULT_STATUS);
++	frag.gpu_faddr = io_rd(gpu_va, GPU_FAULT_ADDR);
++	frag.exc = hdr[0];
++	frag.fault_ptr = *(volatile uint64_t *)(base + FRAG_JOB_OFF + 8);
++	if ((frag.js_status & 0xffu) == JS_ACTIVE) {
++		gpu_wr(slot + JS_COMMAND, JS_HARD_STOP);
++		(void)gpu_wait(slot + JS_STATUS, 0xffu, 0, 10000);
++	}
++	gpu_wr(JOB_IRQ_CLEAR, 0xffffffffu);
++	gpu_wr(MMU_IRQ_CLEAR, 0xffffffffu);
++	gpu_wr(GPU_IRQ_CLEAR, 0xffffffffu);
++
++	frag.good = 0;
++	frag.first_bad_at = 0xffffffffu;
++	for (unsigned i = 0; i < FRAG_W * FRAG_H; i++) {
++		uint32_t v = px[i];
++		if (v == FRAG_COLOR) {
++			frag.good++;
++		} else if (frag.first_bad_at == 0xffffffffu) {
++			frag.first_bad_at = i;
++			frag.first_bad = v;
++		}
++	}
++	frag.corner[0] = px[0];
++	frag.corner[1] = px[FRAG_W - 1u];
++	frag.corner[2] = px[(FRAG_H - 1u) * FRAG_W];
++	frag.corner[3] = px[FRAG_W * FRAG_H - 1u];
++	bool ran = (frag.jirq & 1u) && !(frag.jirq & (1u << 16)) && !frag.mirq &&
++	    !(frag.girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT));
++	if (ran && frag.good == FRAG_W * FRAG_H) {
++		frag.state = "OK";
++		frag.why = "THE MALI-G52 CLEARED A RENDER TARGET";
++		kprintf("A04S GPU FRAGMENT OK %u/%u pixels in %u us\n", frag.good, FRAG_W * FRAG_H, frag.us);
++	} else {
++		frag.state = "FAIL";
++		frag.why = !ran ? (frag.jirq || frag.mirq || frag.girq ? "FAULT" : "TIMEOUT") : "PIXELS";
++		kprintf("A04S GPU FRAGMENT FAIL %s %u/%u EXC %x\n", frag.why, frag.good, FRAG_W * FRAG_H, frag.exc);
++	}
++}
++
 +static void
 +gpu_first_job(void)
 +{
@@ -1061,7 +1233,7 @@ index 0000000..8e7c993
 +	job.why = "MMU";
 +	gpu_tables();
 +	vm_offset_t hdr = mem_va + GPU_DATA_OFF;
-+	*(volatile uint8_t *)(hdr + 16) = 1 | (2 << 1);         /* 64-bit descriptor, WRITE_VALUE */
++	*(volatile uint8_t *)(hdr + 16) = 1 | (JOB_WRITE_VALUE << 1);   /* 64-bit descriptor, WRITE_VALUE */
 +	*(volatile uint16_t *)(hdr + 18) = 1;                   /* job index */
 +	*(volatile uint64_t *)(hdr + 32) = GPU_VA + GPU_OUT_OFF; /* payload: address */
 +	*(volatile uint64_t *)(hdr + 40) = 3;                   /* type ZERO: write 64 zero bits */
@@ -1120,10 +1292,15 @@ index 0000000..8e7c993
 +	gpu_wr(JOB_IRQ_CLEAR, 0xffffffffu);
 +	gpu_wr(MMU_IRQ_CLEAR, 0xffffffffu);
 +	gpu_wr(GPU_IRQ_CLEAR, 0xffffffffu);
-+	gpu_cores_off();
 +
 +	bool ok = (job.jirq & (1u << 1)) && !(job.jirq & (1u << 17)) && !job.mirq &&
 +	    !(job.girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT)) && job.output == 0;
++	if (ok) {
++		gpu_fragment_clear(core0);
++	} else {
++		frag.why = "NO FIRST JOB";
++	}
++	gpu_cores_off();
 +	if (ok) {
 +		job.state = "OK";
 +		job.why = "THE MALI-G52 RAN A JOB";
@@ -1218,6 +1395,13 @@ index 0000000..8e7c993
 +		    job.girq, job.js_status, job.head, job.exc, job.as_fault, job.as_addr, job.gpu_fault, job.gpu_faddr);
 +		kprintf("GPUJOB CFG %x %x %x %x BEFORE ST %x %x/%x/%x\n", job.cfg[0], job.cfg[1], job.cfg[2],
 +		    job.cfg[3], job.before_status, job.before_l2, job.before_sc, job.before_tl);
++	}
++	kprintf("GPUFRAG %s %s %ux%u GOOD %u/%u US %u CORNERS %x %x %x %x\n", frag.state, frag.why, FRAG_W, FRAG_H,
++	    frag.good, FRAG_W * FRAG_H, frag.us, frag.corner[0], frag.corner[1], frag.corner[2], frag.corner[3]);
++	if (frag.tried) {
++		kprintf("GPUFRAG IRQ %x MMU %x GPU %x JS %x HEAD %x EXC %x FP %llx ASF %x@%x GF %x@%x BAD %x@%u\n",
++		    frag.jirq, frag.mirq, frag.girq, frag.js_status, frag.head, frag.exc, frag.fault_ptr, frag.as_fault,
++		    frag.as_addr, frag.gpu_fault, frag.gpu_faddr, frag.first_bad, frag.first_bad_at);
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
