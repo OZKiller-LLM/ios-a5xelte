@@ -12,16 +12,17 @@ index 7dee125..cc95042 100644
  SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
  sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
 diff --git a/bsd/conf/files b/bsd/conf/files
-index a16d8e0..da29b50 100644
+index a16d8e0..9e5d1e4 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -106,6 +106,9 @@ bsd/dev/random/randomdev.c		standard
+@@ -106,6 +106,10 @@ bsd/dev/random/randomdev.c		standard
  bsd/dev/memdev.c			standard
  bsd/dev/sweet_ufs.c			standard
  bsd/dev/a5xelte_emmc.c			standard
 +bsd/dev/a04s_acpm.c			standard
 +bsd/dev/a04s_input.c			standard
 +bsd/dev/a04s_gpu.c			standard
++bsd/dev/a04s_power.c			standard
  bsd/dev/herolte_ufs.c			standard
  bsd/dev/herolte_touch.c			standard
  bsd/dev/herolte_battery.c		standard
@@ -482,10 +483,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..feb1f5c
+index 0000000..8e7c993
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
-@@ -0,0 +1,595 @@
+@@ -0,0 +1,734 @@
 +/*
 + * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
 + *
@@ -528,7 +529,32 @@ index 0000000..feb1f5c
 +#include <libkern/libkern.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void IOSleep(unsigned int milliseconds);
 +extern bool a04s_gpu_path_ok(void);
++extern int a04s_fg_temp_dc(void);
++
++/*
++ * Thermal monitor (a04sthermal, on unless it is 0): the three TMU sensors once a second. Readings
++ * count only after THERM_TRUST_READS in a row are sane (all three 10-80 C, within 25 C of each
++ * other), so a wrong decoding can't drive anything. Levels by the hottest sensor: NORMAL, WARM from
++ * 65 C, HOT from 80 C, CRITICAL from 95 C. GPU work runs only at NORMAL with trusted readings, and
++ * every level change and a battery at 50 C or more gets a line. Nothing here changes a clock or a
++ * voltage: the CPU clusters' PLLs are read for the report only, and the CPUs stay at S-Boot's
++ * clock. The TMU's own trip (115 C in the device tree, if S-Boot armed it: CTL bit 12) is what
++ * protects the chip past that.
++ */
++#define THERM_WARM              65
++#define THERM_HOT               80
++#define THERM_CRITICAL          95
++#define THERM_TRUST_READS       3
++#define BATT_HOT_DC             500
++#define CMU_CPUCL0_PA           0x10900000u
++#define CMU_CPUCL1_PA           0x10800000u
++#define CPU_PLL_CON3            0x10cu
++#define CPUCL0_MUX_PLL          0x100cu
++#define CPUCL1_MUX_PLL          0x1000u
++enum { LEVEL_OFF, LEVEL_UNTRUSTED, LEVEL_NORMAL, LEVEL_WARM, LEVEL_HOT, LEVEL_CRITICAL };
++static const char *const level_names[] = { "OFF", "UNTRUSTED", "NORMAL", "WARM", "HOT", "CRITICAL" };
 +
 +#define GATE_MANUAL             (1u << 20)
 +#define GATE_CG_VAL             (1u << 21)
@@ -659,6 +685,16 @@ index 0000000..feb1f5c
 +} tmu = { .why = "NOT READ", .max_g3d = TMU_NO_TEMP };
 +
 +static struct {
++	volatile int level;
++	unsigned good;                          /* sane readings in a row, until trusted */
++	bool trusted;
++	int hottest, max_seen, batt_dc;
++	volatile uint32_t samples, changes;
++	bool batt_warned;
++} therm = { .level = LEVEL_OFF, .hottest = TMU_NO_TEMP, .max_seen = TMU_NO_TEMP, .batt_dc = -9990 };
++static vm_offset_t cpucl0_va, cpucl1_va;
++
++static struct {
 +	const char *state;                      /* OFF, RUNNING, SKIP, OK, FAIL */
 +	const char *why;
 +	uint32_t before_status, before_l2, before_sc, before_tl;
@@ -785,6 +821,83 @@ index 0000000..feb1f5c
 +	return tmu.t[2];
 +}
 +
++/* Whether GPU work may run now: the monitor is running, its readings are trusted, and it is NORMAL. */
++bool a04s_gpu_allowed(void);
++bool
++a04s_gpu_allowed(void)
++{
++	return therm.level == LEVEL_NORMAL;
++}
++
++static void
++therm_sample(void)
++{
++	tmu_read();
++	int lo = 1000, hi = TMU_NO_TEMP;
++	bool sane = tmu.why == NULL;
++	for (unsigned i = 0; sane && i < 3; i++) {
++		int t = tmu.t[i];
++		if (t == TMU_NO_TEMP || t < -20 || t > 125) {
++			sane = false;
++			break;
++		}
++		lo = t < lo ? t : lo;
++		hi = t > hi ? t : hi;
++	}
++	therm.samples++;
++	therm.batt_dc = a04s_fg_temp_dc();
++	if (therm.batt_dc >= BATT_HOT_DC && !therm.batt_warned) {
++		therm.batt_warned = true;
++		kprintf("A04S BATTERY HOT %d.%d C\n", therm.batt_dc / 10, therm.batt_dc % 10);
++	} else if (therm.batt_dc < BATT_HOT_DC - 30) {
++		therm.batt_warned = false;
++	}
++	if (!therm.trusted) {
++		therm.good = (sane && lo >= 10 && hi <= 80 && hi - lo <= 25) ? therm.good + 1 : 0;
++		therm.trusted = therm.good >= THERM_TRUST_READS;
++	}
++	int level;
++	if (!therm.trusted || !sane) {
++		level = LEVEL_UNTRUSTED;
++	} else {
++		therm.hottest = hi;
++		if (hi > therm.max_seen) {
++			therm.max_seen = hi;
++		}
++		level = hi >= THERM_CRITICAL ? LEVEL_CRITICAL : hi >= THERM_HOT ? LEVEL_HOT :
++		    hi >= THERM_WARM ? LEVEL_WARM : LEVEL_NORMAL;
++	}
++	if (level != therm.level) {
++		therm.changes++;
++		kprintf("A04S THERMAL %s %d C (L0 %d L1 %d G3D %d) BATT %d\n", level_names[level], hi,
++		    tmu.t[0], tmu.t[1], tmu.t[2], therm.batt_dc);
++		therm.level = level;
++	}
++}
++
++static void
++a04s_therm_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		therm_sample();
++		IOSleep(1000);
++	}
++}
++
++/* A CPU cluster's PLL in MHz (FOUT = 26 MHz x M / (P x 2^S)), from PLL_CON3; 0 if not readable. */
++static unsigned
++cpu_pll_mhz(vm_offset_t cmu, uint32_t *raw)
++{
++	if (!cmu) {
++		*raw = 0;
++		return 0;
++	}
++	uint32_t pll = io_rd(cmu, CPU_PLL_CON3);
++	*raw = pll;
++	uint32_t m = (pll >> 16) & 0x3ffu, p = (pll >> 8) & 0x3fu, s = pll & 7u;
++	return p ? (unsigned)(OSC_HZ * m / ((uint64_t)p << s) / 1000000u) : 0;
++}
++
 +static bool
 +gpu_wait(uint32_t off, uint32_t mask, uint32_t want, unsigned max_us)
 +{
@@ -874,6 +987,14 @@ index 0000000..feb1f5c
 +	}
 +	if (!gate_running(io_rd(g3d_va, G3D_GATE_LHS_D)) || !gate_running(io_rd(core_va, CORE_GATE_LHM_D_G3D))) {
 +		gpu_skip("DATA GATE");
++		return;
++	}
++	/* The thermal monitor needs THERM_TRUST_READS seconds to trust its readings. */
++	for (unsigned waited = 0; !a04s_gpu_allowed() && waited < 10000; waited += 500) {
++		IOSleep(500);
++	}
++	if (!a04s_gpu_allowed()) {
++		gpu_skip(therm.level == LEVEL_OFF ? "THERMAL OFF" : level_names[therm.level]);
 +		return;
 +	}
 +	job.temp = a04s_gpu_temp();
@@ -1028,7 +1149,20 @@ index 0000000..feb1f5c
 +	if (a04s_gpu_path_ok()) {
 +		g3d_va = ml_io_map(CMU_G3D_PA, 0x4000);
 +	}
++	cpucl0_va = ml_io_map(CMU_CPUCL0_PA, 0x2000);
++	cpucl1_va = ml_io_map(CMU_CPUCL1_PA, 0x2000);
 +	tmu_read();
++	unsigned thermal = 1;
++	(void)PE_parse_boot_argn("a04sthermal", &thermal, sizeof(thermal));
++	if (thermal != 0) {
++		thread_t tthread;
++		if (kernel_thread_start(a04s_therm_thread, NULL, &tthread) == KERN_SUCCESS) {
++			thread_deallocate(tthread);
++			therm.level = LEVEL_UNTRUSTED;
++		} else {
++			kprintf("A04S THERMAL NO THREAD\n");
++		}
++	}
 +	unsigned want = 0;
 +	(void)PE_parse_boot_argn("a04sgpu", &want, sizeof(want));
 +	if (want != 1) {
@@ -1057,6 +1191,12 @@ index 0000000..feb1f5c
 +		kprintf("TMU RAW %08x %08x TRIM %08x %08x %08x %08x\n", tmu.cur[0], tmu.cur[1], tmu.trim0,
 +		    tmu.trim[0], tmu.trim[1], tmu.trim[2]);
 +	}
++	uint32_t raw0, raw1;
++	unsigned mhz0 = cpu_pll_mhz(cpucl0_va, &raw0), mhz1 = cpu_pll_mhz(cpucl1_va, &raw1);
++	kprintf("THERM %s HOT %d MAX %d BATT %d N %u CH %u CPU L %u MHZ (%08x MUX %x) B %u MHZ (%08x MUX %x)\n",
++	    level_names[therm.level], therm.hottest, therm.max_seen, therm.batt_dc, therm.samples, therm.changes,
++	    mhz0, raw0, cpucl0_va ? io_rd(cpucl0_va, CPUCL0_MUX_PLL) : 0, mhz1, raw1,
++	    cpucl1_va ? io_rd(cpucl1_va, CPUCL1_MUX_PLL) : 0);
 +	if (g3d_va && a04s_gpu_path_ok()) {
 +		uint32_t pll = io_rd(g3d_va, G3D_PLL_CON3);
 +		uint32_t m = (pll >> 16) & 0x3ffu, p = (pll >> 8) & 0x3fu, s = pll & 7u;
@@ -1083,10 +1223,10 @@ index 0000000..feb1f5c
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_input.c b/bsd/dev/a04s_input.c
 new file mode 100644
-index 0000000..3eeab86
+index 0000000..ac6bfa6
 --- /dev/null
 +++ b/bsd/dev/a04s_input.c
-@@ -0,0 +1,1338 @@
+@@ -0,0 +1,1342 @@
 +/*
 + * Galaxy A04s, stage 7: the keys (7b), and read-only first looks at the touch path (7a-1) and
 + * the GPU's power domain (7c-1).
@@ -2356,6 +2496,8 @@ index 0000000..3eeab86
 +	kprintf("A04S 7 PROBED\n");
 +	extern void a04s_gpu_start(void);
 +	a04s_gpu_start();
++	extern void a04s_power_start(void);
++	a04s_power_start();
 +	cmu_cmgp_va = cmu_cmgp;
 +	a04s_touch_spi_start();
 +	if (!alive_pins) {
@@ -2423,6 +2565,493 @@ index 0000000..3eeab86
 +	}
 +	extern void a04s_gpu_report(void);
 +	a04s_gpu_report();
++	extern void a04s_power_report(void);
++	a04s_power_report();
++}
++#endif /* ARM64_BOARD_CONFIG_A04S */
+diff --git a/bsd/dev/a04s_power.c b/bsd/dev/a04s_power.c
+new file mode 100644
+index 0000000..36346cb
+--- /dev/null
++++ b/bsd/dev/a04s_power.c
+@@ -0,0 +1,479 @@
++/*
++ * Galaxy A04s: the battery (fuel gauge), and read-only first looks at the speaker amp and the audio
++ * power domain.
++ *
++ * I2C: the two buses used here are Samsung's plain s3c2440-i2c controllers (live device tree):
++ *  - bus 0, i2c@13830000: the MAX1726x fuel gauge at 0x36. Pins gpp0-0/1, function 2.
++ *  - bus 3, i2c@13860000: the FourSemi FS18xx speaker amp at 0x34. Pins gpp1-0/1, function 2.
++ * The driver below can only read. A transfer sends the device's address and one register number,
++ * then a repeated start and the read: no data byte is ever sent, and there is no write function.
++ * Each device has a fixed list of registers it may read; anything else is refused. A bus is used
++ * only if its CMU_PERI PCLK gate is running, its Q-channel can't stop the clock, both pins already
++ * have the I2C function (nothing here changes a pin), and the controller isn't busy. The bus runs at
++ * the slowest rate the controller has (PCLK / 512 / 16), far under the 400 kHz both chips take, and
++ * its interrupt-enable bit is set only if the GIC can't deliver that interrupt (S-Boot may have left
++ * an SPI enabled, and XNU has no handler for it). Every poll is bounded.
++ *
++ * Fuel gauge, with the boot-arg a04sfg=1 (SweetBattery polls it every 30 s; without it iOS gets
++ * SweetBattery's static 100%): Maxim ModelGauge m5 registers, as the S7's MAX77854 (herolte_battery.c).
++ * The device tree's fuelgauge,rsense = 5 (mOhm) and designcap = 0x128e (4750 at 1 mAh a bit) agree:
++ *   RepSOC 0x06 1/256 %, VCell 0x09 78.125 uV, Current 0x0A and AvgCurrent 0x0B signed 312.5 uA
++ *   (positive = charging), RepCap 0x05 and FullCapRep 0x10 1 mAh, Temp 0x08 signed 1/256 C,
++ *   Status 0x00, TTE 0x11, Cycles 0x17, DesignCap 0x18, AvgVCell 0x19, DevName 0x21.
++ * There is no charger driver (the SYV660 keeps S-Boot's settings): a charge current above 20 mA
++ * is what marks a cable, as on the S7.
++ *
++ * Speaker amp, with a04samp=1: its ID and status registers (0x03, 0x00; 16-bit, big-endian), once
++ * at root mount. The amp stays as S-Boot left it.
++ *
++ * Audio power, always: pd-aud's configuration and status in the always-on PMU, and PLL_AUD in
++ * CMU_AUD only when pd-aud is on. Reads only; ABOX itself is not touched.
++ */
++#if defined(ARM64_BOARD_CONFIG_A04S)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <stdbool.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define GATE_MANUAL             (1u << 20)
++#define GATE_CG_VAL             (1u << 21)
++#define QCH_ENABLE              (1u << 0)
++#define QCH_CLOCK_REQ           (1u << 1)
++#define CMU_PERI_PA             0x10030000u
++#define PERI_PINS_PA            0x139b0000u     /* pinctrl@139b0000: bank CON +0x0 */
++#define GICD_PA                 0x12a01000u
++#define GICD_ISENABLER          0x100u
++
++/* s3c2440-i2c (Linux i2c-s3c2410.c). */
++#define IICCON                  0x00u
++#define IICSTAT                 0x04u
++#define IICDS                   0x0cu
++#define IICLC                   0x10u
++#define CON_ACKEN               (1u << 7)
++#define CON_TXDIV_512           (1u << 6)
++#define CON_IRQEN               (1u << 5)
++#define CON_IRQPEND             (1u << 4)
++#define CON_SCALE_MAX           0xfu
++#define STAT_MASTER_RX          0x80u
++#define STAT_MASTER_TX          0xc0u
++#define STAT_START              (1u << 5)       /* write: start; read: bus busy */
++#define STAT_TXRXEN             (1u << 4)
++#define STAT_ARBITR             (1u << 3)
++#define STAT_LASTBIT            (1u << 0)       /* 1: no ACK */
++#define LC_FILTER_ON            (1u << 2)
++#define I2C_WAIT_US             5000u
++
++/* pd-aud@11862080 and PLL_AUD (cmucal-sfr.c). */
++#define PD_AUD_PA               0x11862000u
++#define PD_AUD_CONFIG           0x080u
++#define PD_AUD_STATUS           0x084u
++#define CMU_AUD_PA              0x14a00000u
++#define AUD_PLL_CON3            0x10cu
++
++#define FG_ADDR                 0x36u
++#define AMP_ADDR                0x34u
++#define FG_STATUS               0x00u
++#define FG_REPCAP               0x05u
++#define FG_REPSOC               0x06u
++#define FG_TEMP                 0x08u
++#define FG_VCELL                0x09u
++#define FG_CURRENT              0x0au
++#define FG_AVGCURRENT           0x0bu
++#define FG_FULLCAPREP           0x10u
++#define FG_TTE                  0x11u
++#define FG_CYCLES               0x17u
++#define FG_DESIGNCAP            0x18u
++#define FG_AVGVCELL             0x19u
++#define FG_DEVNAME              0x21u
++#define AMP_STATUS              0x00u
++#define AMP_ID                  0x03u
++#define NO_TEMP                 (-9990)         /* tenths of a degree */
++
++struct i2c_bus {
++	const char *name;
++	uint32_t pa, gate_off, qch_off, pin_bank;
++	unsigned gic_id;
++	vm_offset_t va;
++	const char *why;                        /* NULL once usable */
++	uint32_t gate, qch, pins, con0, stat0;
++	bool irqen;
++	uint32_t xfers, errors;
++	const char *last_error;
++};
++
++static struct i2c_bus buses[2] = {
++	{ .name = "I2C0", .pa = 0x13830000u, .gate_off = 0x203cu, .qch_off = 0x301cu, .pin_bank = 0x020u,
++	  .gic_id = 32u + 0xc4u, .why = "NOT TRIED", .last_error = "-" },
++	{ .name = "I2C3", .pa = 0x13860000u, .gate_off = 0x2048u, .qch_off = 0x3028u, .pin_bank = 0x040u,
++	  .gic_id = 32u + 0xc7u, .why = "NOT TRIED", .last_error = "-" },
++};
++
++/* The only transfers there are: a device, its bus, its byte order, and the registers it may read. */
++static const uint8_t fg_regs[] = { FG_STATUS, FG_REPCAP, FG_REPSOC, FG_TEMP, FG_VCELL, FG_CURRENT,
++	FG_AVGCURRENT, FG_FULLCAPREP, FG_TTE, FG_CYCLES, FG_DESIGNCAP, FG_AVGVCELL, FG_DEVNAME };
++static const uint8_t amp_regs[] = { AMP_STATUS, AMP_ID };
++struct i2c_dev {
++	unsigned bus;
++	uint8_t addr;
++	bool big_endian;
++	const uint8_t *regs;
++	unsigned nregs;
++};
++enum { DEV_FG = 0, DEV_AMP = 1 };
++static const struct i2c_dev devs[2] = {
++	{ 0, FG_ADDR, false, fg_regs, (unsigned)sizeof(fg_regs) },
++	{ 1, AMP_ADDR, true, amp_regs, (unsigned)sizeof(amp_regs) },
++};
++
++static LCK_GRP_DECLARE(a04s_power_grp, "a04s_power");
++static LCK_MTX_DECLARE(a04s_i2c_mtx, &a04s_power_grp);
++static vm_offset_t peri_va, pins_va, gicd_va;
++
++static struct {
++	const char *state;                      /* OFF, NO BUS, NO CHIP, OK, ERR */
++	uint16_t devname, status, designcap, cycles, tte;
++	unsigned percent, mv, avg_mv, rem, full;
++	int ma, avg_ma, temp_dc;
++	uint32_t reads, bad;
++	bool ok;                                /* the last read worked */
++} fg = { .state = "OFF", .temp_dc = NO_TEMP };
++
++static struct {
++	const char *state;
++	uint16_t id, status;
++} amp = { .state = "OFF" };
++
++static uint32_t pd_aud_config, pd_aud_status, aud_pll;
++static bool aud_pll_read;
++
++static inline uint32_t
++io_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++io_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static bool
++gate_running(uint32_t gate)
++{
++	return !(gate & GATE_MANUAL) || (gate & GATE_CG_VAL);
++}
++
++static bool
++qch_may_stop(uint32_t qch)
++{
++	return (qch & QCH_ENABLE) && !(qch & QCH_CLOCK_REQ);
++}
++
++/* Reads only: decides whether a bus can be used, and how. */
++static void
++bus_check(struct i2c_bus *b)
++{
++	if (!peri_va) {
++		peri_va = ml_io_map(CMU_PERI_PA, 0x4000);
++	}
++	if (!pins_va) {
++		pins_va = ml_io_map(PERI_PINS_PA, 0x1000);
++	}
++	if (!gicd_va) {
++		gicd_va = ml_io_map(GICD_PA, 0x1000);
++	}
++	if (!peri_va || !pins_va || !gicd_va) {
++		b->why = "NO MAPPING";
++		return;
++	}
++	b->gate = io_rd(peri_va, b->gate_off);
++	b->qch = io_rd(peri_va, b->qch_off);
++	if (!gate_running(b->gate)) {
++		b->why = "GATE";
++		return;
++	}
++	if (qch_may_stop(b->qch)) {
++		b->why = "QCH";
++		return;
++	}
++	b->pins = io_rd(pins_va, b->pin_bank);
++	if ((b->pins & 0xffu) != 0x22u) {
++		b->why = "PINS";
++		return;
++	}
++	if (!b->va) {
++		b->va = ml_io_map(b->pa, 0x1000);
++	}
++	if (!b->va) {
++		b->why = "NO MAPPING";
++		return;
++	}
++	b->con0 = io_rd(b->va, IICCON);
++	b->stat0 = io_rd(b->va, IICSTAT);
++	if (b->stat0 & STAT_START) {
++		b->why = "BUSY";
++		return;
++	}
++	uint32_t en = io_rd(gicd_va, GICD_ISENABLER + 4u * (b->gic_id / 32u));
++	b->irqen = !(en & (1u << (b->gic_id % 32u)));
++	b->why = NULL;
++}
++
++static bool
++i2c_wait_pend(struct i2c_bus *b)
++{
++	for (unsigned us = 0; us <= I2C_WAIT_US; us += 5) {
++		if (io_rd(b->va, IICCON) & CON_IRQPEND) {
++			return true;
++		}
++		delay(5);
++	}
++	return false;
++}
++
++static void
++i2c_stop(struct i2c_bus *b, uint32_t mode, uint32_t con)
++{
++	io_wr(b->va, IICSTAT, mode | STAT_TXRXEN);
++	io_wr(b->va, IICCON, con & ~(CON_IRQPEND | CON_ACKEN));
++	for (unsigned us = 0; us <= I2C_WAIT_US && (io_rd(b->va, IICSTAT) & STAT_START); us += 5) {
++		delay(5);
++	}
++}
++
++static bool
++i2c_fail(struct i2c_bus *b, const char *what, uint32_t mode, uint32_t con)
++{
++	b->errors++;
++	b->last_error = what;
++	i2c_stop(b, mode, con);
++	return false;
++}
++
++/*
++ * One 16-bit register: START, address + W, the register number, repeated START, address + R, two
++ * bytes (ACK, then NACK), STOP. Called with a04s_i2c_mtx held.
++ */
++static bool
++i2c_read16(unsigned dev_index, uint8_t reg, uint16_t *value)
++{
++	if (dev_index >= sizeof(devs) / sizeof(devs[0])) {
++		return false;
++	}
++	const struct i2c_dev *d = &devs[dev_index];
++	bool listed = false;
++	for (unsigned i = 0; i < d->nregs; i++) {
++		listed = listed || d->regs[i] == reg;
++	}
++	struct i2c_bus *b = &buses[d->bus];
++	if (!listed || b->why) {
++		return false;
++	}
++	if (io_rd(b->va, IICSTAT) & STAT_START) {
++		b->errors++;
++		b->last_error = "BUSY";
++		return false;
++	}
++	b->xfers++;
++	uint32_t con = CON_ACKEN | CON_TXDIV_512 | CON_SCALE_MAX | (b->irqen ? CON_IRQEN : 0);
++	io_wr(b->va, IICLC, LC_FILTER_ON);
++	io_wr(b->va, IICCON, con);
++	io_wr(b->va, IICSTAT, STAT_MASTER_TX | STAT_TXRXEN);
++	io_wr(b->va, IICDS, (uint32_t)d->addr << 1);
++	delay(1);
++	io_wr(b->va, IICSTAT, STAT_MASTER_TX | STAT_TXRXEN | STAT_START);
++	if (!i2c_wait_pend(b)) {
++		return i2c_fail(b, "TIMEOUT ADDR", STAT_MASTER_TX, con);
++	}
++	uint32_t st = io_rd(b->va, IICSTAT);
++	if (st & STAT_ARBITR) {
++		return i2c_fail(b, "ARBITRATION", STAT_MASTER_TX, con);
++	}
++	if (st & STAT_LASTBIT) {
++		return i2c_fail(b, "NACK ADDR", STAT_MASTER_TX, con);
++	}
++	io_wr(b->va, IICDS, reg);
++	delay(1);
++	io_wr(b->va, IICCON, con);                              /* clears the pending bit: send it */
++	if (!i2c_wait_pend(b)) {
++		return i2c_fail(b, "TIMEOUT REG", STAT_MASTER_TX, con);
++	}
++	if (io_rd(b->va, IICSTAT) & STAT_LASTBIT) {
++		return i2c_fail(b, "NACK REG", STAT_MASTER_TX, con);
++	}
++	io_wr(b->va, IICSTAT, STAT_MASTER_RX | STAT_TXRXEN);
++	io_wr(b->va, IICDS, ((uint32_t)d->addr << 1) | 1u);
++	delay(1);
++	io_wr(b->va, IICSTAT, STAT_MASTER_RX | STAT_TXRXEN | STAT_START);
++	io_wr(b->va, IICCON, con);
++	if (!i2c_wait_pend(b)) {
++		return i2c_fail(b, "TIMEOUT RESTART", STAT_MASTER_RX, con);
++	}
++	if (io_rd(b->va, IICSTAT) & STAT_LASTBIT) {
++		return i2c_fail(b, "NACK READ", STAT_MASTER_RX, con);
++	}
++	io_wr(b->va, IICCON, con);                              /* first byte, ACKed */
++	if (!i2c_wait_pend(b)) {
++		return i2c_fail(b, "TIMEOUT BYTE0", STAT_MASTER_RX, con);
++	}
++	uint8_t b0 = (uint8_t)io_rd(b->va, IICDS);
++	io_wr(b->va, IICCON, con & ~CON_ACKEN);                 /* last byte, NACKed */
++	if (!i2c_wait_pend(b)) {
++		return i2c_fail(b, "TIMEOUT BYTE1", STAT_MASTER_RX, con);
++	}
++	uint8_t b1 = (uint8_t)io_rd(b->va, IICDS);
++	i2c_stop(b, STAT_MASTER_RX, con);
++	*value = d->big_endian ? (uint16_t)((b0 << 8) | b1) : (uint16_t)(b0 | (b1 << 8));
++	return true;
++}
++
++static bool
++fg_reg(uint8_t reg, uint16_t *value)
++{
++	return i2c_read16(DEV_FG, reg, value);
++}
++
++/* For SweetBattery (iokit/Kernel/arm/SweetBattery.cpp). 0 once the gauge has answered. */
++int a04s_fg_init(void);
++int
++a04s_fg_init(void)
++{
++	unsigned want = 0;
++	(void)PE_parse_boot_argn("a04sfg", &want, sizeof(want));
++	if (want != 1) {
++		fg.state = "OFF";
++		return -1;
++	}
++	lck_mtx_lock(&a04s_i2c_mtx);
++	bus_check(&buses[0]);
++	bool ok = false;
++	if (buses[0].why) {
++		fg.state = "NO BUS";
++	} else if (!fg_reg(FG_DEVNAME, &fg.devname) || fg.devname == 0 || fg.devname == 0xffffu) {
++		fg.state = "NO CHIP";
++	} else {
++		(void)fg_reg(FG_DESIGNCAP, &fg.designcap);
++		fg.state = "OK";
++		ok = true;
++	}
++	lck_mtx_unlock(&a04s_i2c_mtx);
++	kprintf("A04S FG %s %s DEV %04x\n", fg.state, buses[0].why ? buses[0].why : buses[0].last_error, fg.devname);
++	return ok ? 0 : -1;
++}
++
++int a04s_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah);
++int
++a04s_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah)
++{
++	uint16_t soc, vcell, avgv, cur, avgc, rem, full, temp, status, cycles, tte;
++	lck_mtx_lock(&a04s_i2c_mtx);
++	bool ok = fg_reg(FG_REPSOC, &soc) && fg_reg(FG_VCELL, &vcell) && fg_reg(FG_CURRENT, &cur) &&
++	    fg_reg(FG_REPCAP, &rem) && fg_reg(FG_FULLCAPREP, &full) && fg_reg(FG_TEMP, &temp) &&
++	    fg_reg(FG_AVGVCELL, &avgv) && fg_reg(FG_AVGCURRENT, &avgc) && fg_reg(FG_STATUS, &status) &&
++	    fg_reg(FG_CYCLES, &cycles) && fg_reg(FG_TTE, &tte);
++	lck_mtx_unlock(&a04s_i2c_mtx);
++	fg.reads++;
++	fg.ok = ok;
++	if (!ok) {
++		fg.bad++;
++		fg.state = "ERR";
++		return -1;
++	}
++	fg.percent = ((unsigned)soc + 128u) >> 8;
++	if (fg.percent > 100) {
++		fg.percent = 100;
++	}
++	fg.mv = (unsigned)vcell * 5u / 64u;                     /* 78.125 uV */
++	fg.avg_mv = (unsigned)avgv * 5u / 64u;
++	fg.ma = (int)(int16_t)cur * 5 / 16;                     /* 312.5 uA */
++	fg.avg_ma = (int)(int16_t)avgc * 5 / 16;
++	fg.rem = rem;
++	fg.full = full;
++	fg.temp_dc = (int)(int16_t)temp * 10 / 256;
++	fg.status = status;
++	fg.cycles = cycles;
++	fg.tte = tte;
++	fg.state = "OK";
++	*percent = fg.percent;
++	*mv = fg.mv;
++	*ma = fg.ma;
++	*rem_mah = fg.rem;
++	*full_mah = fg.full;
++	return 0;
++}
++
++/* The gauge's last temperature in tenths of a degree, or NO_TEMP (-9990). For the thermal monitor. */
++int a04s_fg_temp_dc(void);
++int
++a04s_fg_temp_dc(void)
++{
++	if (!fg.ok || fg.temp_dc < -300 || fg.temp_dc > 900) {
++		return NO_TEMP;
++	}
++	return fg.temp_dc;
++}
++
++/* Called from a04s_input_start() at root mount. */
++void a04s_power_start(void);
++void
++a04s_power_start(void)
++{
++	vm_offset_t pmu = ml_io_map(PD_AUD_PA, 0x1000);
++	if (pmu) {
++		pd_aud_config = io_rd(pmu, PD_AUD_CONFIG);
++		pd_aud_status = io_rd(pmu, PD_AUD_STATUS);
++	}
++	if (pd_aud_status & 1u) {
++		vm_offset_t aud = ml_io_map(CMU_AUD_PA, 0x1000);
++		if (aud) {
++			aud_pll = io_rd(aud, AUD_PLL_CON3);
++			aud_pll_read = true;
++		}
++	}
++	unsigned want = 0;
++	(void)PE_parse_boot_argn("a04samp", &want, sizeof(want));
++	if (want != 1) {
++		return;
++	}
++	lck_mtx_lock(&a04s_i2c_mtx);
++	bus_check(&buses[1]);
++	if (buses[1].why) {
++		amp.state = "NO BUS";
++	} else if (i2c_read16(DEV_AMP, AMP_ID, &amp.id) && i2c_read16(DEV_AMP, AMP_STATUS, &amp.status)) {
++		amp.state = "OK";
++	} else {
++		amp.state = "NO CHIP";
++	}
++	lck_mtx_unlock(&a04s_i2c_mtx);
++	kprintf("A04S AMP %s ID %04x ST %04x\n", amp.state, amp.id, amp.status);
++}
++
++void a04s_power_report(void);
++void
++a04s_power_report(void)
++{
++	for (unsigned i = 0; i < 2; i++) {
++		struct i2c_bus *b = &buses[i];
++		kprintf("%s %s G %x Q %x PIN %x CON %x ST %x IRQ %d XF %u ERR %u %s\n", b->name,
++		    b->why ? b->why : "OK", b->gate, b->qch, b->pins & 0xffu, b->con0, b->stat0, b->irqen ? 1 : 0,
++		    b->xfers, b->errors, b->last_error);
++	}
++	kprintf("FG %s DEV %04x %u%% %u MV (AVG %u) %d MA (AVG %d) CAP %u/%u DES %u T %d.%d ST %04x CYC %u TTE %u N %u/%u\n",
++	    fg.state, fg.devname, fg.percent, fg.mv, fg.avg_mv, fg.ma, fg.avg_ma, fg.rem, fg.full, fg.designcap,
++	    fg.temp_dc / 10, (fg.temp_dc < 0 ? -fg.temp_dc : fg.temp_dc) % 10, fg.status, fg.cycles, fg.tte,
++	    fg.reads, fg.bad);
++	kprintf("AUD PD %x %x %s PLL %s%08x AMP %s ID %04x ST %04x\n", pd_aud_config, pd_aud_status,
++	    (pd_aud_status & 1u) ? "ON" : "OFF", aud_pll_read ? "" : "NOT READ ", aud_pll, amp.state, amp.id,
++	    amp.status);
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
@@ -3319,6 +3948,80 @@ index 0000000..e3b8eb3
 +
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 6d8a0fd..d471153 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -4,7 +4,7 @@
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+  * See report.md for binary evidence, register provenance and integration.
+  */
+-#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_HEROLTE)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_HEROLTE) || defined(ARM64_BOARD_CONFIG_A04S)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOWorkLoop.h>
+@@ -12,7 +12,19 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
+-#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#if defined(ARM64_BOARD_CONFIG_A04S)
++/* bsd/dev/a04s_power.c: the MAX1726x fuel gauge, read-only, with the boot-arg a04sfg=1 (without
++ * it, the static fallback). The same Maxim registers as the S7's MAX77854, so the rest of this
++ * file takes the S7's path. */
++#define SWEET_BATTERY_MAXIM 1
++extern "C" int a04s_fg_init(void);
++extern "C" int a04s_fg_read(unsigned *percent, unsigned *mv, int *ma,
++    unsigned *rem_mah, unsigned *full_mah);
++#define herolte_fg_init a04s_fg_init
++#define herolte_fg_read a04s_fg_read
++#define BATTERY_DESIGN_MAH 5000u        /* SM-A047F, typical */
++#elif defined(ARM64_BOARD_CONFIG_HEROLTE)
++#define SWEET_BATTERY_MAXIM 1
+ /* bsd/dev/herolte_battery.c: MAX77854 fuel gauge, read-only. */
+ extern "C" int herolte_fg_init(void);
+ extern "C" int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma,
+@@ -163,8 +175,8 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-#if defined(ARM64_BOARD_CONFIG_HEROLTE)
+-		    measured ? "MAX77854 fuel gauge" : "static fallback",
++#if defined(SWEET_BATTERY_MAXIM)
++		    measured ? "Maxim fuel gauge" : "static fallback",
+ #else
+ 		    measured ? "PM6150 / estimated SOC" : "static fallback",
+ #endif
+@@ -173,7 +185,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	}
+ }
+ 
+-#if !defined(ARM64_BOARD_CONFIG_HEROLTE)
++#if !defined(SWEET_BATTERY_MAXIM)
+ /* Keep the proven single-byte observer command. Read two matching whole
+  * words to reject most torn ADC samples without writing the QG HOLD bit.
+  * This is a bounded consistency check, not a hardware snapshot guarantee. */
+@@ -218,7 +230,7 @@ SweetBattery::estimatePercent(unsigned mv)
+ }
+ #endif
+ 
+-#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#if defined(SWEET_BATTERY_MAXIM)
+ void
+ SweetBattery::poll(void)
+ {
+@@ -300,8 +312,8 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-#if defined(ARM64_BOARD_CONFIG_HEROLTE)
+-	/* Default on; herofg=0 keeps the static fallback. */
++#if defined(SWEET_BATTERY_MAXIM)
++	/* HEROLTE: default on; herofg=0 keeps the static fallback. A04S: a04sfg=1 turns it on. */
+ 	fReal = herolte_fg_init() == 0;
+ #else
+ 	int real = 0;
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
 index b269868..717e4cf 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
@@ -3756,6 +4459,19 @@ index 61aaef9..ccecb8e 100644
  #elif defined(ARM64_BOARD_CONFIG_A5XELTE)
  	setProperty("SurfaceHeight", (unsigned long long)(121 << 16), 32);
  #else
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index d1099ff..f0ac7a5 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -89,7 +89,7 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
+-#if !defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(ARM64_BOARD_CONFIG_HEROLTE)
++#if !defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(ARM64_BOARD_CONFIG_HEROLTE) || defined(ARM64_BOARD_CONFIG_A04S)
+     "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 index 10449ab..20309cf 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
