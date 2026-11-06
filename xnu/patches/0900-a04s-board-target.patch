@@ -483,10 +483,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..c7ea944
+index 0000000..93e7c0c
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
-@@ -0,0 +1,2214 @@
+@@ -0,0 +1,2285 @@
 +/*
 + * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
 + *
@@ -1960,8 +1960,15 @@ index 0000000..c7ea944
 + * a04sgpu_selftest=1, after the boot tests: a WRITE_VALUE (ZERO) job in AS1 on a buffer mapped in
 + * AS1 (must work), the same job aimed at AS0's private GPU VA (must fault in AS1, and the private
 + * page must keep its marker: the isolation test), then 7c-4a's private clear in AS0 (must still work).
++ *
++ * v47: a faulting AS1 job is ended as Panfrost and kbase do (user_recover_locked()), and the
++ * self-test runs a second WRITE_VALUE in AS1 after the fault, so a pass also shows AS1 is usable
++ * again after a bad job. If the recovery itself fails, AS1 stays out of service until a reboot.
 + */
 +#define AS1                     (AS0 + 0x40u)
++#define AS_TRANSTAB_UNMAPPED    0u                      /* ADRMODE 0: every access faults */
++#define AS1_FAULT_BITS          ((1u << 1) | (1u << 17))        /* AS1's page fault and bus fault */
++#define USER_STOP_US            100000u
 +#define GPU_AS_PRESENT          0x018u
 +#define UPT_PA                  0xbc100000ull
 +#define UPT_L3_MAX              512u
@@ -1994,7 +2001,10 @@ index 0000000..c7ea944
 +	uint32_t wv_status, wv_us, iso_status, iso_fault, iso_addr;
 +	uint64_t wv_output, iso_output;
 +	uint32_t jobs, faults, l3;
++	uint32_t wv2_status, stop_status, mmu_after, recovers, recover_fails;
++	uint64_t wv2_output;
 +	bool as0_ok;
++	bool broken;                            /* a recovery failed: AS1 out of service until reboot */
 +	struct frag_result as0;
 +} uj = { .state = "OFF", .why = "a04sgpu_selftest=0" };
 +
@@ -2028,6 +2038,10 @@ index 0000000..c7ea944
 +static bool
 +user_up_locked(void)
 +{
++	if (uj.broken) {
++		uj.why = "AS1 STUCK";
++		return false;
++	}
 +	if (user_ready) {
 +		return true;
 +	}
@@ -2137,6 +2151,48 @@ index 0000000..c7ea944
 +	return user_as_update();
 +}
 +
++/*
++ * v47: end a job in AS1 that faulted or would not finish. The faulting access keeps AS1 stalled, so
++ * a hard stop alone doesn't end it, and clearing the fault with the same tables in place only lets it
++ * fault again: in v46's self-test the AS0 job after the isolation test saw that second fault and gave
++ * up. So: hard-stop the slot, take AS1 out of service (no tables, which ends the stalled accesses),
++ * clear AS1's fault, wait for the slot to leave ACTIVE, clear again, and only then put AS1's tables
++ * back. True if the slot is idle and no MMU fault is left; otherwise AS1 stays out of service.
++ * With a04s_gpu_mtx held.
++ */
++static bool
++user_recover_locked(uint32_t slot)
++{
++	gpu_wr(slot + JS_COMMAND, JS_HARD_STOP);
++	gpu_wr(AS1 + AS_TRANSTAB_LO, AS_TRANSTAB_UNMAPPED);
++	gpu_wr(AS1 + AS_TRANSTAB_HI, 0);
++	gpu_wr(AS1 + AS_COMMAND, 1);                            /* UPDATE */
++	bool as_done = gpu_wait(AS1 + AS_STATUS, 1u, 0, USER_STOP_US);
++	gpu_wr(MMU_IRQ_CLEAR, AS1_FAULT_BITS);
++	bool stopped = false;
++	for (unsigned us = 0; us <= USER_STOP_US; us += 10) {
++		if ((io_rd(gpu_va, slot + JS_STATUS) & 0xffu) != JS_ACTIVE) {
++			stopped = true;
++			break;
++		}
++		delay(10);
++	}
++	uj.stop_status = io_rd(gpu_va, slot + JS_STATUS);
++	gpu_wr(JOB_IRQ_CLEAR, 0xffffffffu);
++	gpu_wr(MMU_IRQ_CLEAR, AS1_FAULT_BITS);
++	bool back = stopped && as_done && user_as_update();
++	uj.mmu_after = io_rd(gpu_va, MMU_IRQ_RAWSTAT);
++	if (back && uj.mmu_after == 0) {
++		uj.recovers++;
++		return true;
++	}
++	uj.recover_fails++;
++	uj.broken = true;
++	user_ready = false;
++	kprintf("A04S GPU USER AS1 STUCK: STOP %x MMU %x, AS1 OUT OF SERVICE\n", uj.stop_status, uj.mmu_after);
++	return false;
++}
++
 +/* One job chain at GPU VA jc on slot js, in AS1. 0 if it finished cleanly, else the slot's status,
 + * or 0xffffffff on a timeout. With a04s_gpu_mtx held. */
 +static uint32_t
@@ -2170,16 +2226,12 @@ index 0000000..c7ea944
 +	*fault = io_rd(gpu_va, AS1 + AS_FAULTSTATUS);
 +	*faddr = io_rd(gpu_va, AS1 + AS_FAULTADDR_LO);
 +	bool answered = (jirq & (done | failed)) || mirq || (girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT));
-+	if ((st & 0xffu) == JS_ACTIVE) {
-+		gpu_wr(slot + JS_COMMAND, JS_HARD_STOP);
-+		(void)gpu_wait(slot + JS_STATUS, 0xffu, 0, 10000);
++	if ((st & 0xffu) == JS_ACTIVE || mirq) {
++		(void)user_recover_locked(slot);
 +	}
 +	gpu_wr(JOB_IRQ_CLEAR, 0xffffffffu);
 +	gpu_wr(MMU_IRQ_CLEAR, 0xffffffffu);
 +	gpu_wr(GPU_IRQ_CLEAR, 0xffffffffu);
-+	if (mirq) {
-+		(void)user_as_update();         /* AS1 back in service for the next job */
-+	}
 +	if ((jirq & done) && !(jirq & failed) && !mirq && !(girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT))) {
 +		return 0;
 +	}
@@ -2265,7 +2317,7 @@ index 0000000..c7ea944
 +	uint32_t fault = 0, faddr = 0, st = 0xffffffffu;
 +	uint64_t t = 0;
 +	lck_mtx_lock(&a04s_gpu_mtx);
-+	if (user_ready) {
++	if (user_ready && !uj.broken) {
 +		st = user_run_locked(js, jc, &fault, &faddr, &t);
 +		uj.jobs++;
 +		if (fault) {
@@ -2346,7 +2398,18 @@ index 0000000..c7ea944
 +	uj.iso_status = user_run_locked(1, va, &uj.iso_fault, &uj.iso_addr, &us);
 +	uj.iso_output = *priv;
 +
-+	/* 3: AS0 still works: 7c-4a's private clear. */
++	/* 3 (v47): AS1 works again after the fault, on its own buffer. */
++	uj.why = "AS1 AFTER";
++	uj.wv2_status = 0xffffffffu;
++	if (!uj.broken) {
++		utest_write_value(va + 0x100u);
++		*out = 0xa5a5a5a55a5a5a5aull;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		uj.wv2_status = user_run_locked(1, va, &fault, &faddr, &us);
++	}
++	uj.wv2_output = *out;
++
++	/* 4: AS0 still works: 7c-4a's private clear. */
 +	uj.why = "AS0 AFTER";
 +	uj.as0_ok = frag_job(GPU_VA + FRAG_RT_OFF, FRAG_W, FRAG_H, FRAG_W * 4u, FRAG_COLOR, core0, &uj.as0, 0, 0,
 +	    SWIZZLE_RGBA);
@@ -2357,16 +2420,21 @@ index 0000000..c7ea944
 +
 +	bool wv_ok = uj.wv_status == 0 && uj.wv_output == 0;
 +	bool iso_ok = uj.iso_status != 0 && uj.iso_fault != 0 && uj.iso_output == UTEST_MARKER;
-+	if (wv_ok && iso_ok && uj.as0_ok) {
++	bool wv2_ok = uj.wv2_status == 0 && uj.wv2_output == 0 && !uj.broken;
++	if (wv_ok && iso_ok && wv2_ok && uj.as0_ok) {
 +		uj.state = "OK";
-+		uj.why = "AS1 RUNS JOBS AND CAN'T REACH AS0";
++		uj.why = "AS1 RUNS JOBS, CAN'T REACH AS0 AND RECOVERS";
 +	} else {
 +		uj.state = "FAIL";
-+		uj.why = !wv_ok ? "WRITE_VALUE" : !iso_ok ? "ISOLATION" : "AS0 AFTER";
++		uj.why = !wv_ok ? "WRITE_VALUE" : !iso_ok ? "ISOLATION" : !wv2_ok ? "AS1 AFTER" : "AS0 AFTER";
 +	}
-+	kprintf("A04S GPU USER %s %s: WV %x OUT %llx, ISO %x FAULT %x@%x PRIV %llx, AS0 %s\n", uj.state, uj.why,
-+	    uj.wv_status, uj.wv_output, uj.iso_status, uj.iso_fault, uj.iso_addr, uj.iso_output,
-+	    uj.as0_ok ? "OK" : "FAIL");
++	kprintf("A04S GPU USER %s %s: WV %x OUT %llx, ISO %x FAULT %x@%x PRIV %llx, STOP %x MMU %x, WV2 %x OUT %llx, AS0 %s\n",
++	    uj.state, uj.why, uj.wv_status, uj.wv_output, uj.iso_status, uj.iso_fault, uj.iso_addr, uj.iso_output,
++	    uj.stop_status, uj.mmu_after, uj.wv2_status, uj.wv2_output, uj.as0_ok ? "OK" : "FAIL");
++	if (!uj.as0_ok) {
++		kprintf("A04S GPU USER AS0 JOB: JS %x IRQ %x MMU %x GPU %x ASF %x@%x US %u\n", uj.as0.js_status, uj.as0.jirq,
++		    uj.as0.mirq, uj.as0.girq, uj.as0.as_fault, uj.as0.as_addr, uj.as0.us);
++	}
 +}
 +
 +static void
@@ -2677,9 +2745,6 @@ index 0000000..c7ea944
 +	    present_broken ? "OFF (FAULT)" : present_ready ? "ON" : "NOT READY", present_frames, present_fails,
 +	    present_last_us, present_frames ? (uint32_t)(present_total_us / present_frames) : 0, present_max_us,
 +	    present_remaps, slots[0].id, slots[0].pages, slots[1].id, slots[1].pages);
-+	kprintf("GPUUSER %s %s AS1 %s L3 %u WV %x OUT %llx US %u ISO %x FAULT %x@%x PRIV %llx AS0 %s JOBS %u FAULTS %u BUSY %u\n",
-+	    uj.state, uj.why, user_ready ? "UP" : "DOWN", uj.l3, uj.wv_status, uj.wv_output, uj.wv_us, uj.iso_status, uj.iso_fault,
-+	    uj.iso_addr, uj.iso_output, uj.as0_ok ? "OK" : "-", uj.jobs, uj.faults, present_busy);
 +	if (present_fails) {
 +		kprintf("GPUSCALE FAULT IRQ %x MMU %x GPU %x JS %x EXC %x ASF %x@%x GF %x@%x\n", present_fault.jirq,
 +		    present_fault.mirq, present_fault.girq, present_fault.js_status, present_fault.exc,
@@ -2699,6 +2764,12 @@ index 0000000..c7ea944
 +		    panel.r.as_addr, panel.r.gpu_fault, panel.r.gpu_faddr, panel.samples[0], panel.samples[1],
 +		    panel.samples[2], panel.samples[3], panel.samples[4]);
 +	}
++	kprintf("GPUUSER %s %s AS1 %s L3 %u WV %x OUT %llx ISO %x FAULT %x@%x PRIV %llx STOP %x MMU %x REC %u/%u WV2 %x "
++	    "AS0 %s JS %x MMU %x JOBS %u FAULTS %u BUSY %u\n",
++	    uj.state, uj.why, uj.broken ? "STUCK" : user_ready ? "UP" : "DOWN", uj.l3, uj.wv_status, uj.wv_output,
++	    uj.iso_status, uj.iso_fault, uj.iso_addr, uj.iso_output, uj.stop_status, uj.mmu_after, uj.recovers,
++	    uj.recover_fails, uj.wv2_status, uj.as0_ok ? "OK" : "-", uj.as0.js_status, uj.as0.mirq, uj.jobs, uj.faults,
++	    present_busy);
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_input.c b/bsd/dev/a04s_input.c
