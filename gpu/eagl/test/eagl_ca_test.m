@@ -5,6 +5,7 @@
 // (EAGL_DEFS=-DEAGL_INJECT gpu/eagl/build.sh): EAGL_INJECT_LIB=<path to its OpenGLES> ./eagl_ca_test
 // Exit status = failures; prints which image provides EAGLContext so a mix-up with the system library is visible.
 #import <Foundation/Foundation.h>
+#include <unistd.h>
 #import <QuartzCore/QuartzCore.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <IOSurface/IOSurfaceRef.h>
@@ -161,6 +162,8 @@ int main(void) {
     sigaction(SIGABRT, &sa, NULL);
     @autoreleasepool {
         const char *inj = getenv("EAGL_INJECT_LIB");       // injection build of the shim: patches the real EAGL classes at load
+        // Galaxy A04s port: its drop zone (tools/ios/a04s-drop.c) runs this with no environment of its own.
+        if (!inj && access("/private/var/a04s/lib/libheroeagl.dylib", F_OK) == 0) inj = "/private/var/a04s/lib/libheroeagl.dylib";
         if (inj && !(g_shim = dlopen(inj, RTLD_NOW))) { printf("FAIL  dlopen %s: %s\n", inj, dlerror()); return 1; }
         LOADGL(glGenFramebuffers); LOADGL(glBindFramebuffer); LOADGL(glGenRenderbuffers); LOADGL(glBindRenderbuffer);
         LOADGL(glRenderbufferStorage); LOADGL(glFramebufferRenderbuffer); LOADGL(glViewport); LOADGL(glClearColor);

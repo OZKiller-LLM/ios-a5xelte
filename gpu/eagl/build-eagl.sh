@@ -28,7 +28,7 @@ $CC $CF -fno-objc-arc -fobjc-exceptions -DEAGL_INJECT -c "$HERE/src/eagl.m" -o "
 $CC -dynamiclib -o "$OUT/lib/libheroeagl.dylib" "$OBJ"/{gl_stubs,gl_resolve,gl_unimpl,osm,macro_ctx,macro_slots,hero_log,hero_backboardd,hero_prof,eagl}.o \
   -install_name @rpath/libheroeagl.dylib \
   -framework Foundation -framework CoreFoundation -framework CoreGraphics -framework IOSurface \
-  -L "$OUT/lib" -lOSMesa.8 -Wl,-rpath,/private/var/herolte/lib -Wl,-undefined,error
+  -L "$OUT/lib" -lOSMesa.8 -Wl,-rpath,/private/var/herolte/lib -Wl,-rpath,/private/var/a04s/lib -Wl,-undefined,error
 
 # HakiOS's EAGL bridge (gpu/hakios-gl, MIT) as lib/libhakiosgl.dylib: its function table is generated from
 # the slot table, Mesa's gl.xml and what our libOSMesa exports; gl_hero.c puts it over our OSMesa.
@@ -42,7 +42,7 @@ $CC -O2 -g -Wall -c "$HG/src/ca_hooks.c" -o "$OBJ/hg_ca_hooks.o"
 $CC -dynamiclib -o "$OUT/lib/libhakiosgl.dylib" "$OBJ"/{hg_eagl,hg_gl_hero,hg_ca_hooks,hero_log,hero_backboardd,hero_prof}.o \
   -install_name @rpath/libhakiosgl.dylib \
   -framework CoreFoundation -framework IOKit -framework IOSurface -lobjc \
-  -L "$OUT/lib" -lOSMesa.8 -Wl,-rpath,/private/var/herolte/lib -Wl,-undefined,error
+  -L "$OUT/lib" -lOSMesa.8 -Wl,-rpath,/private/var/herolte/lib -Wl,-rpath,/private/var/a04s/lib -Wl,-undefined,error
 
 # The CoreAnimation test links the SDK's OpenGLES and QuartzCore; EAGL_INJECT_LIB names the shim.
 $CC -O1 -g -Wno-deprecated-declarations -fno-objc-arc -I"$HERE/src" "$HERE/test/eagl_ca_test.m" \
@@ -50,13 +50,13 @@ $CC -O1 -g -Wno-deprecated-declarations -fno-objc-arc -I"$HERE/src" "$HERE/test/
   -framework Foundation -framework CoreFoundation -framework CoreGraphics -framework IOSurface \
   -framework QuartzCore -framework OpenGLES
 $CC -O2 -Wall -o "$OUT/hero-run" "$HERE/test/hero-run.c" -L "$OUT/lib" -ldrm.2 -lobjc -framework Foundation \
-  -Wl,-rpath,/private/var/herolte/lib
+  -Wl,-rpath,/private/var/herolte/lib -Wl,-rpath,/private/var/a04s/lib
 
 $CC -O2 -Wall -dynamiclib -o "$OUT/lib/libherosb.dylib" "$HERE/src/herosb.c" -install_name @rpath/libherosb.dylib \
-  -framework CoreFoundation -lobjc -L "$OUT/lib" -ldrm.2 -Wl,-rpath,/private/var/herolte/lib
+  -framework CoreFoundation -lobjc -L "$OUT/lib" -ldrm.2 -Wl,-rpath,/private/var/herolte/lib -Wl,-rpath,/private/var/a04s/lib
 
 $CC -O2 -Wall -dynamiclib -o "$OUT/lib/libheroapp.dylib" "$HERE/src/heroapp.c" -install_name @rpath/libheroapp.dylib \
-  -framework Foundation -framework UIKit -framework CoreGraphics -lobjc -L "$OUT/lib" -ldrm.2 -Wl,-rpath,/private/var/herolte/lib
+  -framework Foundation -framework UIKit -framework CoreGraphics -lobjc -L "$OUT/lib" -ldrm.2 -Wl,-rpath,/private/var/herolte/lib -Wl,-rpath,/private/var/a04s/lib
 
 # The audio plug-in of mediaserverd, for hero-run to put in /System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver.
 mkdir -p "$OUT/audio"

@@ -12,6 +12,11 @@
 
 static void (*klog)(const char *fmt, ...);
 static int log_fd = -1;
+// Galaxy A04s port: its kernel log is only on screen, so on the A04s every line is also appended to
+// /private/var/mobile/Library/Logs/hero-<program>.log (backboardd runs as mobile), read from TWRP
+// with tools/hfs_read.py.
+static FILE *mirror;
+#define A04S_LIB "/private/var/a04s/lib"
 
 static void *pump(void *arg) {
     (void)arg;
@@ -27,6 +32,7 @@ static void *pump(void *arg) {
             if (c != '\n' && len < sizeof line - 1) { line[len++] = c; continue; }
             line[len] = 0;
             // herodrm_log() also prints its line to stderr: it is already in the kernel log.
+            if (len && mirror && sent <= max) { fprintf(mirror, "%s\n", line); fflush(mirror); }
             if (len && strncmp(line, "herodrm: ", 9) != 0) {
                 if (sent < max) klog("%s: %s", prog, line);
                 else if (sent == max) klog("%s: further stderr lines dropped (HERO_LOG_MAX %ld)", prog, max);
@@ -40,7 +46,7 @@ static void *pump(void *arg) {
 // Extra KEY=VALUE lines for the shim (debug and trace switches) from the drop zone, so they change without a new
 // kernel: the kernel only sets DYLD_INSERT_LIBRARIES and HERO_LOG_STDERR.
 static void load_gl_env(void) {
-    FILE *f = fopen("/private/var/herolte/gl.env", "r");
+    FILE *f = fopen(access(A04S_LIB, F_OK) == 0 ? "/private/var/a04s/gl.env" : "/private/var/herolte/gl.env", "r");
     char line[256];
     while (f && fgets(line, sizeof line, f)) {
         line[strcspn(line, "\r\n")] = 0;
@@ -63,6 +69,11 @@ __attribute__((constructor)) static void hero_log_init(void) {
     close(fds[1]);
     log_fd = fds[0];
     setvbuf(stderr, NULL, _IOLBF, 0);
+    if (access(A04S_LIB, F_OK) == 0) {
+        char path[256];
+        snprintf(path, sizeof path, "/private/var/mobile/Library/Logs/hero-%s.log", getprogname());
+        mirror = fopen(path, "a");
+    }
     pthread_t t;
     if (pthread_create(&t, NULL, pump, NULL) == 0) pthread_detach(t);
     klog("%s: EAGL shim loaded (pid %d), stderr -> kernel log", getprogname(), getpid());
