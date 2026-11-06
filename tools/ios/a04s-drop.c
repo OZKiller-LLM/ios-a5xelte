@@ -19,8 +19,15 @@
  * ".part" file, fsync and rename. A package is applied once (its ident is kept in drop.applied).
  * Then /private/var/a04s/autorun, if the package had one, runs with its output in autorun.log.
  * Lines go to /private/var/a04s/drop.log (readable from TWRP with hfs_read.py) and /dev/console.
+ *
+ * v2: the autorun's environment gets the KEY=VALUE lines of /private/var/a04s/autorun.env
+ * (a package can carry it). At every boot, the kernel's message buffer (IOLog and printf, as
+ * dmesg reads it; boot-arg msgbuf= sets its size, up to 1 MiB) is saved as dmesg-1.log ...
+ * dmesg-5.log at about 1, 2, 4, 8 and 15 minutes after the autorun, so the kernel's own lines can
+ * be read from TWRP too.
  */
 #include <CommonCrypto/CommonDigest.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <spawn.h>
@@ -47,6 +54,9 @@
 #define MAX_PATH_LEN    1023u
 #define CHUNK           (1u << 20)
 #define FLAG_EVERY_BOOT 1u
+#define AUTORUN_ENV     PREFIX "autorun.env"
+#define MAX_ENV_LINES   64u
+#define MSGBUF_MAX      (1u << 20)      /* bsd/sys/msgbuf.h MAX_MSG_BSIZE */
 
 extern char **environ;
 
@@ -188,7 +198,8 @@ path_ok(const char *p, size_t len)
 		}
 		s = e + 1;
 	}
-	static const char *const ours[] = { DROP_PATH, DROP_PATH ".part", APPLIED_PATH, LOG_PATH, AUTORUN_LOG };
+	static const char *const ours[] = { DROP_PATH, DROP_PATH ".part", APPLIED_PATH, LOG_PATH, AUTORUN_LOG,
+		PREFIX "dmesg-1.log", PREFIX "dmesg-2.log", PREFIX "dmesg-3.log", PREFIX "dmesg-4.log", PREFIX "dmesg-5.log" };
 	for (size_t i = 0; i < sizeof(ours) / sizeof(ours[0]); i++) {
 		size_t on = strlen(ours[i]);
 		if (strcmp(p, ours[i]) == 0 || (len > on && strncmp(p, ours[i], on) == 0 && p[on] == '/')) {
@@ -338,7 +349,7 @@ run_autorun(uint64_t ident)
 	while (environ && environ[n]) {
 		n++;
 	}
-	char **env = calloc(n + 2, sizeof(char *));
+	char **env = calloc(n + 2 + MAX_ENV_LINES, sizeof(char *));
 	if (env == NULL) {
 		posix_spawn_file_actions_destroy(&fa);
 		return;
@@ -346,12 +357,35 @@ run_autorun(uint64_t ident)
 	for (size_t i = 0; i < n; i++) {
 		env[i] = environ[i];
 	}
-	env[n] = id;
+	env[n++] = id;
+	/* v2: KEY=VALUE lines from autorun.env; '#' starts a comment line. */
+	char *extra[MAX_ENV_LINES];
+	unsigned nextra = 0;
+	FILE *ef = fopen(AUTORUN_ENV, "r");
+	char line[256];
+	while (ef && nextra < MAX_ENV_LINES && fgets(line, sizeof(line), ef)) {
+		line[strcspn(line, "\r\n")] = '\0';
+		char *eq = strchr(line, '=');
+		if (line[0] == '#' || eq == NULL || eq == line) {
+			continue;
+		}
+		extra[nextra] = strdup(line);
+		if (extra[nextra] != NULL) {
+			say("  autorun env %s", line);
+			env[n++] = extra[nextra++];
+		}
+	}
+	if (ef) {
+		fclose(ef);
+	}
 	char *argv[] = { (char *)AUTORUN_PATH, NULL };
 	pid_t pid;
 	int e = posix_spawn(&pid, AUTORUN_PATH, &fa, NULL, argv, env);
 	posix_spawn_file_actions_destroy(&fa);
 	free(env);
+	for (unsigned i = 0; i < nextra; i++) {
+		free(extra[i]);
+	}
 	if (e != 0) {
 		say("FAIL: autorun: %s", strerror(e));
 		return;
@@ -367,6 +401,37 @@ run_autorun(uint64_t ident)
 	}
 }
 
+/* v2: the kernel's message buffer into dmesg-N.log, through a .part file and rename. */
+static void
+save_dmesg(unsigned index)
+{
+	/* libproc's proc_kmsgbuf, as dmesg uses: looked up at run time, as the SDK doesn't declare it. */
+	int (*kmsgbuf)(void *, uint32_t) = (int (*)(void *, uint32_t))dlsym(RTLD_DEFAULT, "proc_kmsgbuf");
+	char *buf = kmsgbuf != NULL ? malloc(MSGBUF_MAX) : NULL;
+	if (buf == NULL) {
+		say("kernel log: %s", kmsgbuf != NULL ? "no memory" : "no proc_kmsgbuf");
+		return;
+	}
+	int got = kmsgbuf(buf, MSGBUF_MAX);
+	char path[64], part[72];
+	snprintf(path, sizeof(path), PREFIX "dmesg-%u.log", index);
+	snprintf(part, sizeof(part), "%s.part", path);
+	int fd = got > 0 ? open(part, O_WRONLY | O_CREAT | O_TRUNC, 0644) : -1;
+	int ok = fd >= 0 && full_write(fd, buf, (size_t)got) == 0 && fsync(fd) == 0;
+	if (fd >= 0) {
+		close(fd);
+	}
+	free(buf);
+	if (ok && rename(part, path) == 0) {
+		say("kernel log: %d bytes in %s", got, path);
+	} else {
+		unlink(part);
+		say("kernel log: not saved (%d bytes read)", got);
+	}
+}
+
+static int drop_main(void);
+
 int
 main(void)
 {
@@ -376,6 +441,21 @@ main(void)
 	}
 	log_fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
 	say("start, pid %d", getpid());
+	int rc = drop_main();
+	static const unsigned at_minutes[] = { 1, 2, 4, 8, 15 };
+	unsigned slept = 0;
+	for (unsigned i = 0; i < sizeof(at_minutes) / sizeof(at_minutes[0]); i++) {
+		sleep((at_minutes[i] - slept) * 60u);
+		slept = at_minutes[i];
+		save_dmesg(i + 1);
+	}
+	say("done");
+	return rc;
+}
+
+static int
+drop_main(void)
+{
 	int made = ensure_drop();
 	if (made != 0) {
 		return made < 0 ? 1 : 0;
@@ -444,6 +524,5 @@ main(void)
 	if (applied_now || (flags & FLAG_EVERY_BOOT)) {
 		run_autorun(ident);
 	}
-	say("done");
 	return 0;
 }
