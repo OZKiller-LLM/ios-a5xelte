@@ -483,10 +483,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..93e7c0c
+index 0000000..170ae21
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
-@@ -0,0 +1,2285 @@
+@@ -0,0 +1,2339 @@
 +/*
 + * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
 + *
@@ -1964,6 +1964,11 @@ index 0000000..93e7c0c
 + * v47: a faulting AS1 job is ended as Panfrost and kbase do (user_recover_locked()), and the
 + * self-test runs a second WRITE_VALUE in AS1 after the fault, so a pass also shows AS1 is usable
 + * again after a bad job. If the recovery itself fails, AS1 stays out of service until a reboot.
++ *
++ * v50 (7c-5b): the HeroGPU user client (iokit/Kernel/arm/HeroGPU.cpp) opens and closes through
++ * a04s_gpu_user_open()/a04s_gpu_user_close(). The first open brings AS1 and the cores up; the last
++ * close, once every user buffer's VA is back, powers the cores off again, unless the present path
++ * (sweetfb_gpu=1) is using them. Jobs the thermal limit refused are counted (HOT).
 + */
 +#define AS1                     (AS0 + 0x40u)
 +#define AS_TRANSTAB_UNMAPPED    0u                      /* ADRMODE 0: every access faults */
@@ -1991,6 +1996,7 @@ index 0000000..93e7c0c
 +
 +static vm_offset_t upt_va, utest_va;
 +static uint64_t user_used[USER_CHUNKS / 64u];
++static unsigned user_clients, user_chunks, user_opens, user_hot;  /* with a04s_gpu_mtx (v50) */
 +static uint16_t user_l3_of[512];
 +static unsigned user_l3_used;
 +static bool user_ready;
@@ -2099,6 +2105,7 @@ index 0000000..93e7c0c
 +			for (unsigned k = first; k <= c; k++) {
 +				user_used[k / 64u] |= 1ull << (k % 64u);
 +			}
++			user_chunks += n;
 +			return USER_VA_BASE + first * USER_CHUNK;
 +		}
 +	}
@@ -2114,7 +2121,10 @@ index 0000000..93e7c0c
 +	unsigned first = (unsigned)((va - USER_VA_BASE) / USER_CHUNK);
 +	unsigned count = (unsigned)(((uint64_t)pages * 0x1000u + USER_CHUNK - 1u) / USER_CHUNK);
 +	for (unsigned k = first; k < first + count && k < USER_CHUNKS; k++) {
-+		user_used[k / 64u] &= ~(1ull << (k % 64u));
++		if (user_used[k / 64u] & (1ull << (k % 64u))) {
++			user_used[k / 64u] &= ~(1ull << (k % 64u));
++			user_chunks--;
++		}
 +	}
 +}
 +
@@ -2255,6 +2265,42 @@ index 0000000..93e7c0c
 +	return ok;
 +}
 +
++/* v50: a HeroGPU client opens. AS1 and the cores come up with the first one. */
++bool a04s_gpu_user_open(void);
++bool
++a04s_gpu_user_open(void)
++{
++	if (job.state[0] != 'O' || job.state[1] != 'K') {
++		return false;
++	}
++	lck_mtx_lock(&a04s_gpu_mtx);
++	bool ok = user_up_locked();
++	if (ok) {
++		user_clients++;
++		user_opens++;
++	}
++	lck_mtx_unlock(&a04s_gpu_mtx);
++	return ok;
++}
++
++/* v50: a client that opened has gone. After the last one, with every user VA chunk given back,
++ * the cores go off (not while the present path uses them), and the next open starts AS1 afresh. */
++void a04s_gpu_user_close(void);
++void
++a04s_gpu_user_close(void)
++{
++	lck_mtx_lock(&a04s_gpu_mtx);
++	if (user_clients > 0) {
++		user_clients--;
++	}
++	if (user_clients == 0 && user_chunks == 0 && user_ready && !uj.broken &&
++	    !__atomic_load_n(&present_ready, __ATOMIC_ACQUIRE)) {
++		gpu_cores_off();
++		user_ready = false;
++	}
++	lck_mtx_unlock(&a04s_gpu_mtx);
++}
++
 +/* A GPU register (GPU_ID, *_PRESENT, *_FEATURES...), for GetParam; 0 outside the block or before. */
 +uint32_t a04s_gpu_reg(uint32_t off);
 +uint32_t
@@ -2312,6 +2358,9 @@ index 0000000..93e7c0c
 +		return 0xffffffffu;
 +	}
 +	if (!a04s_gpu_allowed()) {
++		lck_mtx_lock(&a04s_gpu_mtx);
++		user_hot++;
++		lck_mtx_unlock(&a04s_gpu_mtx);
 +		return 0xfffffffeu;
 +	}
 +	uint32_t fault = 0, faddr = 0, st = 0xffffffffu;
@@ -2370,6 +2419,10 @@ index 0000000..93e7c0c
 +	}
 +	uint64_t va = utest_va ? user_va_alloc_locked(UTEST_BYTES) : 0;
 +	if (va == 0 || !user_set_locked(va, pages, UTEST_PAGES)) {
++		if (va != 0) {
++			(void)user_set_locked(va, NULL, UTEST_PAGES);
++			user_va_free_locked(va, UTEST_PAGES);  /* v50: give the VA back, or the cores never go off */
++		}
 +		lck_mtx_unlock(&a04s_gpu_mtx);
 +		uj.state = "FAIL";
 +		uj.why = "MAP";
@@ -2765,11 +2818,12 @@ index 0000000..93e7c0c
 +		    panel.samples[2], panel.samples[3], panel.samples[4]);
 +	}
 +	kprintf("GPUUSER %s %s AS1 %s L3 %u WV %x OUT %llx ISO %x FAULT %x@%x PRIV %llx STOP %x MMU %x REC %u/%u WV2 %x "
-+	    "AS0 %s JS %x MMU %x JOBS %u FAULTS %u BUSY %u\n",
++	    "AS0 %s JS %x MMU %x JOBS %u FAULTS %u BUSY %u CLIENTS %u/%u VA %u HOT %u\n",
 +	    uj.state, uj.why, uj.broken ? "STUCK" : user_ready ? "UP" : "DOWN", uj.l3, uj.wv_status, uj.wv_output,
 +	    uj.iso_status, uj.iso_fault, uj.iso_addr, uj.iso_output, uj.stop_status, uj.mmu_after, uj.recovers,
 +	    uj.recover_fails, uj.wv2_status, uj.as0_ok ? "OK" : "-", uj.as0.js_status, uj.as0.mirq, uj.jobs, uj.faults,
-+	    present_busy);
++	    present_busy, __atomic_load_n(&user_clients, __ATOMIC_RELAXED), __atomic_load_n(&user_opens, __ATOMIC_RELAXED),
++	    __atomic_load_n(&user_chunks, __ATOMIC_RELAXED), __atomic_load_n(&user_hot, __ATOMIC_RELAXED));
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_input.c b/bsd/dev/a04s_input.c
@@ -6932,6 +6986,165 @@ index 0000000..e3b8eb3
 +
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
+diff --git a/iokit/Kernel/arm/HeroGPU.cpp b/iokit/Kernel/arm/HeroGPU.cpp
+index 3ba3cb8..d1f93be 100644
+--- a/iokit/Kernel/arm/HeroGPU.cpp
++++ b/iokit/Kernel/arm/HeroGPU.cpp
+@@ -28,7 +28,7 @@
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+-#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#if defined(ARM64_BOARD_CONFIG_HEROLTE) || defined(ARM64_BOARD_CONFIG_A04S)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOKitKeys.h>
+@@ -39,6 +39,37 @@
+ #include <sys/proc.h>
+ #include "SweetSurface.h"
+ 
++#if defined(ARM64_BOARD_CONFIG_A04S)
++/*
++ * 7c-5b: the Galaxy A04s's Mali-G52 MP1 (Bifrost, v7) through bsd/dev/a04s_gpu.c, with the same
++ * selectors, so gpu/mesa/herodrm.c serves both phones. User buffers live in their own GPU address
++ * space (AS1, GPU VA 0x40000000-0x80000000), apart from the panel and the kernel's GPU pages in
++ * AS0, and every page is checked to be RAM before it is mapped. Jobs run one at a time under the
++ * GPU lock, after the thermal limit, polled for at most 1 s; a faulting job fails alone and AS1 is
++ * recovered. The first client brings AS1 and the cores up; the last one, once its buffers are
++ * gone, powers the cores off (unless sweetfb_gpu=1 uses them). No IOAcceleratorES on this phone
++ * yet (heroaccel=1 adds it), so QuartzCore and Metal see nothing new.
++ */
++extern "C" {
++bool a04s_gpu_user_open(void);
++void a04s_gpu_user_close(void);
++uint32_t a04s_gpu_reg(uint32_t off);
++uint64_t a04s_gpu_user_va_alloc(uint64_t bytes);
++bool a04s_gpu_user_map(uint64_t va, const uint64_t *pages, unsigned n);
++void a04s_gpu_user_unmap(uint64_t va, unsigned n);
++uint32_t a04s_gpu_user_submit(unsigned js, uint64_t jc, uint64_t *us);
++}
++#define herolte_gpu_up          a04s_gpu_user_open
++#define herolte_gpu_down        a04s_gpu_user_close
++#define herolte_gpu_reg         a04s_gpu_reg
++#define herolte_gpu_va_alloc    a04s_gpu_user_va_alloc
++#define herolte_gpu_map         a04s_gpu_user_map
++#define herolte_gpu_unmap       a04s_gpu_user_unmap
++#define herolte_gpu_submit      a04s_gpu_user_submit
++#define HEROGPU_NAME            "Mali-G52 MP1"
++#define HEROGPU_ACCEL_DEFAULT   0
++#define HEROGPU_SELFTEST_MS     90000
++#else
+ extern "C" {
+ bool herolte_gpu_up(void);
+ uint32_t herolte_gpu_reg(uint32_t off);
+@@ -47,6 +78,14 @@ bool herolte_gpu_map(uint64_t va, const uint64_t *pages, unsigned n);
+ void herolte_gpu_unmap(uint64_t va, unsigned n);
+ uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
+ }
++static inline void
++herolte_gpu_down(void)
++{
++}
++#define HEROGPU_NAME            "Mali-T880 MP12"
++#define HEROGPU_ACCEL_DEFAULT   1
++#define HEROGPU_SELFTEST_MS     70000
++#endif
+ 
+ enum {
+ 	kHeroGPUGetParam = 0,
+@@ -107,10 +146,17 @@ herogpu_param(uint64_t param)
+ 		return id & 0xffff;
+ 	case 38:        /* NR_CORE_GROUPS: one L2 */
+ 		return 1;
++#if defined(ARM64_BOARD_CONFIG_A04S)
++	case 39:        /* THREAD_TLS_ALLOC: Bifrost v7 */
++		return herolte_gpu_reg(0x310);
++	case 40:        /* AFBC_FEATURES: Bifrost v7 */
++		return herolte_gpu_reg(0x04c);
++#else
+ 	case 39:        /* THREAD_TLS_ALLOC: none before v7 */
+ 		return 0;
+ 	case 40:        /* AFBC_FEATURES: v7+ only */
+ 		return 0;
++#endif
+ 	}
+ 	uint32_t reg = herogpu_param_reg(param);
+ 	return reg == ~0u ? 0 : herolte_gpu_reg(reg);
+@@ -280,6 +326,7 @@ class HeroGPUUserClient : public IOUserClient {
+ 	task_t             fTask;
+ 	IOLock            *fLock;
+ 	struct herogpu_bo *fBOs;          /* handle = index + 1 */
++	bool               fUp;           /* the GPU side was opened for this client */
+ 
+ public:
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+@@ -300,10 +347,10 @@ HeroGPU::start(IOService *provider)
+ 		return false;
+ 	}
+ 	setProperty(kIOUserClientClassKey, "HeroGPUUserClient");
+-	setProperty("GPU", "Mali-T880 MP12");
++	setProperty("GPU", HEROGPU_NAME);
+ 	registerService();
+ 	IOLog("HEROGPU: registered\n");
+-	int accel = 1;
++	int accel = HEROGPU_ACCEL_DEFAULT;
+ 	PE_parse_boot_argn("heroaccel", &accel, sizeof(accel));
+ 	if (accel) {
+ 		IOAcceleratorES *es = OSTypeAlloc(IOAcceleratorES);
+@@ -331,7 +378,8 @@ HeroGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
+ 	fTask = owningTask;
+ 	fLock = IOLockAlloc();
+ 	fBOs = (struct herogpu_bo *)IOMallocZeroData(HEROGPU_MAX_BOS * sizeof(*fBOs));
+-	return fLock != NULL && fBOs != NULL && herolte_gpu_up();
++	fUp = fLock != NULL && fBOs != NULL && herolte_gpu_up();
++	return fUp;
+ }
+ 
+ IOReturn
+@@ -351,6 +399,10 @@ HeroGPUUserClient::free(void)
+ 		IOFreeData(fBOs, HEROGPU_MAX_BOS * sizeof(*fBOs));
+ 		fBOs = NULL;
+ 	}
++	if (fUp) {
++		herolte_gpu_down();     /* after every buffer, so their GPU VA is back */
++		fUp = false;
++	}
+ 	if (fLock != NULL) {
+ 		IOLockFree(fLock);
+ 		fLock = NULL;
+@@ -499,7 +551,7 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ static void
+ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+ {
+-	IOSleep(70000);
++	IOSleep(HEROGPU_SELFTEST_MS);
+ 	if (!herolte_gpu_up()) {
+ 		IOLog("HEROGPU SELFTEST: GPU not up\n");
+ 		return;
+@@ -511,6 +563,7 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+ 	bzero(&bo, sizeof(bo));
+ 	if (!herogpu_bo_create(&bo, 0x10000)) {
+ 		IOLog("HEROGPU SELFTEST: buffer failed\n");
++		herolte_gpu_down();
+ 		return;
+ 	}
+ 	/* Through a write-combined kernel mapping, as a client would. */
+@@ -520,6 +573,7 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+ 	if (job == NULL) {
+ 		IOLog("HEROGPU SELFTEST: mapping failed\n");
+ 		herogpu_bo_free(&bo);
++		herolte_gpu_down();
+ 		return;
+ 	}
+ 	job[16] = 1 | (2 << 1);                         /* 64-bit, WRITE_VALUE */
+@@ -535,5 +589,6 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+ 	    bo.va, status, us, *output, status == 0 && *output == 0 ? "OK" : "FAILED");
+ 	map->release();
+ 	herogpu_bo_free(&bo);
++	herolte_gpu_down();
+ }
+-#endif /* ARM64_BOARD_CONFIG_HEROLTE */
++#endif /* ARM64_BOARD_CONFIG_HEROLTE || ARM64_BOARD_CONFIG_A04S */
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
 index 6d8a0fd..680d690 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
@@ -7578,10 +7791,10 @@ index 61aaef9..ccecb8e 100644
  	setProperty("SurfaceHeight", (unsigned long long)(121 << 16), 32);
  #else
 diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
-index d1099ff..f0ac7a5 100644
+index d1099ff..c4f9077 100644
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
-@@ -89,7 +89,7 @@ const char * gIOKernelConfigTables =
+@@ -89,14 +89,14 @@ const char * gIOKernelConfigTables =
      "     'IOProviderClass' = IOResources;"
      "     'IOMatchCategory' = SweetHIDTouch;"
      "   },"
@@ -7589,6 +7802,14 @@ index d1099ff..f0ac7a5 100644
 +#if !defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(ARM64_BOARD_CONFIG_HEROLTE) || defined(ARM64_BOARD_CONFIG_A04S)
      "   {"
      "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
+ #endif
+-#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#if defined(ARM64_BOARD_CONFIG_HEROLTE) || defined(ARM64_BOARD_CONFIG_A04S)
+     "   {"
+     "     'IOClass'         = HeroGPU;"
      "     'IOProviderClass' = IOResources;"
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 index 10449ab..20309cf 100644

@@ -1,15 +1,16 @@
 name: ios-tools
 
-# Programs for the S7's iOS userland (tools/ios/*.c), built with the
-# runner's iPhoneOS SDK for plain arm64 (the iPhone X userland has no
-# arm64e; the S7's cores have no pointer authentication) and ad-hoc
-# signed. They reach the phone through the kernel's USERDATA drop zone
-# (tools/herolte-drop.py). Nothing of Apple's is in the artifact.
+# Programs for the S7's and the A04s's iOS userland (tools/ios/*.c), built
+# with the runner's iPhoneOS SDK for plain arm64 (the iPhone X userland has
+# no arm64e; neither phone's cores have pointer authentication) and ad-hoc
+# signed. They reach the S7 through the kernel's USERDATA drop zone
+# (tools/herolte-drop.py), and the A04s in place of a file on its root
+# volume. Nothing of Apple's is in the artifact.
 
 on:
   workflow_dispatch:
   push:
-    branches: [herolte]
+    branches: [herolte, a04s]
     paths:
       - "tools/ios/**"
       - ".github/workflows/ios-tools.yml"
