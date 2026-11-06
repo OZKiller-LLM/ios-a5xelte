@@ -23,10 +23,13 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/fsctl.h>
 #include <sys/ioccom.h>
 #include <sys/mount.h>
+#include <sys/types.h>
 #include <unistd.h>
+
+/* libSystem's fsctl(2); declared here as <sys/fsctl.h> may not be in the iPhoneOS SDK. */
+int fsctl(const char *path, unsigned long request, void *data, unsigned int options);
 
 #define HFSIOC_RESIZE_VOLUME    _IOW('h', 2, u_int64_t)        /* hfs/core/hfs_fsctl.h */
 #define USERDATA_SECTORS        227672064ull                    /* bsd/dev/a04s_emmc_guard.h */

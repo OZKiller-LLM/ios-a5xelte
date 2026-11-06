@@ -27,9 +27,18 @@ jobs:
           mkdir -p out
           for src in tools/ios/*.c; do
             name=$(basename "$src" .c)
-            xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -isysroot "$sdk" \
+            log="$RUNNER_TEMP/$name.log"
+            if ! xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -isysroot "$sdk" \
               -O2 -Wall -Wextra -Wno-unused-parameter -o "out/$name" "$src" \
-              -framework IOKit -framework CoreFoundation
+              -framework IOKit -framework CoreFoundation 2> "$log"; then
+              cat "$log"
+              # Annotations can be read without signing in, unlike the log.
+              grep -E 'error|warning' "$log" | head -20 | while IFS= read -r line; do
+                echo "::error title=$name::$line"
+              done
+              exit 1
+            fi
+            cat "$log"
             codesign -s - -f "out/$name"
             file "out/$name"
           done
