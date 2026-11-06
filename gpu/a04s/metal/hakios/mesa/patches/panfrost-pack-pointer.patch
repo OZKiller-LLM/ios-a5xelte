@@ -1,0 +1,8 @@
+--- a/src/panfrost/lib/genxml/pan_pack_helpers.h
++++ b/src/panfrost/lib/genxml/pan_pack_helpers.h
+@@ -101 +101 @@
+-   pan_pack((PREFIX2(T, PACKED_T) *)dst, T, name)
++   pan_pack((PREFIX2(T, PACKED_T) *)(dst), T, name)
+@@ -104 +104 @@
+-   pan_pack_nodefaults((PREFIX2(T, PACKED_T) *)dst, T, name)
++   pan_pack_nodefaults((PREFIX2(T, PACKED_T) *)(dst), T, name)

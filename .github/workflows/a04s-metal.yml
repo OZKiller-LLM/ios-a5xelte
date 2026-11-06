@@ -1,0 +1,64 @@
+name: a04s-metal
+
+# Galaxy A04s, Metal track M1: the Metal shader path (AIR -> NIR -> Bifrost v7) and Panfrost's job
+# chains for the Mali-G52, checked under Mesa's drm-shim without the phone (gpu/a04s/metal). Only
+# Mesa, HakiOS's MIT code and this repository's are used; no Apple file.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [a04s-metal]
+    paths:
+      - "gpu/a04s/metal/**"
+      - ".github/workflows/a04s-metal.yml"
+
+concurrency:
+  group: a04s-metal-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build bison flex pkg-config python3-venv \
+            libdrm-dev zlib1g-dev llvm curl xz-utils
+      - name: Build Mesa and run the checks
+        run: |
+          set -o pipefail
+          bash gpu/a04s/metal/check.sh "$RUNNER_TEMP/a04s-metal" out 2>&1 | tee check.log
+      # Logs and artifacts need a GitHub sign-in; check-run annotations are public.
+      - name: Publish the results as annotations
+        if: always()
+        run: |
+          test -f check.log || exit 0
+          python3 - check.log out <<'PY'
+          import pathlib, re, sys
+          esc = lambda s: s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
+          lines = [re.sub(r'\x1b\[[0-9;]*m', '', l) for l in open(sys.argv[1], errors='replace').read().splitlines()]
+          keep = [l for l in lines if re.match(r'(== |Metal |GL|softpipe|a04s-metal-check|air2nir)', l)]
+          print('::notice title=a04s-metal summary::' + esc('\n'.join(keep)[:60000]))
+          out = pathlib.Path(sys.argv[2])
+          for p in sorted((out / 'air').glob('*.nir.txt'))[:6]:
+              print('::notice title=NIR ' + p.name + '::' + esc(p.read_text(errors='replace')[:20000]))
+          for name in ('meson-setup.log', 'ninja.log'):
+              p = out / name
+              if p.exists():
+                  t = [l for l in p.read_text(errors='replace').splitlines()
+                       if re.search(r'error|ERROR|FAILED|undefined reference|Assertion', l)]
+                  if t:
+                      print('::error title=' + name + '::' + esc('\n'.join(t[:40])[:30000]))
+          if any('FAIL' in l for l in keep) or not any('PASS' in l for l in keep):
+              print('::error title=check tail::' + esc('\n'.join(lines[-80:])[-30000:]))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: a04s-metal-check
+          path: |
+            out/
+            check.log

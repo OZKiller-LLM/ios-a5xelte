@@ -1,0 +1,237 @@
+--- a/meson.build
++++ b/meson.build
+@@ -1716,10 +1716,11 @@
+   # dependencies (such as vk-runtime) linking to it
+   dep_libdrm = null_dep
+ endif
+-if host_machine.system() == 'darwin' and with_gallium_freedreno
++if host_machine.system() == 'darwin' and (with_gallium_freedreno or with_gallium_panfrost)
+   # No DRM on this system: freedreno's requests go to the kernel's driver through a stand-in
+   # for libdrm (src/hakios-drm, put there by Darwin on redwood's tools/mk-mesa.sh; its one
+-  # source file is built with freedreno's drm layer, src/freedreno/drm).
++  # source file is built with freedreno's drm layer, src/freedreno/drm, or, without freedreno,
++  # with panfrost's, src/panfrost/lib/kmod), and so do panfrost's, to the Mali's.
+   dep_libdrm = declare_dependency(
+     include_directories : include_directories('src/hakios-drm'),
+     link_args : ['-framework', 'IOKit', '-framework', 'CoreFoundation'],
+--- a/src/gallium/drivers/panfrost/pan_bo.c
++++ b/src/gallium/drivers/panfrost/pan_bo.c
+@@ -355,10 +355,16 @@
+    if (!bo->ptr.cpu)
+       return;
+ 
++#ifdef __APPLE__
++   /* (mapped by the kernel's driver: pan_kmod.h, src/hakios-drm) */
++   hakios_drm_unmap(panfrost_device_fd(bo->dev), panfrost_bo_handle(bo),
++                    bo->ptr.cpu);
++#else
+    if (os_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {
+       mesa_loge("munmap failed: %s", strerror(errno));
+       abort();
+    }
++#endif
+ 
+    bo->ptr.cpu = NULL;
+ }
+@@ -483,6 +489,16 @@
+ 
+    pthread_mutex_lock(&dev->bo_map_lock);
+    ret = drmPrimeFDToHandle(dev->kmod.dev->fd, fd, &gem_handle);
++#ifdef __APPLE__
++   /* An IOSurface the kernel's driver could not make a buffer of (it ran
++    * out of handles or GPU addresses): no texture, rather than a buffer
++    * made of no handle. The window server then copies the surface instead.
++    */
++   if (ret) {
++      pthread_mutex_unlock(&dev->bo_map_lock);
++      return NULL;
++   }
++#endif
+    assert(!ret);
+ 
+    bo = pan_lookup_bo(dev, gem_handle);
+@@ -490,6 +506,13 @@
+    if (!bo->dev) {
+       bo->dev = dev;
+       bo->kmod_bo = pan_kmod_bo_import(dev->kmod.dev, fd, 0);
++#ifdef __APPLE__
++      if (!bo->kmod_bo) {
++         memset(bo, 0, sizeof(*bo));
++         pthread_mutex_unlock(&dev->bo_map_lock);
++         return NULL;
++      }
++#endif
+ 
+       struct pan_kmod_vm_op vm_op = {
+          .type = PAN_KMOD_VM_OP_TYPE_MAP,
+--- a/src/gallium/targets/osmesa/meson.build
++++ b/src/gallium/targets/osmesa/meson.build
+@@ -39,7 +39,7 @@
+   ],
+   dependencies : [
+     dep_ws2_32, dep_thread, dep_clock, dep_unwind, driver_swrast, idep_mesautil,
+-    driver_freedreno, idep_xmlconfig, dep_libdrm,
++    driver_freedreno, driver_panfrost, idep_xmlconfig, dep_libdrm,
+   ],
+   name_prefix : host_machine.system() == 'windows' ? '' : [],  # otherwise mingw will create libosmesa.dll
+   soversion : host_machine.system() == 'windows' ? '' : '8',
+--- a/src/gallium/targets/osmesa/osmesa_target.c
++++ b/src/gallium/targets/osmesa/osmesa_target.c
+@@ -30,22 +30,56 @@
+ #include "pipe/p_screen.h"
+ #include "pipe/p_state.h"
+ 
+-#ifdef GALLIUM_FREEDRENO
+-#include "freedreno/drm/freedreno_drm_public.h"
++#if defined(GALLIUM_FREEDRENO) || defined(GALLIUM_PANFROST)
++#define OSMESA_GPU
+ #include "util/driconf.h"
+ #include "util/xmlconfig.h"
+ #include <xf86drm.h>
+ 
+ static int gpu_fd = -1;
++#endif
+ 
++#ifdef GALLIUM_FREEDRENO
++#include "freedreno/drm/freedreno_drm_public.h"
++
+ static const driOptionDescription freedreno_options[] = {
+ #include "freedreno/driinfo_freedreno.h"
+ };
++#endif
+ 
+-/* The GPU's driver, where the kernel has a GPU to drive (Darwin on redwood); NULL: none. */
++#ifdef GALLIUM_PANFROST
++#include "panfrost/drm/panfrost_drm_public.h"
++
++static const driOptionDescription panfrost_options[] = {
++#include "panfrost/driinfo_panfrost.h"
++};
++#endif
++
++#ifdef OSMESA_GPU
++/*
++ * The GPU's driver, where the kernel has a GPU to drive (Darwin on redwood); NULL: none. Which
++ * GPU, the kernel's service says: src/hakios-drm opens the one of the Linux driver asked for,
++ * HakiosGPU for msm (the Adreno, freedreno's) or HakiosMali for panfrost (the Mali's).
++ */
+ static struct pipe_screen *
+ osmesa_create_gpu_screen(void)
+ {
++   static const struct {
++      const char *name;
++      const driOptionDescription *options;
++      unsigned count;
++      struct pipe_screen *(*create)(int fd, struct renderonly *ro,
++                                    const struct pipe_screen_config *config);
++   } drivers[] = {
++#ifdef GALLIUM_FREEDRENO
++      { "msm", freedreno_options, ARRAY_SIZE(freedreno_options),
++        fd_drm_screen_create_renderonly },
++#endif
++#ifdef GALLIUM_PANFROST
++      { "panfrost", panfrost_options, ARRAY_SIZE(panfrost_options),
++        panfrost_drm_screen_create_renderonly },
++#endif
++   };
+    static driOptionCache info, cache;
+    static struct pipe_screen_config config;
+    struct pipe_screen *screen;
+@@ -53,17 +87,20 @@
+ 
+    if (debug_get_bool_option("OSMESA_SOFTWARE", false))
+       return NULL;
+-   fd = drmOpenWithType("msm", NULL, DRM_NODE_RENDER);
+-   if (fd < 0)
+-      return NULL;
+-   driParseOptionInfo(&info, freedreno_options, ARRAY_SIZE(freedreno_options));
+-   driParseConfigFiles(&cache, &info, 0, "msm", NULL, NULL, NULL, 0, NULL, 0);
+-   config.options = &cache;
+-   config.options_info = &info;
+-   screen = fd_drm_screen_create_renderonly(fd, NULL, &config);
+-   if (screen)
+-      gpu_fd = fd;
+-   return screen ? debug_screen_wrap(screen) : NULL;
++   for (unsigned i = 0; i < ARRAY_SIZE(drivers); i++) {
++      fd = drmOpenWithType(drivers[i].name, NULL, DRM_NODE_RENDER);
++      if (fd < 0)
++         continue;
++      driParseOptionInfo(&info, drivers[i].options, drivers[i].count);
++      driParseConfigFiles(&cache, &info, 0, drivers[i].name, NULL, NULL, NULL, 0, NULL, 0);
++      config.options = &cache;
++      config.options_info = &info;
++      screen = drivers[i].create(fd, NULL, &config);
++      if (screen)
++         gpu_fd = fd;
++      return screen ? debug_screen_wrap(screen) : NULL;
++   }
++   return NULL;
+ }
+ #endif
+ 
+@@ -79,7 +116,7 @@
+ struct pipe_resource *
+ osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface)
+ {
+-#ifdef GALLIUM_FREEDRENO
++#ifdef OSMESA_GPU
+    struct hakios_drm_surface s = { .surface = surface };
+    struct pipe_resource templ = {
+       .target = PIPE_TEXTURE_2D,
+@@ -118,7 +155,7 @@
+    struct sw_winsys *winsys;
+    struct pipe_screen *screen;
+ 
+-#ifdef GALLIUM_FREEDRENO
++#ifdef OSMESA_GPU
+    screen = osmesa_create_gpu_screen();
+    if (screen)
+       return screen;
+--- a/src/panfrost/lib/kmod/meson.build
++++ b/src/panfrost/lib/kmod/meson.build
+@@ -6,6 +6,10 @@
+   'panfrost_kmod.c',
+   'panthor_kmod.c',
+ )
++if host_machine.system() == 'darwin' and not with_gallium_freedreno
++  # the stand-in for libdrm (src/hakios-drm), which freedreno's drm layer carries when it is built
++  libpankmod_lib_files += files('../../../hakios-drm/hakios.drm.c')
++endif
+ 
+ libpankmod_lib = static_library(
+   'pankmod_lib',
+--- a/src/panfrost/lib/kmod/pan_kmod.c
++++ b/src/panfrost/lib/kmod/pan_kmod.c
+@@ -176,7 +176,13 @@
+ 
+       p_atomic_inc(&bo->refcnt);
+    } else {
++#ifdef __APPLE__
++      /* (what comes in here is an IOSurface, and the "file descriptor" its ID) */
++      struct hakios_drm_surface surface = { .surface = fd };
++      size_t size = hakios_drm_surface(dev->fd, &surface) ? 0 : surface.size;
++#else
+       size_t size = lseek(fd, 0, SEEK_END);
++#endif
+       if (size == 0 || size == (size_t)-1) {
+          mesa_loge("invalid dmabuf size");
+          goto err_close_handle;
+--- a/src/panfrost/lib/kmod/pan_kmod.h
++++ b/src/panfrost/lib/kmod/pan_kmod.h
+@@ -615,8 +615,16 @@
+    if (mmap_offset < 0)
+       return MAP_FAILED;
+ 
++#ifdef __APPLE__
++   /* no mmap() on a device here: the kernel's driver maps the buffer, all of
++    * it (src/hakios-drm), which is what panfrost asks for (pan_bo.c) */
++   host_addr = bo_offset == 0 && size == bo->size
++                  ? hakios_drm_map(bo->dev->fd, bo->handle, size)
++                  : MAP_FAILED;
++#else
+    host_addr = os_mmap(host_addr, size, prot, flags, bo->dev->fd,
+                        mmap_offset + bo_offset);
++#endif
+    if (host_addr == MAP_FAILED) {
+       mesa_loge("mmap(..., size=%zu, prot=%d, flags=0x%x) failed: %s",
+                 size, prot, flags, strerror(errno));
