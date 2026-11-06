@@ -4122,10 +4122,10 @@ index 0000000..ac6bfa6
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_power.c b/bsd/dev/a04s_power.c
 new file mode 100644
-index 0000000..870d666
+index 0000000..0ac4db4
 --- /dev/null
 +++ b/bsd/dev/a04s_power.c
-@@ -0,0 +1,1754 @@
+@@ -0,0 +1,1847 @@
 +/*
 + * Galaxy A04s: the battery (fuel gauge), and read-only first looks at the speaker amp and the audio
 + * power domain.
@@ -4756,6 +4756,14 @@ index 0000000..870d666
 + *    wire_cool3_current 448). REG04 only ever gets S-Boot's own value or one of those four, so
 + *    never more than 2112 mA, Android's own value for a wall adapter. A PC port (SDP) keeps S-Boot's
 + *    value: 500 mA is the USB 2.0 limit, and Android uses it too.
++ *  - REG02, HVDCP_EN (bit 3), v48, with a04shvdcp=1 (and a04schgfast=1, a04safc=1): the charger's own
++ *    HVDCP handshake, which a Samsung brick needs before it listens for AFC (Samsung's driver starts
++ *    AFC only once the SY6970 reports VBUS_STAT HVDCP). With it the chip may also ask a QC brick for
++ *    a higher voltage, and HV_TYPE (bit 2) picks 9 V (0) or 12 V (1), so REG02 is written only if
++ *    S-Boot left HV_TYPE at 0 (and HVDCP_EN, CONV_START and FORCE_DPDM at 0), and only ever gets
++ *    S-Boot's own value or that value with HVDCP_EN set: 9 V at most, Android's own maximum.
++ *    CONV_START (bit 7) is read-only and reads 1 during a conversion in continuous mode, so REG02 is
++ *    compared without it (chg_mask()).
 + * Nothing raises the input limit, the charge voltage or anything else, turns on OTG boost (REG03
 + * bit 5), or resets the watchdog (bit 6). Writes are refused, and stay off for the rest of the boot,
 + * if:
@@ -4763,15 +4771,16 @@ index 0000000..870d666
 + *  - a value isn't one of the allowed ones (chg_value_allowed());
 + *  - the charger's watchdog is on (REG07 bits 5-4 not 0). A write puts the chip in host mode, and
 + *    an expiring watchdog would then reset every register to its defaults, 2048 mA among them;
++ *  - the register isn't REG03, REG04 or REG02;
 + *  - the register holds a value that isn't allowed just before the write (someone else changed it);
 + *  - after the write, it doesn't read back as written, or any of IINLIM, REG03, ICHG, IPRECHG/
-+ *    ITERM, VREG and REG07 other than it differ from their values read just before it.
-+ * When writes go off with REG04 raised, one write puts S-Boot's REG04 back first.
++ *    ITERM, VREG, REG07 and REG02 other than it differ from their values read just before it.
++ * When writes go off with REG04 raised, or HVDCP on, one write each puts S-Boot's value back first.
 + *
-+ * chg_send() is the only code that sends an I2C data byte. It is built only into a04s_chg_write03()
-+ * and a04s_chg_write04(), which each send one fixed register number, and only a04s_chg_checked()
-+ * and chgw_refuse() (REG04 back to S-Boot's value) call those. They stay separate functions
-+ * (noinline), so tools/check_kernel_charger.py can check them in the built kernel.
++ * chg_send() is the only code that sends an I2C data byte. It is built only into a04s_chg_write03(),
++ * a04s_chg_write04() and a04s_chg_write02(), which each send one fixed register number, and only
++ * a04s_chg_checked() and chgw_refuse() (S-Boot's REG04 and REG02 back) call those. They stay
++ * separate functions (noinline), so tools/check_kernel_charger.py can check them in the built kernel.
 + */
 +#define CHG_CFG_CHG             (1u << 4)       /* CHG_CONFIG */
 +#define CHG_CFG_OTG             (1u << 5)       /* OTG_CONFIG */
@@ -4783,12 +4792,16 @@ index 0000000..870d666
 +#define CHG_VBUS_DCP            3u
 +#define CHG_STAT_PG             (1u << 2)
 +#define CHG_REG_IPRE_ITERM      0x05u
-+#define CHG_KEEP_N              6u
++#define CHG_KEEP_N              7u
++#define CHG_ADC_HVDCP           (1u << 3)       /* REG02 HVDCP_EN */
++#define CHG_ADC_HVTYPE          (1u << 2)       /* REG02 HV_TYPE: 0 = 9 V, 1 = 12 V */
++#define CHG_ADC_CONV_START      (1u << 7)       /* REG02, read-only in continuous mode */
++#define CHG_ADC_FORCE_DPDM      (1u << 1)       /* REG02, clears itself */
 +
 +/* Samsung's wired steps in REG04 codes: 448, 832, 1280 and 2112 mA. */
 +static const uint8_t ichg_steps[CHG_ICHG_STEPS] = { 7, 13, 20, 33 };
 +static const uint8_t chg_keep[CHG_KEEP_N] = { CHG_REG_IINLIM, CHG_REG_CFG, CHG_REG_ICHG, CHG_REG_IPRE_ITERM,
-+	                                      CHG_REG_VREG, CHG_REG_TIMER };
++	                                      CHG_REG_VREG, CHG_REG_TIMER, CHG_REG_ADC };
 +
 +static struct {
 +	const char *why;                        /* why writes went off, or "-" */
@@ -4796,9 +4809,12 @@ index 0000000..870d666
 +	uint8_t ichg_code;                      /* REG04's ICHG as last written, 0 before the first */
 +	uint8_t vbus;                           /* VBUS_STAT at the last sample */
 +	uint8_t status, reg03, reg04, reg13;    /* REG0B, REG03, REG04, REG13 as read each sample (v46) */
++	uint8_t reg02;                          /* REG02 as read each sample (v48) */
 +	unsigned writes, stops, resumes, failures, ichg_changes;
 +	unsigned test_phase, test_at;
 +	bool stopped, disabled;
++	bool hvdcp_on, hvdcp_tried;             /* v48: REG02 HVDCP_EN written, and tried this boot */
++	bool ov_latched;                        /* v48: stopped for over-voltage; cleared on unplug */
 +} chgw = { .why = "-" };
 +
 +/* START, 0x6a + W, register reg, one data byte, STOP. Built only into the two writers below. */
@@ -4863,6 +4879,20 @@ index 0000000..870d666
 +	return chg_send(CHG_REG_ICHG, value);
 +}
 +
++/* REG02 (HVDCP_EN), v48. With a04s_i2c_mtx held. */
++static bool __attribute__((noinline))
++a04s_chg_write02(uint8_t value)
++{
++	return chg_send(CHG_REG_ADC, value);
++}
++
++/* The bits of reg that are compared: all but REG02's read-only CONV_START. */
++static uint8_t
++chg_mask(uint8_t reg)
++{
++	return reg == CHG_REG_ADC ? (uint8_t)~CHG_ADC_CONV_START : (uint8_t)0xffu;
++}
++
 +/* Whether reg may hold value: the only values these writes can ever send. */
 +static bool
 +chg_value_allowed(uint8_t reg, uint8_t value)
@@ -4886,6 +4916,13 @@ index 0000000..870d666
 +			}
 +		}
 +	}
++	if (reg == CHG_REG_ADC) {
++		uint8_t orig = chg.regs[CHG_REG_ADC];
++		if ((orig & (CHG_ADC_HVDCP | CHG_ADC_HVTYPE | CHG_ADC_CONV_START | CHG_ADC_FORCE_DPDM)) != 0) {
++			return false;
++		}
++		return value == orig || value == (uint8_t)(orig | CHG_ADC_HVDCP);
++	}
 +	return false;
 +}
 +
@@ -4901,13 +4938,23 @@ index 0000000..870d666
 +		kprintf("A04S CHGSAFE ICHG BACK TO S-BOOT'S %u MA: %s\n", (orig4 & CHG_ICHG_MASK) * 64u,
 +		    back ? "SENT" : "NOT SENT");
 +	}
++	uint8_t orig2 = chg.regs[CHG_REG_ADC];
++	if (chgw.hvdcp_on) {
++		bool back2 = a04s_chg_write02(orig2);
++		chgw.hvdcp_on = !back2;
++		kprintf("A04S CHGSAFE REG02 BACK TO S-BOOT'S %02x (HVDCP OFF): %s\n", orig2, back2 ? "SENT" : "NOT SENT");
++	}
 +}
 +
-+/* One allowed value into REG03 or REG04, with every check above. With a04s_i2c_mtx held. */
++/* One allowed value into REG03, REG04 or REG02, with every check above. With a04s_i2c_mtx held. */
 +static bool __attribute__((noinline))
 +a04s_chg_checked(uint8_t reg, uint8_t value)
 +{
 +	if (chgw.disabled || !chg.started) {
++		return false;
++	}
++	if (reg != CHG_REG_CFG && reg != CHG_REG_ICHG && reg != CHG_REG_ADC) {
++		chgw_refuse("REGISTER NOT ALLOWED");
 +		return false;
 +	}
 +	uint8_t orig = chg.regs[CHG_REG_CFG];
@@ -4929,6 +4976,7 @@ index 0000000..870d666
 +		chgw.failures++;                /* the bus: tried again on the next sample */
 +		return false;
 +	}
++	now = (uint8_t)(now & chg_mask(reg));
 +	if (reg == CHG_REG_CFG) {
 +		chgw.now = now;
 +	}
@@ -4943,14 +4991,15 @@ index 0000000..870d666
 +	if (now == value) {
 +		return true;
 +	}
-+	bool sent = reg == CHG_REG_CFG ? a04s_chg_write03(value) : a04s_chg_write04(value);
++	bool sent = reg == CHG_REG_CFG ? a04s_chg_write03(value) : reg == CHG_REG_ICHG ? a04s_chg_write04(value) :
++	    a04s_chg_write02(value);
 +	if (!sent) {
 +		chgw.failures++;
 +		return false;
 +	}
 +	chgw.writes++;
 +	uint8_t back = 0;
-+	if (!chg_reg(reg, &back) || back != value) {
++	if (!chg_reg(reg, &back) || (back & chg_mask(reg)) != value) {
 +		if (reg == CHG_REG_CFG) {
 +			chgw.now = back;
 +		}
@@ -4962,7 +5011,8 @@ index 0000000..870d666
 +	}
 +	for (unsigned i = 0; i < CHG_KEEP_N; i++) {
 +		uint8_t after = 0;
-+		if (chg_keep[i] != reg && (!chg_reg(chg_keep[i], &after) || after != before[i])) {
++		uint8_t m = chg_mask(chg_keep[i]);
++		if (chg_keep[i] != reg && (!chg_reg(chg_keep[i], &after) || (after & m) != (before[i] & m))) {
 +			chgw_refuse("OTHER REGISTER CHANGED");
 +			return false;
 +		}
@@ -4988,6 +5038,22 @@ index 0000000..870d666
 +		return false;
 +	}
 +	chgw.ichg_code = (uint8_t)(code & CHG_ICHG_MASK);
++	return true;
++}
++
++/* REG02 with HVDCP_EN on (S-Boot's value with HVDCP_EN) or off (S-Boot's value), v48. With a04s_i2c_mtx
++ * held. */
++static bool __attribute__((noinline))
++a04s_chg_hvdcp(bool on)
++{
++	uint8_t value = on ? (uint8_t)(chg.regs[CHG_REG_ADC] | CHG_ADC_HVDCP) : chg.regs[CHG_REG_ADC];
++	if (on && !chg_value_allowed(CHG_REG_ADC, value)) {
++		return false;           /* S-Boot's REG02 isn't one HVDCP may be turned on from: left alone */
++	}
++	if (!a04s_chg_checked(CHG_REG_ADC, value)) {
++		return false;
++	}
++	chgw.hvdcp_on = on;
 +	return true;
 +}
 +
@@ -5205,10 +5271,12 @@ index 0000000..870d666
 + * bank and is never touched). A pin is used only if S-Boot left it as a GPIO input or output.
 + * The switch is always put back to 0 (D- to USB) after an exchange.
 + *
-+ * The charger's REG02 is not written: with HVDCP_EN = 1 the SY6970 asks a QC brick for a higher
-+ * voltage by itself, and HV_TYPE's power-on value is 12 V (the SY6970 datasheet); S-Boot leaves
-+ * HVDCP off and v46 keeps it off. The only voltage asked for is AFC's 9 V, Android's own maximum
-+ * (battery,max_input_voltage 9000 mV).
++ * v46 got no answer from a Samsung brick: the brick listens for AFC only after the charger's own
++ * HVDCP handshake, which S-Boot leaves off (REG02 HVDCP_EN 0). v48 turns it on with a04shvdcp=1
++ * (a04s_chg_hvdcp(), only with S-Boot's HV_TYPE 0 = 9 V). The chip may then ask a QC brick for 9 V
++ * itself, without AFC. Every voltage asked for is 9 V at most, Android's own maximum
++ * (battery,max_input_voltage 9000 mV). Over-voltage is checked before the pins, every sample, and
++ * also turns HVDCP off.
 + *
 + * One exchange (UI 160 us, MPING 16 UI, DATA_DELAY 8 UI, SYNC UI/4), with interrupts off for each
 + * phase (at most about 7 ms): MPING; the brick's SPING (the line high again within MPING); the
@@ -5507,23 +5575,28 @@ index 0000000..870d666
 +		afc.why = "a04safc=0";
 +		return;
 +	}
-+	if (!afc_check()) {
-+		afc.state = AFC_OFF;
-+		return;
-+	}
 +	if (pg && afc_vbus_mv() >= VBUS_MAX_MV && afc.state != AFC_AT_9V) {
 +		afc.over++;
 +		lck_mtx_lock(&a04s_i2c_mtx);
 +		bool stopped = a04s_chg_set(false);
++		bool hv_off = !chgw.hvdcp_on || a04s_chg_hvdcp(false);
++		chgw.ov_latched = true;
 +		lck_mtx_unlock(&a04s_i2c_mtx);
 +		if (stopped) {
 +			chgw.stopped = true;
 +			chgw.stops++;
 +		}
-+		kprintf("A04S AFC VBUS %u MV OVER %u WITHOUT A REQUEST: CHARGING %s\n", afc.mv, VBUS_MAX_MV,
-+		    stopped ? "STOPPED" : "NOT STOPPED");
++		kprintf("A04S AFC VBUS %u MV OVER %u WITHOUT A REQUEST: CHARGING %s, HVDCP %s\n", afc.mv, VBUS_MAX_MV,
++		    stopped ? "STOPPED" : "NOT STOPPED", hv_off ? "OFF" : "STILL ON");
 +		afc.state = AFC_NO_ANSWER;
 +		afc.why = "OVER VOLTAGE";
++		return;
++	}
++	if (!pg) {
++		chgw.ov_latched = false;
++	}
++	if (!afc_check()) {
++		afc.state = AFC_OFF;
 +		return;
 +	}
 +	if (!pg) {
@@ -5543,13 +5616,15 @@ index 0000000..870d666
 +			afc.over++;
 +			lck_mtx_lock(&a04s_i2c_mtx);
 +			bool stopped = a04s_chg_set(false);
++			bool hv_off = !chgw.hvdcp_on || a04s_chg_hvdcp(false);
++			chgw.ov_latched = true;
 +			lck_mtx_unlock(&a04s_i2c_mtx);
 +			if (stopped) {
 +				chgw.stopped = true;
 +				chgw.stops++;
 +			}
-+			kprintf("A04S AFC VBUS %u MV OVER %u: CHARGING %s, BACK TO 5 V\n", mv, VBUS_MAX_MV,
-+			    stopped ? "STOPPED" : "NOT STOPPED");
++			kprintf("A04S AFC VBUS %u MV OVER %u: CHARGING %s, HVDCP %s, BACK TO 5 V\n", mv, VBUS_MAX_MV,
++			    stopped ? "STOPPED" : "NOT STOPPED", hv_off ? "OFF" : "STILL ON");
 +			(void)afc_request(5u);
 +			afc.state = AFC_AT_5V;
 +			afc.why = "OVER VOLTAGE";
@@ -5610,6 +5685,9 @@ index 0000000..870d666
 + *
 + * v46: REG03, REG04, the status (REG0B) and the input limit status (REG13) are read every sample for
 + * the report, and AFC (afc_sample()) runs after, without the I2C lock.
++ *
++ * v48: REG02 is read too, and with a04shvdcp=1 HVDCP_EN is set once (a04s_chg_hvdcp()). Charging
++ * stopped for over-voltage doesn't start again until the cable is unplugged (ov_latched).
 + */
 +#define CHGTEST_SAMPLES         30u             /* 60 s at one sample every 2 s */
 +#define ICHG_HYST_DC            20
@@ -5618,7 +5696,9 @@ index 0000000..870d666
 +static void
 +chg_safety(int safe, bool lost)
 +{
-+	unsigned arm = 0, test = 0, fast = 0;
++	unsigned arm = 0, test = 0, fast = 0, hv = 0, afc_on = 0;
++	(void)PE_parse_boot_argn("a04shvdcp", &hv, sizeof(hv));
++	(void)PE_parse_boot_argn("a04safc", &afc_on, sizeof(afc_on));
 +	(void)PE_parse_boot_argn("a04schgsafe", &arm, sizeof(arm));
 +	(void)PE_parse_boot_argn("a04schgtest", &test, sizeof(test));
 +	(void)PE_parse_boot_argn("a04schgfast", &fast, sizeof(fast));
@@ -5653,7 +5733,7 @@ index 0000000..870d666
 +			chgw.stops++;
 +			kprintf("A04S CHGSAFE CHARGING STOPPED: %s AT %d (REG03 %02x)\n", reason, adc.temp_dc, chgw.now);
 +		}
-+	} else if (resume && chgw.stopped) {
++	} else if (resume && chgw.stopped && !chgw.ov_latched) {
 +		if (a04s_chg_set(true)) {
 +			chgw.stopped = false;
 +			chgw.resumes++;
@@ -5671,6 +5751,7 @@ index 0000000..870d666
 +		(void)chg_reg(CHG_REG_CFG, &chgw.reg03);
 +		(void)chg_reg(CHG_REG_ICHG, &chgw.reg04);
 +		(void)chg_reg(CHG_REG_IDPM, &chgw.reg13);
++		(void)chg_reg(CHG_REG_ADC, &chgw.reg02);
 +	}
 +	if (chg.started && !chgw.disabled) {
 +		unsigned orig = chg.regs[CHG_REG_ICHG] & CHG_ICHG_MASK;
@@ -5690,6 +5771,17 @@ index 0000000..870d666
 +				    want == orig ? "S-BOOT'S" : "SAMSUNG'S WIRED STEP");
 +			}
 +		}
++	}
++	/* v48: the charger's own HVDCP handshake, once a boot, with a trusted reading at SAFE OK. It takes
++	 * effect at the next plug-in (AUTO_DPDM_EN). AFC's sample watches VBUS for over-voltage, so it
++	 * needs a04safc=1 too. */
++	if (hv == 1 && fast == 1 && afc_on == 1 && chg.started && !chgw.disabled && !chgw.hvdcp_tried && !lost &&
++	    adc.trusted && safe == SAFE_OK && !chgw.stopped) {
++		chgw.hvdcp_tried = true;
++		bool on = a04s_chg_hvdcp(true);
++		(void)chg_reg(CHG_REG_ADC, &chgw.reg02);
++		kprintf("A04S CHGSAFE HVDCP %s: REG02 %02x, 9 V AT MOST, FROM THE NEXT PLUG-IN\n", on ? "ON" : "NOT ON",
++		    chgw.reg02);
 +	}
 +	lck_mtx_unlock(&a04s_i2c_mtx);
 +	if (fast == 1) {
@@ -5850,9 +5942,10 @@ index 0000000..870d666
 +		    chg.regs[CHG_REG_CFG], chgw.now, chgw.writes, chgw.stops, chgw.resumes, chgw.failures, test, chgw.test_phase);
 +		kprintf("CHGSAFE ICHG %u MA (S-BOOT %u) FAST %u VBUS %u CHANGES %u\n",
 +		    chgw.ichg_code ? chgw.ichg_code * 64u : ichg_sboot, ichg_sboot, fast, chgw.vbus, chgw.ichg_changes);
-+		kprintf("CHGSAFE NOW REG03 %02x REG04 %02x STAT %02x REG13 %02x (VDPM %u IDPM %u) THERM %u\n",
++		kprintf("CHGSAFE NOW REG03 %02x REG04 %02x STAT %02x REG13 %02x (VDPM %u IDPM %u) THERM %u REG02 %02x HVDCP %s%s\n",
 +		    chgw.reg03, chgw.reg04, chgw.status, chgw.reg13, (chgw.reg13 >> 7) & 1u, (chgw.reg13 >> 6) & 1u,
-+		    (chg.batv >> 7) & 1u);             /* THERM_STAT, REG0E bit 7 */
++		    (chg.batv >> 7) & 1u,              /* THERM_STAT, REG0E bit 7 */
++		    chgw.reg02, chgw.hvdcp_on ? "ON" : chgw.hvdcp_tried ? "TRIED" : "OFF", chgw.ov_latched ? " OV" : "");
 +		kprintf("AFC %s %s VBUS %u MV (MAX %u) TRIES %u NACKS %u ANSWERS %u 9V %u BACK %u OVER %u PINS %x/%x %x/%x %x/%x\n",
 +		    afc_names[afc.state], afc.why, afc.mv, afc.max_mv, afc.tries, afc.nacks, afc.answers, afc.ok9, afc.back5,
 +		    afc.over, afc.con_was[0], afc.dat_was[0], afc.con_was[1], afc.dat_was[1], afc.con_was[2], afc.dat_was[2]);
