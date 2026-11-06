@@ -6873,6 +6873,57 @@ index 9ad7fd6..1c812db 100644
  }
 +#endif /* A04S */
  #endif /* ARM64_BOARD_CONFIG_A5XELTE */
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 5e1f965..ca35c7c 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -12,8 +12,11 @@
+  * EAGL_SHIM_DEBUG=1), the dylib must exist, and only the first two
+  * launches of a boot get it: if backboardd dies twice, the next one is
+  * stock, so a broken shim costs two restarts and no more.
++ *
++ * v52 (Galaxy A04s, 7c-6b): built for the A04S too, with the libraries in its drop zone,
++ * /private/var/a04s/lib (tools/ios/a04s-drop.c). Same boot-args and the same two-launch limit.
+  */
+-#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#if defined(ARM64_BOARD_CONFIG_HEROLTE) || defined(ARM64_BOARD_CONFIG_A04S)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/vnode.h>
+@@ -24,11 +27,16 @@
+ int herolte_gl_env(const char *path, int pid, const char **extra, int max);
+ uint64_t herolte_gl_dyld_flags(void);
+ 
++#if defined(ARM64_BOARD_CONFIG_A04S)
++#define HGL_LIB_DIR     "/private/var/a04s/lib/"
++#else
++#define HGL_LIB_DIR     "/private/var/herolte/lib/"
++#endif
+ #define HGL_TARGET      "/usr/libexec/backboardd"
+-#define HGL_SHIM        "/private/var/herolte/lib/libheroeagl.dylib"
++#define HGL_SHIM        HGL_LIB_DIR "libheroeagl.dylib"
+ #define HGL_MAX_LAUNCHES 2
+ #define HGL_SB_TARGET   "/System/Library/CoreServices/SpringBoard.app/SpringBoard"
+-#define HGL_SB_LIB      "/private/var/herolte/lib/libherosb.dylib"
++#define HGL_SB_LIB      HGL_LIB_DIR "libherosb.dylib"
+ 
+ /*
+  * dyld only honours DYLD_* variables when AMFI allows them
+@@ -49,7 +57,7 @@ static int hgl_launches;
+ static int hgl_pid = -1;        /* the backboardd that got the shim */
+ static int hgl_sb_pid = -1;     /* the SpringBoard that got libherosb */
+ static int hgl_sb_launches;
+-#define HGL_APP_LIB     "/private/var/herolte/lib/libheroapp.dylib"
++#define HGL_APP_LIB     HGL_LIB_DIR "libheroapp.dylib"
+ #define HGL_APP_PIDS    64
+ static int hgl_app_pids[HGL_APP_PIDS];  /* the latest applications that got libheroapp */
+ static unsigned hgl_app_next;
+@@ -185,4 +193,4 @@ herolte_gl_env(const char *path, int pid, const char **extra, int max)
+ 	    launch, hgl_pid, hgl_mode);
+ 	return n;
+ }
+-#endif /* ARM64_BOARD_CONFIG_HEROLTE */
++#endif /* ARM64_BOARD_CONFIG_HEROLTE || ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
 index 37b738a..21bded5 100644
 --- a/bsd/kern/bsd_init.c
@@ -6902,9 +6953,18 @@ index 37b738a..21bded5 100644
  #if CONFIG_NETBOOT
  	if (netboot) {
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 62f690d..ddafd29 100644
+index 62f690d..f71329d 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
+@@ -5751,7 +5751,7 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
+-#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#if defined(ARM64_BOARD_CONFIG_HEROLTE) || defined(ARM64_BOARD_CONFIG_A04S)
+ 	/* bsd/dev/herolte_gl.c: the EAGL shim for backboardd (boot-arg herogl). */
+ 	{
+ 		extern int herolte_gl_env(const char *path, int pid, const char **extra, int max);
 @@ -6964,6 +6964,9 @@ load_init_program(proc_t p)
  		printf("load_init_program: attempting to load %s\n", init_programs[i]);
  		error = load_init_program_at_path(p, (user_addr_t)scratch_addr, init_programs[i]);
@@ -6915,6 +6975,28 @@ index 62f690d..ddafd29 100644
  			return;
  		} else if (error != ENOENT) {
  			printf("load_init_program: failed loading %s: errno %d\n", init_programs[i], error);
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 10e01a9..8364b13 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -368,7 +368,7 @@ static struct mac_policy_conf sweet_amfi_mac_conf = {
+ 
+ static mac_policy_handle_t sweet_amfi_mac_handle;
+ 
+-#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#if defined(ARM64_BOARD_CONFIG_HEROLTE) || defined(ARM64_BOARD_CONFIG_A04S)
+ /*
+  * Policy "AMFI": dyld's amfi_check_dyld_policy_self() is
+  * __mac_syscall("AMFI", 90, &{ u64 input flags, u64 *output flags }).
+@@ -433,7 +433,7 @@ sweet_amfi_policy_register(void)
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
+-#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#if defined(ARM64_BOARD_CONFIG_HEROLTE) || defined(ARM64_BOARD_CONFIG_A04S)
+ 	error = mac_policy_register(&sweet_amfi_dyld_mac_conf, &sweet_amfi_dyld_mac_handle, NULL);
+ 	printf("SWEET AMFI: dyld policy %s (%d)\n", error ? "NOT registered" : "registered", error);
+ #endif
 diff --git a/config/MASTER.arm64.a04s b/config/MASTER.arm64.a04s
 new file mode 100644
 index 0000000..e3b8eb3
