@@ -4122,10 +4122,10 @@ index 0000000..ac6bfa6
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_power.c b/bsd/dev/a04s_power.c
 new file mode 100644
-index 0000000..0ac4db4
+index 0000000..34e90b4
 --- /dev/null
 +++ b/bsd/dev/a04s_power.c
-@@ -0,0 +1,1847 @@
+@@ -0,0 +1,1909 @@
 +/*
 + * Galaxy A04s: the battery (fuel gauge), and read-only first looks at the speaker amp and the audio
 + * power domain.
@@ -4764,6 +4764,12 @@ index 0000000..0ac4db4
 + *    S-Boot's own value or that value with HVDCP_EN set: 9 V at most, Android's own maximum.
 + *    CONV_START (bit 7) is read-only and reads 1 during a conversion in continuous mode, so REG02 is
 + *    compared without it (chg_mask()).
++ *    v49: FORCE_DPDM (bit 1) as well, as Samsung's driver does: once right after HVDCP_EN, so the
++ *    chip detects the brick again at once, and again (at most CHG_DPDM_RETRIES a plug-in) when it
++ *    reports an unknown adapter (VBUS_STAT 101). The value sent is S-Boot's with HVDCP_EN and
++ *    FORCE_DPDM, nothing else, and only while HVDCP is on. FORCE_DPDM clears itself when detection
++ *    is done, so it's left out of every comparison too (chg_mask()), and a detection sets IINLIM
++ *    itself, so IINLIM isn't compared around that one write. HV_TYPE stays 0 (9 V), unlike Samsung's 1.
 + * Nothing raises the input limit, the charge voltage or anything else, turns on OTG boost (REG03
 + * bit 5), or resets the watchdog (bit 6). Writes are refused, and stay off for the rest of the boot,
 + * if:
@@ -4797,6 +4803,8 @@ index 0000000..0ac4db4
 +#define CHG_ADC_HVTYPE          (1u << 2)       /* REG02 HV_TYPE: 0 = 9 V, 1 = 12 V */
 +#define CHG_ADC_CONV_START      (1u << 7)       /* REG02, read-only in continuous mode */
 +#define CHG_ADC_FORCE_DPDM      (1u << 1)       /* REG02, clears itself */
++#define CHG_DPDM_RETRIES        3u              /* v49: reruns a plug-in for an unknown adapter */
++#define CHG_VBUS_UNKNOWN        5u              /* VBUS_STAT 101 */
 +
 +/* Samsung's wired steps in REG04 codes: 448, 832, 1280 and 2112 mA. */
 +static const uint8_t ichg_steps[CHG_ICHG_STEPS] = { 7, 13, 20, 33 };
@@ -4815,6 +4823,7 @@ index 0000000..0ac4db4
 +	bool stopped, disabled;
 +	bool hvdcp_on, hvdcp_tried;             /* v48: REG02 HVDCP_EN written, and tried this boot */
 +	bool ov_latched;                        /* v48: stopped for over-voltage; cleared on unplug */
++	unsigned dpdm_sent, dpdm_retries;       /* v49: FORCE_DPDM writes this boot, and reruns this plug-in */
 +} chgw = { .why = "-" };
 +
 +/* START, 0x6a + W, register reg, one data byte, STOP. Built only into the two writers below. */
@@ -4886,11 +4895,11 @@ index 0000000..0ac4db4
 +	return chg_send(CHG_REG_ADC, value);
 +}
 +
-+/* The bits of reg that are compared: all but REG02's read-only CONV_START. */
++/* The bits of reg that are compared: all but REG02's read-only CONV_START and self-clearing FORCE_DPDM. */
 +static uint8_t
 +chg_mask(uint8_t reg)
 +{
-+	return reg == CHG_REG_ADC ? (uint8_t)~CHG_ADC_CONV_START : (uint8_t)0xffu;
++	return reg == CHG_REG_ADC ? (uint8_t)~(CHG_ADC_CONV_START | CHG_ADC_FORCE_DPDM) : (uint8_t)0xffu;
 +}
 +
 +/* Whether reg may hold value: the only values these writes can ever send. */
@@ -4921,7 +4930,8 @@ index 0000000..0ac4db4
 +		if ((orig & (CHG_ADC_HVDCP | CHG_ADC_HVTYPE | CHG_ADC_CONV_START | CHG_ADC_FORCE_DPDM)) != 0) {
 +			return false;
 +		}
-+		return value == orig || value == (uint8_t)(orig | CHG_ADC_HVDCP);
++		return value == orig || value == (uint8_t)(orig | CHG_ADC_HVDCP) ||
++		    value == (uint8_t)(orig | CHG_ADC_HVDCP | CHG_ADC_FORCE_DPDM);
 +	}
 +	return false;
 +}
@@ -4999,7 +5009,8 @@ index 0000000..0ac4db4
 +	}
 +	chgw.writes++;
 +	uint8_t back = 0;
-+	if (!chg_reg(reg, &back) || (back & chg_mask(reg)) != value) {
++	bool dpdm = reg == CHG_REG_ADC && (value & CHG_ADC_FORCE_DPDM) != 0;
++	if (!chg_reg(reg, &back) || (back & chg_mask(reg)) != (value & chg_mask(reg))) {
 +		if (reg == CHG_REG_CFG) {
 +			chgw.now = back;
 +		}
@@ -5012,6 +5023,9 @@ index 0000000..0ac4db4
 +	for (unsigned i = 0; i < CHG_KEEP_N; i++) {
 +		uint8_t after = 0;
 +		uint8_t m = chg_mask(chg_keep[i]);
++		if (dpdm && chg_keep[i] == CHG_REG_IINLIM) {
++			continue;       /* v49: a detection sets IINLIM itself */
++		}
 +		if (chg_keep[i] != reg && (!chg_reg(chg_keep[i], &after) || (after & m) != (before[i] & m))) {
 +			chgw_refuse("OTHER REGISTER CHANGED");
 +			return false;
@@ -5054,6 +5068,22 @@ index 0000000..0ac4db4
 +		return false;
 +	}
 +	chgw.hvdcp_on = on;
++	return true;
++}
++
++/* REG02 with HVDCP_EN and FORCE_DPDM (S-Boot's value with both), v49: the chip detects the brick again.
++ * Only while HVDCP is on. With a04s_i2c_mtx held. */
++static bool __attribute__((noinline))
++a04s_chg_dpdm(void)
++{
++	if (!chgw.hvdcp_on) {
++		return false;
++	}
++	uint8_t value = (uint8_t)(chg.regs[CHG_REG_ADC] | CHG_ADC_HVDCP | CHG_ADC_FORCE_DPDM);
++	if (!a04s_chg_checked(CHG_REG_ADC, value)) {
++		return false;
++	}
++	chgw.dpdm_sent++;
 +	return true;
 +}
 +
@@ -5335,6 +5365,7 @@ index 0000000..0ac4db4
 +	uint32_t con_was[AFC_PINS], dat_was[AFC_PINS];
 +	unsigned seen, tries, nacks, answers, ok9, back5, over, mv, max_mv;
 +	bool checked, usable;
++	bool hv_try;                            /* v49: a try made with VBUS_STAT HVDCP this plug-in */
 +} afc = { .state = AFC_IDLE, .why = "-" };
 +
 +/* XNU's delay() takes an int; the AFC times are unsigned. */
@@ -5406,6 +5437,7 @@ index 0000000..0ac4db4
 +	afc.usable = true;
 +	afc_pin(AFC_PIN_SWITCH, PIN_LOW);       /* D- to USB, as Samsung's probe leaves it */
 +	afc_pin(AFC_PIN_DATA, PIN_LOW);
++	afc_pin(AFC_PIN_HVDCP, PIN_LOW);        /* v49: driven low too, as Samsung's probe does (afc_dpdm_ctrl(0)) */
 +	return true;
 +}
 +
@@ -5564,9 +5596,12 @@ index 0000000..0ac4db4
 +}
 +
 +/* Every sample, from chg_safety() after the ICHG step, without the I2C lock. pg: the charger's power
-+ * good. wall: power good on a wall adapter (VBUS_STAT DCP, or HVDCP should the chip report it). */
++ * good. wall: power good on a wall adapter (VBUS_STAT DCP, or HVDCP should the chip report it).
++ * hv (v49): power good with VBUS_STAT HVDCP. Samsung starts AFC only then, so once the chip reports
++ * HVDCP, a try that already failed on a plain DCP this plug-in is made once more, in Samsung's order
++ * (hvdcp pin high, 1.2 s, then the 9 V request). */
 +static void
-+afc_sample(int safe, bool lost, bool pg, bool wall)
++afc_sample(int safe, bool lost, bool pg, bool wall, bool hv)
 +{
 +	unsigned want = 0;
 +	(void)PE_parse_boot_argn("a04safc", &want, sizeof(want));
@@ -5607,7 +5642,13 @@ index 0000000..0ac4db4
 +			afc.why = "UNPLUGGED";
 +		}
 +		afc.seen = 0;
++		afc.hv_try = false;
 +		return;
++	}
++	if (hv && !afc.hv_try && afc.state == AFC_NO_ANSWER && !chgw.ov_latched) {
++		afc.state = AFC_WAIT;   /* v49: HVDCP reported after a DCP try: once more, Samsung's way */
++		afc.why = "HVDCP";
++		afc.seen = 0;
 +	}
 +	bool may = wall && safe == SAFE_OK && !lost && adc.trusted && !chgw.stopped && !chgw.disabled;
 +	if (afc.state == AFC_AT_9V) {
@@ -5653,6 +5694,7 @@ index 0000000..0ac4db4
 +		afc.why = "SETTLING";
 +		return;
 +	}
++	afc.hv_try = afc.hv_try || hv;
 +	afc_pin(AFC_PIN_HVDCP, PIN_HIGH);
 +	IOSleep(1200);
 +	unsigned level = afc_request(9u);
@@ -5688,6 +5730,10 @@ index 0000000..0ac4db4
 + *
 + * v48: REG02 is read too, and with a04shvdcp=1 HVDCP_EN is set once (a04s_chg_hvdcp()). Charging
 + * stopped for over-voltage doesn't start again until the cable is unplugged (ov_latched).
++ *
++ * v49: HVDCP goes on only once the AFC pins are driven low, and is followed at once by one
++ * FORCE_DPDM (a04s_chg_dpdm()). An unknown adapter (VBUS_STAT 101) gets up to CHG_DPDM_RETRIES more a
++ * plug-in, as in Samsung's driver.
 + */
 +#define CHGTEST_SAMPLES         30u             /* 60 s at one sample every 2 s */
 +#define ICHG_HYST_DC            20
@@ -5725,7 +5771,10 @@ index 0000000..0ac4db4
 +			}
 +		}
 +	}
-+	bool pg = false, wall = false;
++	bool pg = false, wall = false, hvs = false;
++	/* v49: the three AFC pins are driven low (hvdcp included, as Samsung's probe does) before HVDCP
++	 * goes on, so the D+/D- path isn't left floating during the chip's detection. */
++	bool pins = fast == 1 && afc_on == 1 && afc_check();
 +	lck_mtx_lock(&a04s_i2c_mtx);
 +	if (stop && !chgw.stopped) {
 +		if (a04s_chg_set(false)) {
@@ -5747,6 +5796,10 @@ index 0000000..0ac4db4
 +			chgw.vbus = (uint8_t)((st >> 5) & 7u);
 +			pg = (st & CHG_STAT_PG) != 0;
 +			wall = pg && (chgw.vbus == CHG_VBUS_DCP || chgw.vbus == CHG_VBUS_HVDCP);
++			hvs = pg && chgw.vbus == CHG_VBUS_HVDCP;
++			if (!pg) {
++				chgw.dpdm_retries = 0;
++			}
 +		}
 +		(void)chg_reg(CHG_REG_CFG, &chgw.reg03);
 +		(void)chg_reg(CHG_REG_ICHG, &chgw.reg04);
@@ -5775,17 +5828,24 @@ index 0000000..0ac4db4
 +	/* v48: the charger's own HVDCP handshake, once a boot, with a trusted reading at SAFE OK. It takes
 +	 * effect at the next plug-in (AUTO_DPDM_EN). AFC's sample watches VBUS for over-voltage, so it
 +	 * needs a04safc=1 too. */
-+	if (hv == 1 && fast == 1 && afc_on == 1 && chg.started && !chgw.disabled && !chgw.hvdcp_tried && !lost &&
++	if (hv == 1 && pins && chg.started && !chgw.disabled && !chgw.hvdcp_tried && !lost &&
 +	    adc.trusted && safe == SAFE_OK && !chgw.stopped) {
 +		chgw.hvdcp_tried = true;
 +		bool on = a04s_chg_hvdcp(true);
++		bool rerun = on && a04s_chg_dpdm();     /* v49: detect again at once, as Samsung's init does */
 +		(void)chg_reg(CHG_REG_ADC, &chgw.reg02);
-+		kprintf("A04S CHGSAFE HVDCP %s: REG02 %02x, 9 V AT MOST, FROM THE NEXT PLUG-IN\n", on ? "ON" : "NOT ON",
-+		    chgw.reg02);
++		kprintf("A04S CHGSAFE HVDCP %s: REG02 %02x, 9 V AT MOST, DETECTION %s\n", on ? "ON" : "NOT ON",
++		    chgw.reg02, rerun ? "RERUN" : "NOT RERUN");
++	} else if (chgw.hvdcp_on && !chgw.disabled && pg && chgw.vbus == CHG_VBUS_UNKNOWN &&
++	    chgw.dpdm_retries < CHG_DPDM_RETRIES) {
++		chgw.dpdm_retries++;                    /* v49: Samsung's "BC1.2 retry" for an unknown adapter */
++		bool rerun = a04s_chg_dpdm();
++		kprintf("A04S CHGSAFE UNKNOWN ADAPTER (STAT %02x): DETECTION %s, %u OF %u\n", chgw.status,
++		    rerun ? "RERUN" : "NOT RERUN", chgw.dpdm_retries, CHG_DPDM_RETRIES);
 +	}
 +	lck_mtx_unlock(&a04s_i2c_mtx);
 +	if (fast == 1) {
-+		afc_sample(safe, lost, pg, wall);
++		afc_sample(safe, lost, pg, wall, hvs);
 +	}
 +}
 +
@@ -5942,13 +6002,15 @@ index 0000000..0ac4db4
 +		    chg.regs[CHG_REG_CFG], chgw.now, chgw.writes, chgw.stops, chgw.resumes, chgw.failures, test, chgw.test_phase);
 +		kprintf("CHGSAFE ICHG %u MA (S-BOOT %u) FAST %u VBUS %u CHANGES %u\n",
 +		    chgw.ichg_code ? chgw.ichg_code * 64u : ichg_sboot, ichg_sboot, fast, chgw.vbus, chgw.ichg_changes);
-+		kprintf("CHGSAFE NOW REG03 %02x REG04 %02x STAT %02x REG13 %02x (VDPM %u IDPM %u) THERM %u REG02 %02x HVDCP %s%s\n",
++		kprintf("CHGSAFE NOW REG03 %02x REG04 %02x STAT %02x REG13 %02x (VDPM %u IDPM %u) THERM %u REG02 %02x HVDCP %s%s DPDM %u/%u\n",
 +		    chgw.reg03, chgw.reg04, chgw.status, chgw.reg13, (chgw.reg13 >> 7) & 1u, (chgw.reg13 >> 6) & 1u,
 +		    (chg.batv >> 7) & 1u,              /* THERM_STAT, REG0E bit 7 */
-+		    chgw.reg02, chgw.hvdcp_on ? "ON" : chgw.hvdcp_tried ? "TRIED" : "OFF", chgw.ov_latched ? " OV" : "");
-+		kprintf("AFC %s %s VBUS %u MV (MAX %u) TRIES %u NACKS %u ANSWERS %u 9V %u BACK %u OVER %u PINS %x/%x %x/%x %x/%x\n",
++		    chgw.reg02, chgw.hvdcp_on ? "ON" : chgw.hvdcp_tried ? "TRIED" : "OFF", chgw.ov_latched ? " OV" : "",
++		    chgw.dpdm_sent, chgw.dpdm_retries);
++		kprintf("AFC %s %s VBUS %u MV (MAX %u) TRIES %u NACKS %u ANSWERS %u 9V %u BACK %u OVER %u PINS %x/%x %x/%x %x/%x HVTRY %u\n",
 +		    afc_names[afc.state], afc.why, afc.mv, afc.max_mv, afc.tries, afc.nacks, afc.answers, afc.ok9, afc.back5,
-+		    afc.over, afc.con_was[0], afc.dat_was[0], afc.con_was[1], afc.dat_was[1], afc.con_was[2], afc.dat_was[2]);
++		    afc.over, afc.con_was[0], afc.dat_was[0], afc.con_was[1], afc.dat_was[1], afc.con_was[2], afc.dat_was[2],
++		    afc.hv_try ? 1u : 0u);
 +	}
 +	static const char *const vbus_names[8] = { "NONE", "SDP", "CDP", "DCP", "HVDCP", "ADAPTER", "NONSTD", "OTG" };
 +	static const char *const chrg_names[4] = { "NOT", "PRE", "FAST", "DONE" };
