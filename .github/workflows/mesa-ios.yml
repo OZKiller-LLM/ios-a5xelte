@@ -1,14 +1,14 @@
 name: mesa-ios
 
-# Mesa's Panfrost (Mali-T880, Midgard) inside OSMesa for the S7's iOS
-# userland, over the HeroGPU libdrm stand-in (gpu/mesa). The artifact holds
+# Mesa's Panfrost inside OSMesa for the S7's (Mali-T880, Midgard) and the
+# A04s's (Mali-G52, Bifrost) iOS userland, over the HeroGPU libdrm stand-in (gpu/mesa). The artifact holds
 # the dylibs and osmesa-test; they reach the phone through the USERDATA
 # drop zone (tools/herolte-drop.py). Nothing of Apple's is in it.
 
 on:
   workflow_dispatch:
   push:
-    branches: [herolte]
+    branches: [herolte, a04s]
     paths:
       - "gpu/mesa/**"
       - "gpu/eagl/**"

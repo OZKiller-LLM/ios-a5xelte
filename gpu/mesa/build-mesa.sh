@@ -104,7 +104,7 @@ for lib in "$OUT"/lib/*.dylib; do
 done
 
 $CC_IOS -O2 -Wall -I mesa/include -o "$OUT/osmesa-test" "$HERE/osmesa-test.c" \
-  -L "$OUT/lib" -lOSMesa.8 -ldrm.2 -Wl,-rpath,/private/var/herolte/lib
+  -L "$OUT/lib" -lOSMesa.8 -ldrm.2 -Wl,-rpath,/private/var/herolte/lib -Wl,-rpath,/private/var/a04s/lib
 
 for f in "$OUT"/lib/*.dylib "$OUT/osmesa-test"; do
   codesign -s - -f "$f"

@@ -206,7 +206,7 @@ drmGetVersion(int fd)
    v->name_len = 8;
    v->date = strdup("20251025");
    v->date_len = 8;
-   v->desc = strdup("HeroGPU Mali-T880 (Galaxy S7)");
+   v->desc = strdup("HeroGPU Mali (Galaxy S7 T880, Galaxy A04s G52)");
    v->desc_len = (int)strlen(v->desc);
    return v;
 }

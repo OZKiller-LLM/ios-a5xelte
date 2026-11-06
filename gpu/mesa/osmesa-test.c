@@ -5,7 +5,8 @@
  * log through the libdrm stand-in (herodrm_log), like herogpu-test.
  *
  * It runs as the drop zone's autorun, with the Mesa dylibs next to it in
- * /private/var/herolte/lib (rpath). HERO_GPU=0 compares with softpipe.
+ * /private/var/herolte/lib on the S7 or /private/var/a04s/lib on the A04s
+ * (rpath). HERO_GPU=0 compares with softpipe.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +20,14 @@ void herodrm_log(const char *fmt, ...);
 
 #define W 256
 #define H 256
-#define ERR_PATH "/private/var/herolte/osmesa-test.err"
+/* Next to the dylibs: the S7 drop zone, or the A04s one (tools/ios/a04s-drop.c). */
+static const char *
+err_path(void)
+{
+   return access("/private/var/a04s/lib", F_OK) == 0 ? "/private/var/a04s/osmesa-test.err"
+                                                    : "/private/var/herolte/osmesa-test.err";
+}
+#define ERR_PATH err_path()
 
 typedef void (*PFN_V)(void);
 typedef void (*PFN_E)(unsigned);
