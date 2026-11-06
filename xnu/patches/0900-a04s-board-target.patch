@@ -483,10 +483,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..170ae21
+index 0000000..71e3802
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
-@@ -0,0 +1,2339 @@
+@@ -0,0 +1,2391 @@
 +/*
 + * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
 + *
@@ -1997,6 +1997,49 @@ index 0000000..170ae21
 +static vm_offset_t upt_va, utest_va;
 +static uint64_t user_used[USER_CHUNKS / 64u];
 +static unsigned user_clients, user_chunks, user_opens, user_hot;  /* with a04s_gpu_mtx (v50) */
++
++/*
++ * v51: a GPU test's verdict line is kept and repeated in every heartbeat ("GPUNOTE ..."), so any
++ * later photo of the console shows it. Slot 0: a client's "A04S GPU TEST PASS/FAIL ..." line
++ * (HeroGPU's Log call); slot 1: HeroGPU's own "HEROGPU SELFTEST ..." outcome. The first line in
++ * each slot is kept for the rest of the boot. Bytes outside printable ASCII become '?'. No lock:
++ * the slot is claimed once, and the heartbeat reads the text only after its length is published.
++ */
++#define GPU_NOTE_MAX    160u
++static struct {
++	char text[GPU_NOTE_MAX];
++	uint32_t len;
++	uint32_t claimed;
++} gpu_notes[2];
++static const char *const gpu_note_prefix[2] = { "A04S GPU TEST ", "HEROGPU SELFTEST" };
++
++void a04s_gpu_note(unsigned slot, const char *s, size_t n);
++void
++a04s_gpu_note(unsigned slot, const char *s, size_t n)
++{
++	if (slot >= 2u || s == NULL) {
++		return;
++	}
++	size_t pn = strlen(gpu_note_prefix[slot]);
++	if (n < pn || memcmp(s, gpu_note_prefix[slot], pn) != 0) {
++		return;
++	}
++	uint32_t unclaimed = 0;
++	if (!__atomic_compare_exchange_n(&gpu_notes[slot].claimed, &unclaimed, 1u, false, __ATOMIC_ACQ_REL,
++	    __ATOMIC_RELAXED)) {
++		return;
++	}
++	uint32_t k = 0;
++	for (size_t i = 0; i < n && k < GPU_NOTE_MAX - 1u; i++) {
++		char c = s[i];
++		if (c == '\0' || c == '\n') {
++			break;
++		}
++		gpu_notes[slot].text[k++] = (c >= 0x20 && c < 0x7f) ? c : '?';
++	}
++	gpu_notes[slot].text[k] = '\0';
++	__atomic_store_n(&gpu_notes[slot].len, k, __ATOMIC_RELEASE);
++}
 +static uint16_t user_l3_of[512];
 +static unsigned user_l3_used;
 +static bool user_ready;
@@ -2233,8 +2276,11 @@ index 0000000..170ae21
 +	}
 +	*us = us_since(start);
 +	uint32_t st = io_rd(gpu_va, slot + JS_STATUS);
-+	*fault = io_rd(gpu_va, AS1 + AS_FAULTSTATUS);
-+	*faddr = io_rd(gpu_va, AS1 + AS_FAULTADDR_LO);
++	/* AS_FAULTSTATUS and FAULTADDR keep the last fault until the next one (v50 counted a clean job
++	 * after a bad one as a fault): only this job's own AS1 fault counts (v51). */
++	bool as1_fault = (mirq & AS1_FAULT_BITS) != 0;
++	*fault = as1_fault ? io_rd(gpu_va, AS1 + AS_FAULTSTATUS) : 0;
++	*faddr = as1_fault ? io_rd(gpu_va, AS1 + AS_FAULTADDR_LO) : 0;
 +	bool answered = (jirq & (done | failed)) || mirq || (girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT));
 +	if ((st & 0xffu) == JS_ACTIVE || mirq) {
 +		(void)user_recover_locked(slot);
@@ -2824,6 +2870,12 @@ index 0000000..170ae21
 +	    uj.recover_fails, uj.wv2_status, uj.as0_ok ? "OK" : "-", uj.as0.js_status, uj.as0.mirq, uj.jobs, uj.faults,
 +	    present_busy, __atomic_load_n(&user_clients, __ATOMIC_RELAXED), __atomic_load_n(&user_opens, __ATOMIC_RELAXED),
 +	    __atomic_load_n(&user_chunks, __ATOMIC_RELAXED), __atomic_load_n(&user_hot, __ATOMIC_RELAXED));
++	for (unsigned i = 0; i < 2u; i++) {
++		uint32_t n = __atomic_load_n(&gpu_notes[i].len, __ATOMIC_ACQUIRE);
++		if (n != 0) {
++			kprintf("GPUNOTE %.*s\n", (int)n, gpu_notes[i].text);
++		}
++	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_input.c b/bsd/dev/a04s_input.c
@@ -6987,7 +7039,7 @@ index 0000000..e3b8eb3
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 diff --git a/iokit/Kernel/arm/HeroGPU.cpp b/iokit/Kernel/arm/HeroGPU.cpp
-index 3ba3cb8..d1f93be 100644
+index 3ba3cb8..6a5bb55 100644
 --- a/iokit/Kernel/arm/HeroGPU.cpp
 +++ b/iokit/Kernel/arm/HeroGPU.cpp
 @@ -28,7 +28,7 @@
@@ -6999,7 +7051,7 @@ index 3ba3cb8..d1f93be 100644
  #include <IOKit/IOService.h>
  #include <IOKit/IOUserClient.h>
  #include <IOKit/IOKitKeys.h>
-@@ -39,6 +39,37 @@
+@@ -39,6 +39,40 @@
  #include <sys/proc.h>
  #include "SweetSurface.h"
  
@@ -7033,11 +7085,14 @@ index 3ba3cb8..d1f93be 100644
 +#define HEROGPU_NAME            "Mali-G52 MP1"
 +#define HEROGPU_ACCEL_DEFAULT   0
 +#define HEROGPU_SELFTEST_MS     90000
++/* v51: a test's verdict line is kept by a04s_gpu.c and repeated in every heartbeat (GPUNOTE). */
++extern "C" void a04s_gpu_note(unsigned slot, const char *s, size_t n);
++#define HEROGPU_NOTE(slot, s, n) a04s_gpu_note((slot), (s), (n))
 +#else
  extern "C" {
  bool herolte_gpu_up(void);
  uint32_t herolte_gpu_reg(uint32_t off);
-@@ -47,6 +78,14 @@ bool herolte_gpu_map(uint64_t va, const uint64_t *pages, unsigned n);
+@@ -47,6 +81,16 @@ bool herolte_gpu_map(uint64_t va, const uint64_t *pages, unsigned n);
  void herolte_gpu_unmap(uint64_t va, unsigned n);
  uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
  }
@@ -7048,11 +7103,13 @@ index 3ba3cb8..d1f93be 100644
 +#define HEROGPU_NAME            "Mali-T880 MP12"
 +#define HEROGPU_ACCEL_DEFAULT   1
 +#define HEROGPU_SELFTEST_MS     70000
++#define HEROGPU_NOTE(slot, s, n) do { (void)(slot); (void)(s); (void)(n); } while (0)
 +#endif
++#define HEROGPU_NOTE_LIT(slot, lit) HEROGPU_NOTE((slot), (lit), sizeof(lit) - 1)
  
  enum {
  	kHeroGPUGetParam = 0,
-@@ -107,10 +146,17 @@ herogpu_param(uint64_t param)
+@@ -107,10 +151,17 @@ herogpu_param(uint64_t param)
  		return id & 0xffff;
  	case 38:        /* NR_CORE_GROUPS: one L2 */
  		return 1;
@@ -7070,7 +7127,7 @@ index 3ba3cb8..d1f93be 100644
  	}
  	uint32_t reg = herogpu_param_reg(param);
  	return reg == ~0u ? 0 : herolte_gpu_reg(reg);
-@@ -280,6 +326,7 @@ class HeroGPUUserClient : public IOUserClient {
+@@ -280,6 +331,7 @@ class HeroGPUUserClient : public IOUserClient {
  	task_t             fTask;
  	IOLock            *fLock;
  	struct herogpu_bo *fBOs;          /* handle = index + 1 */
@@ -7078,7 +7135,7 @@ index 3ba3cb8..d1f93be 100644
  
  public:
  	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
-@@ -300,10 +347,10 @@ HeroGPU::start(IOService *provider)
+@@ -300,10 +352,10 @@ HeroGPU::start(IOService *provider)
  		return false;
  	}
  	setProperty(kIOUserClientClassKey, "HeroGPUUserClient");
@@ -7091,7 +7148,7 @@ index 3ba3cb8..d1f93be 100644
  	PE_parse_boot_argn("heroaccel", &accel, sizeof(accel));
  	if (accel) {
  		IOAcceleratorES *es = OSTypeAlloc(IOAcceleratorES);
-@@ -331,7 +378,8 @@ HeroGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
+@@ -331,7 +383,8 @@ HeroGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
  	fTask = owningTask;
  	fLock = IOLockAlloc();
  	fBOs = (struct herogpu_bo *)IOMallocZeroData(HEROGPU_MAX_BOS * sizeof(*fBOs));
@@ -7101,7 +7158,7 @@ index 3ba3cb8..d1f93be 100644
  }
  
  IOReturn
-@@ -351,6 +399,10 @@ HeroGPUUserClient::free(void)
+@@ -351,6 +404,10 @@ HeroGPUUserClient::free(void)
  		IOFreeData(fBOs, HEROGPU_MAX_BOS * sizeof(*fBOs));
  		fBOs = NULL;
  	}
@@ -7112,7 +7169,26 @@ index 3ba3cb8..d1f93be 100644
  	if (fLock != NULL) {
  		IOLockFree(fLock);
  		fLock = NULL;
-@@ -499,7 +551,7 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+@@ -464,13 +521,17 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ 	}
+ 	case kHeroGPULog:
+ 		/* Test programs have no console here: their lines go to the
+-		 * kernel log (and the USERDATA log ring). */
++		 * kernel log (and, on the S7, the USERDATA log ring). On the
++		 * A04s, an "A04S GPU TEST ..." verdict line is also kept for the
++		 * GPU heartbeat (GPUNOTE). */
+ 		if (args->structureInput != NULL && args->structureInputSize > 0) {
+ 			char name[32];
+ 			proc_selfname(name, sizeof(name));
+ 			IOLog("HEROGPU [%s]: %.*s\n", name,
+ 			    (int)(args->structureInputSize < 1024u ? args->structureInputSize : 1024u),
+ 			    (const char *)args->structureInput);
++			HEROGPU_NOTE(0, (const char *)args->structureInput,
++			    args->structureInputSize < 1024u ? args->structureInputSize : 1024u);
+ 		}
+ 		break;
+ 	default:
+@@ -499,9 +560,10 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
  static void
  herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  {
@@ -7120,25 +7196,39 @@ index 3ba3cb8..d1f93be 100644
 +	IOSleep(HEROGPU_SELFTEST_MS);
  	if (!herolte_gpu_up()) {
  		IOLog("HEROGPU SELFTEST: GPU not up\n");
++		HEROGPU_NOTE_LIT(1, "HEROGPU SELFTEST: GPU not up");
  		return;
-@@ -511,6 +563,7 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ 	IOLog("HEROGPU SELFTEST: GPU_ID %#llx rev %#llx shaders %#llx tiler features %#llx "
+@@ -511,6 +573,8 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  	bzero(&bo, sizeof(bo));
  	if (!herogpu_bo_create(&bo, 0x10000)) {
  		IOLog("HEROGPU SELFTEST: buffer failed\n");
++		HEROGPU_NOTE_LIT(1, "HEROGPU SELFTEST: buffer failed");
 +		herolte_gpu_down();
  		return;
  	}
  	/* Through a write-combined kernel mapping, as a client would. */
-@@ -520,6 +573,7 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+@@ -519,7 +583,9 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+ 	volatile uint8_t *job = map ? (volatile uint8_t *)map->getVirtualAddress() : NULL;
  	if (job == NULL) {
  		IOLog("HEROGPU SELFTEST: mapping failed\n");
++		HEROGPU_NOTE_LIT(1, "HEROGPU SELFTEST: mapping failed");
  		herogpu_bo_free(&bo);
 +		herolte_gpu_down();
  		return;
  	}
  	job[16] = 1 | (2 << 1);                         /* 64-bit, WRITE_VALUE */
-@@ -535,5 +589,6 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+@@ -531,9 +597,13 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	uint64_t us = 0;
+ 	uint32_t status = herolte_gpu_submit(1, bo.va, &us);
+-	IOLog("HEROGPU SELFTEST: buffer at GPU VA %#llx, status %#x in %llu us, output %#llx -> %s\n",
++	char note[160];
++	snprintf(note, sizeof(note), "HEROGPU SELFTEST: buffer at GPU VA %#llx, status %#x in %llu us, output %#llx -> %s",
  	    bo.va, status, us, *output, status == 0 && *output == 0 ? "OK" : "FAILED");
++	IOLog("%s\n", note);
++	HEROGPU_NOTE(1, note, strnlen(note, sizeof(note)));
  	map->release();
  	herogpu_bo_free(&bo);
 +	herolte_gpu_down();
