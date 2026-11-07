@@ -13,6 +13,11 @@
  *
  * Everything is logged to stderr (autorun.log) and /private/var/a04s/metal-probe.log. Nothing is
  * drawn or computed. Exit 0 once all steps were tried.
+ *
+ * REMOVAL: with A04S_METAL_REMOVE=1 (autorun.env), it only deletes what M4 installed --
+ * /System/Library/Extensions/A04sMetal.bundle, /private/var/a04s/metal/,
+ * /private/var/a04s/lib/A04sMetalCompiler.dylib and /private/var/a04s/metal.clients -- logs
+ * each, and exits without touching Metal. The log itself is kept for reading back.
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -46,11 +51,39 @@ install_bundle(void)
 	a04s_log("install: copyfile %s -> %s: %s", SRC_BUNDLE, DST_BUNDLE, rc == 0 ? "ok" : strerror(errno));
 }
 
+static void
+remove_all(void)
+{
+	static const char *paths[] = {
+		"/System/Library/Extensions/A04sMetal.bundle",
+		"/private/var/a04s/metal",
+		"/private/var/a04s/lib/A04sMetalCompiler.dylib",
+		"/private/var/a04s/metal.clients",
+	};
+	NSFileManager *fm = [NSFileManager defaultManager];
+	for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+		NSString *p = @(paths[i]);
+		if (![fm fileExistsAtPath:p]) {
+			a04s_log("remove: %s: not there", paths[i]);
+			continue;
+		}
+		NSError *err = nil;
+		BOOL ok = [fm removeItemAtPath:p error:&err];
+		a04s_log("remove: %s: %s", paths[i], ok ? "removed" : err.localizedDescription.UTF8String);
+	}
+}
+
 int
 main(int argc, char **argv)
 {
 	@autoreleasepool {
 		a04s_log("a04s-metal-probe (M4): uid %d, argv[0] %s", getuid(), argv[0]);
+		const char *rm = getenv("A04S_METAL_REMOVE");
+		if (rm && !strcmp(rm, "1")) {
+			remove_all();
+			a04s_log("a04s-metal-probe: removal done");
+			return 0;
+		}
 		install_bundle();
 		setenv("A04S_METAL", "1", 1);
 		setenv("MTL_MONOLITHIC_COMPILER", "1", 0);
