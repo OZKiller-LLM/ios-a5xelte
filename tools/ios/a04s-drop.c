@@ -25,6 +25,16 @@
  * dmesg reads it; boot-arg msgbuf= sets its size, up to 1 MiB) is saved as dmesg-1.log ...
  * dmesg-5.log at about 1, 2, 4, 8 and 15 minutes after the autorun, so the kernel's own lines can
  * be read from TWRP too.
+ *
+ * v3: the agent kept dying before its snapshots (three boots in a row, 2026-11-07). launchd runs it
+ * in tipsd's slot at jetsam priority 40 with a 15 MB active / 10 MB inactive fatal limit, and v2
+ * took its first snapshot only a minute after the autorun returned. Now:
+ *   - at start it lifts its own memory limit and raises its band (memorystatus_control, looked
+ *     up at run time like proc_kmsgbuf), and logs what the kernel said;
+ *   - dmesg-0.log is saved at once, before any package work, so the boot's kernel lines survive
+ *     whatever happens next;
+ *   - the autorun is spawned without waiting; dmesg-1..5.log are saved at 1, 2, 4, 8 and 15
+ *     minutes after the agent starts, whatever the autorun does, and its exit is logged when seen.
  */
 #include <CommonCrypto/CommonDigest.h>
 #include <dlfcn.h>
@@ -199,7 +209,8 @@ path_ok(const char *p, size_t len)
 		s = e + 1;
 	}
 	static const char *const ours[] = { DROP_PATH, DROP_PATH ".part", APPLIED_PATH, LOG_PATH, AUTORUN_LOG,
-		PREFIX "dmesg-1.log", PREFIX "dmesg-2.log", PREFIX "dmesg-3.log", PREFIX "dmesg-4.log", PREFIX "dmesg-5.log" };
+		PREFIX "dmesg-0.log", PREFIX "dmesg-1.log", PREFIX "dmesg-2.log", PREFIX "dmesg-3.log", PREFIX "dmesg-4.log",
+		PREFIX "dmesg-5.log" };
 	for (size_t i = 0; i < sizeof(ours) / sizeof(ours[0]); i++) {
 		size_t on = strlen(ours[i]);
 		if (strcmp(p, ours[i]) == 0 || (len > on && strncmp(p, ours[i], on) == 0 && p[on] == '/')) {
@@ -330,6 +341,30 @@ set_applied(uint64_t ident)
 	(void)rename(part, APPLIED_PATH);
 }
 
+/* v3: the autorun's pid while it runs, reaped by reap_autorun() from main()'s snapshot loop. */
+static pid_t autorun_pid = -1;
+
+static void
+reap_autorun(int block)
+{
+	if (autorun_pid <= 0) {
+		return;
+	}
+	int status = 0;
+	pid_t got;
+	while ((got = waitpid(autorun_pid, &status, block ? 0 : WNOHANG)) < 0 && errno == EINTR) {
+	}
+	if (got != autorun_pid) {
+		return;
+	}
+	if (WIFEXITED(status)) {
+		say("autorun exited %d", WEXITSTATUS(status));
+	} else if (WIFSIGNALED(status)) {
+		say("autorun killed by signal %d", WTERMSIG(status));
+	}
+	autorun_pid = -1;
+}
+
 static void
 run_autorun(uint64_t ident)
 {
@@ -391,14 +426,41 @@ run_autorun(uint64_t ident)
 		return;
 	}
 	say("autorun running, pid %d, output in %s", pid, AUTORUN_LOG);
-	int status = 0;
-	while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+	autorun_pid = pid;                      /* v3: reaped from main()'s snapshot loop */
+}
+
+/*
+ * v3: lift this process's jetsam limit and raise its band. memorystatus_control is in
+ * libsystem_kernel but not in the SDK's headers: looked up at run time. Commands and layouts from
+ * xnu's sys/kern_memorystatus.h. Root may set them for itself.
+ */
+static void
+keep_alive(void)
+{
+	int (*msc)(uint32_t, int32_t, uint32_t, void *, size_t) =
+	    (int (*)(uint32_t, int32_t, uint32_t, void *, size_t))dlsym(RTLD_DEFAULT, "memorystatus_control");
+	if (msc == NULL) {
+		say("jetsam: no memorystatus_control");
+		return;
 	}
-	if (WIFEXITED(status)) {
-		say("autorun exited %d", WEXITSTATUS(status));
-	} else if (WIFSIGNALED(status)) {
-		say("autorun killed by signal %d", WTERMSIG(status));
+	struct {
+		int32_t memlimit_active;
+		uint32_t memlimit_active_attr;
+		int32_t memlimit_inactive;
+		uint32_t memlimit_inactive_attr;
+	} limits = { -1, 0, -1, 0 };            /* memorystatus_memlimit_properties_t: -1 = none */
+	int rl = msc(7 /* MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES */, getpid(), 0, &limits, sizeof(limits));
+	int el = rl == 0 ? 0 : errno;
+	if (rl != 0) {
+		rl = msc(6 /* MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT */, getpid(), 0, NULL, 0);
 	}
+	struct {
+		int32_t priority;
+		uint64_t user_data;
+	} prio = { 180, 0 };                    /* memorystatus_priority_properties_t */
+	int rp = msc(2 /* MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES */, getpid(), 0, &prio, sizeof(prio));
+	int ep = rp == 0 ? 0 : errno;
+	say("jetsam: limit %s (%d), band 180 %s (%d)", rl == 0 ? "lifted" : "kept", el, rp == 0 ? "set" : "kept", ep);
 }
 
 /* v2: the kernel's message buffer into dmesg-N.log, through a .part file and rename. */
@@ -440,16 +502,26 @@ main(void)
 		return 1;
 	}
 	log_fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
-	say("start, pid %d", getpid());
+	say("start, pid %d (v3)", getpid());
+	keep_alive();
+	save_dmesg(0);                          /* v3: before anything can go wrong */
+	time_t t0 = time(NULL);
 	int rc = drop_main();
 	static const unsigned at_minutes[] = { 1, 2, 4, 8, 15 };
-	unsigned slept = 0;
 	for (unsigned i = 0; i < sizeof(at_minutes) / sizeof(at_minutes[0]); i++) {
-		sleep((at_minutes[i] - slept) * 60u);
-		slept = at_minutes[i];
+		/* v3: minutes since the agent started, whatever the autorun is doing; checked every 5 s. */
+		while (time(NULL) - t0 < (time_t)at_minutes[i] * 60) {
+			sleep(5);
+			reap_autorun(0);
+		}
 		save_dmesg(i + 1);
 	}
-	say("done");
+	reap_autorun(0);
+	if (autorun_pid > 0) {
+		say("done (autorun %d still running)", autorun_pid);
+	} else {
+		say("done");
+	}
 	return rc;
 }
 
