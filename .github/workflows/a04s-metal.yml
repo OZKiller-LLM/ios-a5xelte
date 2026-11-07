@@ -12,6 +12,7 @@ on:
     branches: [a04s-metal]
     paths:
       - "gpu/a04s/metal/**"
+      - "!gpu/a04s/metal/m4/**"
       - ".github/workflows/a04s-metal.yml"
 
 concurrency:

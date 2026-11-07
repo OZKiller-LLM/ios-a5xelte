@@ -1,0 +1,49 @@
+name: a04s-metal-m4
+
+# Galaxy A04s, Metal track M4: the logging Metal device bundle, the logging compiler plug-in and the
+# probe for iOS 16 (gpu/a04s/metal/m4), built with the iPhoneOS SDK and ad-hoc signed, laid out for
+# the drop zone. The artifact holds only this repository's code and our own test metallib.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [a04s-metal]
+    paths:
+      - "gpu/a04s/metal/m4/**"
+      - "gpu/a04s/metal/shaders/**"
+      - ".github/workflows/a04s-metal-m4.yml"
+
+concurrency:
+  group: a04s-metal-m4-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          set -o pipefail
+          bash gpu/a04s/metal/m4/build.sh out 2>&1 | tee build.log
+      - name: Publish the digests as an annotation
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          esc = lambda s: s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
+          p = pathlib.Path('out/SHA256SUMS')
+          if p.exists():
+              print('::notice title=a04s-metal-m4 files::' + esc(p.read_text()))
+          b = pathlib.Path('build.log')
+          if b.exists():
+              bad = [l for l in b.read_text(errors='replace').splitlines() if 'error' in l.lower() and 'Werror' not in l]
+              if bad:
+                  print('::error title=build::' + esc('\n'.join(bad[:30])))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: a04s-metal-m4
+          path: out/
