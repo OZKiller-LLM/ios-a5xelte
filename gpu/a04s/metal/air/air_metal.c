@@ -819,7 +819,9 @@ rwa_shader_cache_sync(struct rwa_device *device)
                               ? device->screen->get_disk_shader_cache(device->screen) : NULL;
    if (!dc)
       return 0;
+#ifdef ENABLE_SHADER_CACHE   /* a build without Mesa's shader cache (check.sh) has no dc anyway */
    disk_cache_wait_for_idle(dc);
+#endif
    return 1;
 }
 
