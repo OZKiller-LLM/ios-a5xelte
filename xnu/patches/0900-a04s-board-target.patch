@@ -29,10 +29,10 @@ index a16d8e0..a1c90fc 100644
  bsd/dev/herolte_battery.c		standard
 diff --git a/bsd/dev/a04s_acpm.c b/bsd/dev/a04s_acpm.c
 new file mode 100644
-index 0000000..8718d81
+index 0000000..b1d0e2c
 --- /dev/null
 +++ b/bsd/dev/a04s_acpm.c
-@@ -0,0 +1,586 @@
+@@ -0,0 +1,618 @@
 +/*
 + * Galaxy A04s: ACPM, the mailbox protocol of the APM core, to the S2MPU12 PMIC and the
 + * AUD3004X codec on the same bus. A write there can change a supply voltage, so this file
@@ -473,6 +473,38 @@ index 0000000..8718d81
 +	return 0;
 +}
 +
++/*
++ * v59 (the owner's decision, 2026-11-08): the codec's digital core clocked, as aud3004x.c's
++ * register_initialize() does first: DCTR_CM (0xD0) bit 0, PDB_JD_CLK_EN, cleared, 20 ms
++ * (AUD3004X_PDB_CLK_MSEC), set, 20 ms. Only that bit changes; the others are kept. d0[] holds the
++ * register before, after the clear and after the set. Through acpm_write() and its allow-list.
++ */
++int a04s_acpm_codec_clk_pulse(uint8_t d0[3]);
++int
++a04s_acpm_codec_clk_pulse(uint8_t d0[3])
++{
++	if (!acpm_ready || !acpm_writes_ok) {
++		return ENXIO;
++	}
++	int error = acpm_read(0x07, 0xD0, &d0[0]);
++	if (!error) {
++		error = acpm_write(0x07, 0xD0, (uint8_t)(d0[0] & ~0x01u));
++	}
++	if (!error) {
++		error = acpm_read(0x07, 0xD0, &d0[1]);
++	}
++	if (error) {
++		return error;
++	}
++	delay(20000);
++	error = acpm_write(0x07, 0xD0, (uint8_t)(d0[1] | 0x01u));
++	if (!error) {
++		delay(20000);
++		error = acpm_read(0x07, 0xD0, &d0[2]);
++	}
++	return error;
++}
++
 +/* The registers Samsung's own drivers read first: s2mpu12-core.c, then aud3004x.c. */
 +void a04s_acpm_probe(void);
 +void
@@ -621,7 +653,7 @@ index 0000000..8718d81
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_acpm_guard.h b/bsd/dev/a04s_acpm_guard.h
 new file mode 100644
-index 0000000..9d62d91
+index 0000000..3a0607f
 --- /dev/null
 +++ b/bsd/dev/a04s_acpm_guard.h
 @@ -0,0 +1,82 @@
@@ -642,8 +674,8 @@ index 0000000..9d62d91
 + * constant, the compiler worked out each check at build time and left none in the kernel.
 + */
 +const volatile uint32_t a04s_acpm_writable[16][8] __attribute__((used)) = {
-+	/* 0x07: 10 CLKGATE0, 11 CLKGATE1, 12 CLKGATE2, 14 RESETB0, 16 CLK_MODE_SEL, 18 PWAUTO_AD, 1E CHOP1, 1F CHOP2, 20 IF_FORM1, 21 IF_FORM2, 22 IF_FORM3, 23 IF_FORM4, 24 IF_FORM5, 29 IF_FORM6, 30 ADC1, 31 ADC2, 32 ADC3, 33 ADC4, 34 AD_VOLL, 35 AD_VOLR, 37 AD_HPF, C5 ACTR_MCB3, C6 ACTR_MCB4 */
-+	[0x07] = { 0xc1570000u, 0x00bf021fu, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000060u, 0x00000000u },
++	/* 0x07: 10 CLKGATE0, 11 CLKGATE1, 12 CLKGATE2, 14 RESETB0, 16 CLK_MODE_SEL, 18 PWAUTO_AD, 1E CHOP1, 1F CHOP2, 20 IF_FORM1, 21 IF_FORM2, 22 IF_FORM3, 23 IF_FORM4, 24 IF_FORM5, 29 IF_FORM6, 30 ADC1, 31 ADC2, 32 ADC3, 33 ADC4, 34 AD_VOLL, 35 AD_VOLR, 37 AD_HPF, C5 ACTR_MCB3, C6 ACTR_MCB4, D0 DCTR_CM (v59) */
++	[0x07] = { 0xc1570000u, 0x00bf021fu, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00010060u, 0x00000000u },
 +	/* 0x08: 02 CLK3_COD, 06 DSM_AD, 07 LPF_AD, 10 PD_REF, 11 PD_AD1, 12 PD_AD2, 13 PD_AD3, 17 CTRL_REF, 30 MIX_AD1, 34 VOL_AD1, 35 VOL_AD2, 36 VOL_AD3 */
 +	[0x08] = { 0x008f00c4u, 0x00710000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u },
 +};
@@ -709,10 +741,10 @@ index 0000000..9d62d91
 +#endif /* A04S_ACPM_GUARD_H */
 diff --git a/bsd/dev/a04s_audclk.c b/bsd/dev/a04s_audclk.c
 new file mode 100644
-index 0000000..0234827
+index 0000000..41a3b18
 --- /dev/null
 +++ b/bsd/dev/a04s_audclk.c
-@@ -0,0 +1,331 @@
+@@ -0,0 +1,346 @@
 +/*
 + * Galaxy A04s, audio route A2 (v54): the AUD3004X codec's master clock.
 + *
@@ -762,6 +794,12 @@ index 0000000..0234827
 + * (0x08) pages, the registers aud3004x.c marks readable, before and after the supplies come on,
 + * plus the PMIC's LDO controls (0x01, 0x40-0x4F) as a control. Reads only. The first two
 + * heartbeats print it as "AUD DUMP" lines; 0xEE marks a register not read.
++ *
++ * v59: v58's dump showed the codec answering (IRQ masks 0xFF, its ACTR block 0xC0-0xFC set) and
++ * its digital core 0x10-0xBF all zero. With the boot-arg "a04scodecclk" set to 1, right after the
++ * supplies come on, a04s_acpm_codec_clk_pulse() does register_initialize()'s first step: DCTR_CM
++ * bit 0 (PDB_JD_CLK_EN) cleared, 20 ms, set, 20 ms. The AFTER dump and the v57 tests then show
++ * whether the core came alive. Heartbeat line "AUD CLKEN".
 + */
 +#if defined(ARM64_BOARD_CONFIG_A04S)
 +#include <sys/param.h>
@@ -777,6 +815,9 @@ index 0000000..0234827
 +extern int a04s_acpm_codec_snapshot(uint8_t out[12]);                           /* a04s_acpm.c, v56 */
 +extern int a04s_acpm_codec_capture_ready(uint8_t regs[6], int *test_if, int *test_adc);  /* v57 */
 +extern int a04s_acpm_read_range(uint32_t bus_addr, uint32_t lo, uint32_t hi, uint8_t out[256]);  /* v58 */
++extern int a04s_acpm_codec_clk_pulse(uint8_t d0[3]);                            /* a04s_acpm.c, v59 */
++static int clken_rc = -1;
++static uint8_t clken_d0[3];
 +
 +#define PMU_PA                  0x11860000u
 +#define PMU_PD_AUD_STATUS       0x2084u
@@ -969,6 +1010,11 @@ index 0000000..0234827
 +	if (power == 1) {
 +		aud.supply_rc = a04s_acpm_codec_supplies_on(aud.supply_before, aud.supply_after);
 +		delay(CODEC_SETTLE_US);        /* v56: Android's 20 ms before the first codec access (v55: 5 ms) */
++		int want_clk = 0;
++		(void)PE_parse_boot_argn("a04scodecclk", &want_clk, sizeof(want_clk));
++		if (want_clk == 1) {
++			clken_rc = a04s_acpm_codec_clk_pulse(clken_d0);     /* v59 */
++		}
 +		aud.snap_rc = a04s_acpm_codec_snapshot(aud.snap);
 +		if (want_dump == 1) {
 +			codec_dump(1);
@@ -1017,6 +1063,7 @@ index 0000000..0234827
 +	kprintf("AUD READY %s rc %d IF %d CLKGATE0 %02x>%02x CLKGATE2 %02x>%02x RESETB0 %02x>%02x ADC %d\n",
 +	    aud.ready_state, aud.ready_rc, aud.test_if, aud.ready[0], aud.ready[1], aud.ready[2], aud.ready[3],
 +	    aud.ready[4], aud.ready[5], aud.test_adc);
++	kprintf("AUD CLKEN rc %d D0 %02x>%02x>%02x\n", clken_rc, clken_d0[0], clken_d0[1], clken_d0[2]);
 +	static int dumps_printed;
 +	if (dumps_printed >= 2 || dump_rc[0] < 0) {
 +		return;
