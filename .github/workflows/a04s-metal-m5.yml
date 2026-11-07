@@ -1,0 +1,77 @@
+name: a04s-metal-m5
+
+# Galaxy A04s, Metal track M5: the Metal device for the Mali-G52 and its probe for iOS 16
+# (gpu/a04s/metal/m5): libhakiosair (Mesa 25.0.7, the AIR front end, Gallium Panfrost and softpipe
+# over HeroGPU's libdrm stand-in), Chlorophyll's Metal device with the A04s's gate and identity, and
+# the probe, built with the iPhoneOS SDK, ad-hoc signed and laid out for the drop zone. The artifact
+# holds only this repository's code, Mesa and our own test metallibs.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [a04s-metal]
+    paths:
+      - "gpu/a04s/metal/m5/**"
+      - "gpu/a04s/metal/chlorophyll/**"
+      - "gpu/a04s/metal/hakios/mesa/**"
+      - "gpu/a04s/metal/mesa-patches/**"
+      - "gpu/a04s/metal/shaders/**"
+      - "gpu/a04s/metal/m4/a04s_metal_log.h"
+      - "gpu/mesa/**"
+      - ".github/workflows/a04s-metal-m5.yml"
+
+concurrency:
+  group: a04s-metal-m5-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deps
+        run: |
+          brew install meson ninja bison pkg-config || true
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q mako pyyaml packaging setuptools meson
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+      - name: Build libhakiosair for iOS
+        run: |
+          set -o pipefail
+          bash gpu/a04s/metal/m5/build-mesa-ios.sh "$RUNNER_TEMP/mesa-work" mesa-out 2>&1 | tee build.log
+      - name: Build the bundle and the probe
+        run: |
+          set -o pipefail
+          bash gpu/a04s/metal/m5/build.sh out mesa-out 2>&1 | tee -a build.log
+      # Logs need a GitHub sign-in to read; check-run annotations are public.
+      - name: Report as annotations
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+          esc = lambda s: s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
+          p = pathlib.Path('out/SHA256SUMS')
+          if p.exists():
+              print('::notice title=a04s-metal-m5 files::' + esc(p.read_text()))
+          b = pathlib.Path('build.log')
+          if not b.exists():
+              raise SystemExit
+          clean = [re.sub(r'\x1b\[[0-9;]*m', '', l) for l in b.read_text(errors='replace').splitlines()]
+          cc = re.compile(r'(:\d+:\d+: (fatal )?error:|^ld: (?!warning)|Undefined symbols|clang: error|ERROR:|^FAILED:|meson.build:\d+:\d+:|Hunk #\d+ FAILED|AssertionError)')
+          hits = [' | '.join(x[:250] for x in clean[i:i + 4]) for i, l in enumerate(clean) if cc.search(l)]
+          for l in hits[:12]:
+              print('::error title=build::' + esc(l[:900]))
+          warn = [l for l in clean if 'warning:' in l and ('bgmtl' in l or 'A04s' in l or 'a04s' in l or 'air_metal' in l)]
+          if warn:
+              print('::warning title=warnings in our files::' + esc('\n'.join(w[:300] for w in warn[:40])))
+          tail = '\n'.join(l[:300] for l in clean[-80:])
+          for i in range(0, len(tail), 3500):
+              print('::notice title=build log tail %d::' % (i // 3500) + esc(tail[i:i + 3500]))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: a04s-metal-m5
+          path: out/

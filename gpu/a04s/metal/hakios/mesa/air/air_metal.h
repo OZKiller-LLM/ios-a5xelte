@@ -591,6 +591,31 @@ int rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings 
 int rwa_finish(struct rwa_device *device, char *why, size_t why_size);
 
 /*
+ * A04s (Metal track M5): the calls Chlorophyll's Metal device (gpu/a04s/metal/chlorophyll/bgmtl.m)
+ * makes beyond this library, with Chlorophyll's signatures (MIT, see that folder's NOTICE.md).
+ *
+ * rwa_flush submits what the context holds and returns its fence, NULL when nothing was queued.
+ * rwa_fence_wait may be called from another thread: it uses only the screen. rwa_fence_release
+ * drops the fence. Every dispatch and draw of this library already waits for its own fence, so
+ * here a fence mostly covers nothing.
+ */
+struct rwa_fence;
+struct rwa_fence *rwa_flush(struct rwa_device *device);
+int rwa_fence_wait(struct rwa_device *device, struct rwa_fence *fence, char *why, size_t why_size);
+void rwa_fence_release(struct rwa_device *device, struct rwa_fence *fence);
+/* A texture-to-texture copy on the GPU (resource_copy_region), in order with the draws. -1 when
+ * the formats are not copy-compatible; the caller then copies on the CPU. */
+int rwa_texture_copy(struct rwa_texture *src, unsigned slevel, unsigned sslice, const unsigned so[3],
+		     struct rwa_texture *dst, unsigned dlevel, unsigned dslice, const unsigned dorg[3],
+		     const unsigned size[3]);
+/* generateMipmapsForTexture: levels 1..last from level 0, on the GPU (0, or -1). */
+int rwa_texture_generate_mipmaps(struct rwa_texture *texture);
+/* Make what the GPU wrote into an IOSurface-backed texture visible to other processes. This
+ * library's surfaces come through the libdrm stand-in, whose buffers need no cache maintenance
+ * for the CPU of this process, so it answers 0. */
+int rwa_texture_flush_surface(struct rwa_texture *texture);
+
+/*
  * ---------------------------------------------------------------------------------------
  * Drawing.
  *
@@ -1313,10 +1338,37 @@ struct rwa_draw {
 	unsigned vertex_buffer_table_count;
 	const struct rwa_buffer_bind *fragment_buffer_table;
 	unsigned fragment_buffer_table_count;
+
+	/* A04s (Metal track M5), from Chlorophyll: MTLRenderCommandEncoder's scissor rect, or NULL
+	 * for the whole attachment (Metal's default). { x, y, width, height } in attachment pixels,
+	 * top-left origin, clamped to the attachment. Appended, like the fields above. */
+	const unsigned *scissor;
 };
 
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 		    char *why, size_t why_size);
+
+/*
+ * A04s (Metal track M5), from Chlorophyll: a render pass's load actions, done at the start of
+ * the pass, where Metal does them, including in a pass that draws nothing. rwa_render_draw
+ * clears inside a draw with ONE colour for every attachment, so a pass with a different clear
+ * per attachment needs this.
+ *   color_mask      bit i: attachment i is MTLLoadActionClear, to color_value[i]; the others
+ *                   are left as they are. A NULL attachment is skipped.
+ *   depth/stencil   as rwa_draw: a NULL pointer is a load.
+ * Like a draw, it waits for its fence. 0, or -1 and a sentence.
+ */
+struct rwa_clear {
+	struct rwa_texture *const *color;
+	unsigned color_count;
+	unsigned color_mask;
+	float color_value[8][4];
+	struct rwa_texture *depth;
+	const float *clear_depth;
+	const unsigned *clear_stencil;
+};
+int rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char *why,
+		     size_t why_size);
 
 #ifdef __cplusplus
 }

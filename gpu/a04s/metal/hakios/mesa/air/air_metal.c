@@ -65,6 +65,7 @@
 #include "util/u_inlines.h"
 #include "util/u_sampler.h"
 #include "util/u_debug.h"
+#include "util/u_gen_mipmap.h"   /* A04s (Metal track M5): rwa_texture_generate_mipmaps */
 
 /* Two seconds, the same wait air_run uses, and for the same reason: a dispatch nobody
  * waited for is not a result, and on this GPU one timeout wedges the core for the rest
@@ -4078,6 +4079,74 @@ rwa_finish(struct rwa_device *device, char *why, size_t why_size)
    return finish_or_say_why(device, false, "work", why, why_size);
 }
 
+/* A04s (Metal track M5): Chlorophyll's asynchronous completion (air_metal.h), as Chlorophyll
+ * wrote it (MIT, gpu/a04s/metal/chlorophyll/NOTICE.md). */
+struct rwa_fence *
+rwa_flush(struct rwa_device *device)
+{
+   struct pipe_fence_handle *fence = NULL;
+   device->pipe->flush(device->pipe, &fence, 0);
+   return (struct rwa_fence *)fence;
+}
+
+int
+rwa_fence_wait(struct rwa_device *device, struct rwa_fence *fence, char *why, size_t why_size)
+{
+   if (!fence)
+      return 0;
+   if (!device->screen->fence_finish(device->screen, NULL, (struct pipe_fence_handle *)fence,
+                                     RWA_FENCE_TIMEOUT_NS)) {
+      say(why, why_size, "the GPU did not finish the work within the fence timeout");
+      return -1;
+   }
+   return 0;
+}
+
+void
+rwa_fence_release(struct rwa_device *device, struct rwa_fence *fence)
+{
+   struct pipe_fence_handle *f = (struct pipe_fence_handle *)fence;
+   if (f)
+      device->screen->fence_reference(device->screen, &f, NULL);
+}
+
+/* A04s (Metal track M5): Chlorophyll's GPU texture copy and mipmap generation (air_metal.h). */
+int
+rwa_texture_copy(struct rwa_texture *src, unsigned slevel, unsigned sslice, const unsigned so[3],
+                 struct rwa_texture *dst, unsigned dlevel, unsigned dslice, const unsigned dorg[3],
+                 const unsigned size[3])
+{
+   if (!src || !dst || !src->res || !dst->res || src->device != dst->device)
+      return -1;
+   if (util_format_get_blocksize(src->res->format) != util_format_get_blocksize(dst->res->format) ||
+       util_format_get_blockwidth(src->res->format) != util_format_get_blockwidth(dst->res->format))
+      return -1;
+   struct pipe_box box;
+   u_box_3d((int)so[0], (int)so[1], (int)(so[2] + sslice), (int)size[0], (int)size[1],
+            (int)(size[2] ? size[2] : 1), &box);
+   struct pipe_context *pipe = src->device->pipe;
+   pipe->resource_copy_region(pipe, dst->res, dlevel, dorg[0], dorg[1], dorg[2] + dslice,
+                              src->res, slevel, &box);
+   return 0;
+}
+
+int
+rwa_texture_generate_mipmaps(struct rwa_texture *texture)
+{
+   if (!texture || !texture->res || texture->res->last_level == 0)
+      return -1;
+   struct pipe_resource *res = texture->res;
+   return util_gen_mipmap(texture->device->pipe, res, res->format, 0, res->last_level, 0,
+                          util_max_layer(res, 0), PIPE_TEX_FILTER_LINEAR) ? 0 : -1;
+}
+
+int
+rwa_texture_flush_surface(struct rwa_texture *texture)
+{
+   (void)texture;
+   return 0;
+}
+
 /*
  * ---------------------------------------------------------------------------------------
  * Drawing.
@@ -6389,7 +6458,10 @@ rwa_render_create(struct rwa_device *device,
       &(struct pipe_rasterizer_state){
          .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
          .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
-         .multisample = samples > 1 });
+         .multisample = samples > 1,
+         /* A04s (Metal track M5), from Chlorophyll: Metal's scissor test always applies;
+          * every draw sets the rect, the whole attachment unless rwa_draw.scissor says. */
+         .scissor = 1 });
    if (!render->blend || !render->dsa || !render->rast) {
       say(why, why_size, "%s would not make the fixed render state", rwa_device_name(device));
       goto fail;
@@ -6934,6 +7006,19 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       .scale = { w / 2.0f, -(h / 2.0f), zfar - znear },
       .translate = { w / 2.0f, h / 2.0f, znear } });
 
+   /* A04s (Metal track M5), from Chlorophyll: Metal's scissor rect (rwa_draw.scissor),
+    * clamped to the attachment as Metal requires; the whole attachment without one. */
+   {
+      struct pipe_scissor_state sc = { .minx = 0, .miny = 0, .maxx = w, .maxy = h };
+      if (draw->scissor) {
+         unsigned x0 = MIN2(draw->scissor[0], w), y0 = MIN2(draw->scissor[1], h);
+         unsigned x1 = MIN2((uint64_t)draw->scissor[0] + draw->scissor[2], w);
+         unsigned y1 = MIN2((uint64_t)draw->scissor[1] + draw->scissor[3], h);
+         sc = (struct pipe_scissor_state){ .minx = x0, .miny = y0, .maxx = x1, .maxy = y1 };
+      }
+      pipe->set_scissor_states(pipe, 0, 1, &sc);
+   }
+
    pipe->bind_blend_state(pipe, render->blend);
    /* The caller's depth/stencil state, or the pipeline's zeroed one, which is Metal's
     * behaviour with no MTLDepthStencilState set: no test and no write.
@@ -7121,6 +7206,103 @@ unbind:
     */
    pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
    for (unsigned i = 0; i < draw->color_count; i++)
+      if (surf[i])
+         pipe->surface_destroy(pipe, surf[i]);
+   if (zsurf)
+      pipe->surface_destroy(pipe, zsurf);
+   return rc;
+}
+
+/*
+ * A04s (Metal track M5): a render pass's load actions without a draw (air_metal.h). The
+ * contract is Chlorophyll's; the body follows this library's draw rather than Chlorophyll's
+ * cached surfaces: surfaces made here, the framebuffer bound, the clears, the fence waited for,
+ * then the framebuffer released and the surfaces destroyed, as rwa_render_draw does.
+ */
+int
+rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char *why,
+                 size_t why_size)
+{
+   struct pipe_context *pipe = device->pipe;
+   if (!clear || (clear->color_count == 0 && !clear->depth)) {
+      say(why, why_size, "a clear of nothing");
+      return -1;
+   }
+   if (clear->color_count > PIPE_MAX_COLOR_BUFS) {
+      say(why, why_size, "a clear of %u colour attachments", clear->color_count);
+      return -1;
+   }
+   struct pipe_surface *surf[PIPE_MAX_COLOR_BUFS] = { 0 };
+   struct pipe_surface *zsurf = NULL;
+   struct pipe_framebuffer_state fb = { .nr_cbufs = clear->color_count, .samples = 1 };
+   unsigned w = 0, h = 0, present = 0;
+   int rc = -1;
+
+   for (unsigned i = 0; i < clear->color_count; i++) {
+      struct rwa_texture *t = clear->color[i];
+      if (!t)
+         continue;   /* an empty slot is legal in Metal; its clear does nothing */
+      if (!(t->res->bind & PIPE_BIND_RENDER_TARGET)) {
+         say(why, why_size, "colour attachment %u (%s) was made without "
+                            "MTLTextureUsageRenderTarget", i, t->format_name);
+         goto out;
+      }
+      if (present++ == 0) {
+         w = t->shape.width;
+         h = t->shape.height ? t->shape.height : 1;
+      }
+      surf[i] = pipe->create_surface(pipe, t->res, &(struct pipe_surface){ .format = t->res->format });
+      if (!surf[i]) {
+         say(why, why_size, "%s would not make a render surface of colour attachment %u",
+             rwa_device_name(device), i);
+         goto out;
+      }
+      fb.cbufs[i] = surf[i];
+   }
+   if (present == 0 && !clear->depth)
+      return 0;   /* only empty slots: nothing to clear */
+   if (clear->depth) {
+      struct rwa_texture *t = clear->depth;
+      if (present == 0) {
+         w = t->shape.width;
+         h = t->shape.height ? t->shape.height : 1;
+      }
+      zsurf = pipe->create_surface(pipe, t->res, &(struct pipe_surface){ .format = t->res->format });
+      if (!zsurf) {
+         say(why, why_size, "%s would not make a render surface of the depth attachment",
+             rwa_device_name(device));
+         goto out;
+      }
+      fb.zsbuf = zsurf;
+   }
+   fb.width = w;
+   fb.height = h;
+   pipe->set_framebuffer_state(pipe, &fb);
+   for (unsigned i = 0; i < clear->color_count; i++) {
+      if (!(clear->color_mask & (1u << i)) || !fb.cbufs[i])
+         continue;
+      union pipe_color_union cv;
+      for (unsigned c = 0; c < 4; c++)
+         cv.f[c] = clear->color_value[i][c];
+      pipe->clear(pipe, PIPE_CLEAR_COLOR0 << i, NULL, &cv, 0.0, 0);
+   }
+   if (clear->depth) {
+      unsigned mask = 0;
+      if (clear->clear_depth && format_has_depth(clear->depth->res->format))
+         mask |= PIPE_CLEAR_DEPTH;
+      if (clear->clear_stencil && format_has_stencil(clear->depth->res->format))
+         mask |= PIPE_CLEAR_STENCIL;
+      if (mask) {
+         union pipe_color_union none = { 0 };
+         pipe->clear(pipe, mask, NULL, &none,
+                     clear->clear_depth ? (double)*clear->clear_depth : 0.0,
+                     clear->clear_stencil ? *clear->clear_stencil & 0xff : 0);
+      }
+   }
+   rc = finish_or_say_why(device, true, "clear", why, why_size);
+   pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
+out:
+   for (unsigned i = 0; i < clear->color_count; i++)
       if (surf[i])
          pipe->surface_destroy(pipe, surf[i]);
    if (zsurf)

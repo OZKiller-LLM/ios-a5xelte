@@ -34,6 +34,15 @@ This folder holds only off-phone work. Nothing here touches the A04s kernel or i
 
 Apple's own metallibs are never used here or in CI. Coverage over iOS's system libraries is run locally only.
 
+## M5: compute, then a triangle, on the G52 (`m5/`)
+
+The first Metal device that computes and draws, run by a probe on the phone. CI: `.github/workflows/a04s-metal-m5.yml`.
+- **`m5/build-mesa-ios.sh`:** `libhakiosair` for iOS 16. Mesa 25.0.7 with the AIR front end and `hakios/mesa/air`, Gallium Panfrost and softpipe. It reaches the GPU through `gpu/mesa/herodrm.c` over HeroGPU, the 7c-6 route, with `gpu/mesa/patch-mesa.py`'s changes.
+- **The device:** Chlorophyll's `bgmtl.m` (`chlorophyll/`, MIT, see its `NOTICE.md`) compiled into `libA04sMetalDevice.dylib` with `m5/A04sMTLDevice.m`, which adds the A04s's identity from M4. Pipelines compile in-process from `bitcodeData`; Apple's compiler service is never used.
+- **The gate:** `m5/A04sMetal.m` is the bundle's executable, as small as M4's. It loads the device library only in a process that asks (`A04S_METAL=1` or `/private/var/a04s/metal.clients`), never in backboardd, and not when `a04smetal.off` is in the bundle.
+- **The probe:** `m5/a04s_metal_m5.m` installs the bundle, then runs `fill_buffer` (4096 values), a triangle (`shaders/m5.metal`, vertex and constant buffers) and a quad with a varying. It runs once on softpipe as the reference and once on the Mali-G52, each in a child process, and logs PASS or FAIL per test.
+- **`hakios/mesa/air` additions for it**, marked "A04s (Metal track M5)": Chlorophyll's fence calls, render-pass clear, GPU texture copy and mipmaps, and scissor.
+
 ## Where `hakios/` comes from
 
 Everything under `hakios/` is copied unchanged from the Galaxy S9+ port, [github.com/danstronics/ios-s9plus-exynos](https://github.com/danstronics/ios-s9plus-exynos) at `2d09239`, directory `core/` (a snapshot of HakiOS/Scion). Its author OK'd reuse for other ports. Its licence, `hakios/LICENSE`, is MIT for userland and tools and APSL-2.0 for kernel-derived files (`hakios/LICENSE.APSL`). Mesa's patches touch Mesa files under Mesa's licences.

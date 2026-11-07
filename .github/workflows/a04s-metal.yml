@@ -13,6 +13,8 @@ on:
     paths:
       - "gpu/a04s/metal/**"
       - "!gpu/a04s/metal/m4/**"
+      - "!gpu/a04s/metal/m5/**"
+      - "!gpu/a04s/metal/chlorophyll/**"
       - ".github/workflows/a04s-metal.yml"
 
 concurrency:
@@ -30,7 +32,7 @@ jobs:
           set -e
           xcrun -sdk iphoneos metal --version | head -3
           mkdir -p metallibs
-          for f in core probe; do
+          for f in core probe m5; do
             xcrun -sdk iphoneos metal -std=metal3.0 -mios-version-min=16.0 \
               -o "metallibs/$f.metallib" "gpu/a04s/metal/shaders/$f.metal"
           done
