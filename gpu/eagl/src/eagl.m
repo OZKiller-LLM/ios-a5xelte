@@ -187,7 +187,8 @@ static BOOL mapping_writable(const void *p, size_t len) {
     return YES;
 }
 
-static void rgba_to_surface(const uint8_t *src, uint32_t w, uint32_t h, IOSurfaceRef s, BOOL flip, BOOL opaque) {
+// A04s: returns 0 written, 1 written through the kernel's alias, -1 skipped (read-only here, no alias).
+static int rgba_to_surface(const uint8_t *src, uint32_t w, uint32_t h, IOSurfaceRef s, BOOL flip, BOOL opaque) {
     kern_return_t lk = IOSurfaceLock(s, 0, NULL);
     uint8_t *dst = lk == KERN_SUCCESS ? IOSurfaceGetBaseAddress(s) : NULL;
     size_t bpr = IOSurfaceGetBytesPerRow(s);
@@ -197,13 +198,18 @@ static void rgba_to_surface(const uint8_t *src, uint32_t w, uint32_t h, IOSurfac
         void *ab = NULL; unsigned abpr = 0, aw = 0, ah = 0;
         // opt-in (BGL_ALIAS=1): read-only surfaces here are mostly the clients' own backing stores (text, labels);
         // writing the render server's result into them doubled and smeared every label on the phone
-        static int alias_on = -1;
+        static int alias_on = -1, alias_small = -1;
         if (alias_on < 0) { const char *e = getenv("BGL_ALIAS"); alias_on = e && e[0] == '1'; }
-        if (alias_on && osm_sweet_surface_alias(IOSurfaceGetID(s), &ab, &abpr, &aw, &ah)) { dst = ab; bpr = abpr; via_alias = YES; }
+        // A04s (2026-11-08), opt-in BGL_ALIAS_SMALL=1: the alias for small render targets only (<= 300x300: glyphs such as
+        // the page dots and the search magnifier, which the GPU can't render in place because their rows aren't 64-byte
+        // aligned), leaving the large client backing stores that smeared alone.
+        if (alias_small < 0) { const char *e = getenv("BGL_ALIAS_SMALL"); alias_small = e && e[0] == '1'; }
+        BOOL small = IOSurfaceGetWidth(s) * IOSurfaceGetHeight(s) <= 300 * 300;
+        if ((alias_on || (alias_small && small)) && osm_sweet_surface_alias(IOSurfaceGetID(s), &ab, &abpr, &aw, &ah)) { dst = ab; bpr = abpr; via_alias = YES; }
         else {
             if (lk == KERN_SUCCESS) IOSurfaceUnlock(s, 0, NULL);
             EAGL_DEBUG("CPU sync skipped: surface %u is not mapped writable here (no kernel alias)\n", IOSurfaceGetID(s));
-            return;
+            return -1;
         }
     }
     size_t sw = IOSurfaceGetWidth(s), sh = IOSurfaceGetHeight(s);
@@ -219,6 +225,7 @@ static void rgba_to_surface(const uint8_t *src, uint32_t w, uint32_t h, IOSurfac
     }
     if (via_alias) osm_sweet_alias_sync(IOSurfaceGetID(s));
     if (lk == KERN_SUCCESS) IOSurfaceUnlock(s, 0, NULL);
+    return via_alias ? 1 : 0;
 }
 
 // Read back the renderbuffer (or texture level 0) `name` of the current context into a malloc'ed RGBA buffer.
@@ -396,9 +403,17 @@ static void bump_seed(IOSurfaceRef s) {
 
 // Galaxy S7 port, BGL_ICONDIAG=1: after a small surface (icons, badges: <= 300x300) was written, log the path taken and how
 // many of its bytes the CPU sees non-zero. With the CPU renderer the icons draw; with this path they stayed blank or garbled.
-static void icon_diag(Attach *a, const char *path) {
-    static int on = -1, n;
+static int icondiag_on(void) {
+    static int on = -1;
     if (on < 0) on = getenv("BGL_ICONDIAG") != NULL;
+    return on;
+}
+
+// A04s: gl_nz = non-zero bytes in the GL-side readback (the CPU path only; -1 elsewhere), so an empty glyph shows whether
+// nothing was drawn (gl 0) or the drawing never reached the surface (gl > 0, surface 0).
+static void icon_diag(Attach *a, const char *path, long gl_nz) {
+    static int n;
+    int on = icondiag_on();
     size_t w = IOSurfaceGetWidth(a->surf), h = IOSurfaceGetHeight(a->surf);
     if (!on || w * h > 300 * 300 || n >= 300) return;
     size_t bpr = IOSurfaceGetBytesPerRow(a->surf), nz = 0;
@@ -408,8 +423,9 @@ static void icon_diag(Attach *a, const char *path) {
     uint32_t mid = p ? *(const uint32_t *)(p + (h / 2) * bpr + (w / 2) * 4) : 0;
     IOSurfaceUnlock(a->surf, kIOSurfaceLockReadOnly, NULL);
     n++;
-    fprintf(stderr, "ICON surface %u %zux%zu fmt %08x bpr %zu kind %d inv %d path %s: %zu of %zu bytes non-zero, centre %08x\n",
-            IOSurfaceGetID(a->surf), w, h, (unsigned)IOSurfaceGetPixelFormat(a->surf), bpr, a->kind, a->inverted, path, nz, w * h * 4, mid);
+    fprintf(stderr, "ICON surface %u %zux%zu fmt %08x bpr %zu kind %d inv %d path %s: %zu of %zu bytes non-zero, centre %08x, gl %ld\n",
+            IOSurfaceGetID(a->surf), w, h, (unsigned)IOSurfaceGetPixelFormat(a->surf), bpr, a->kind, a->inverted, path, nz, w * h * 4, mid,
+            gl_nz);
 }
 
 static void sync_att(EAGLContext *c, int i) {
@@ -419,7 +435,7 @@ static void sync_att(EAGLContext *c, int i) {
         if (a->direct) {
             double td = g_debug ? now_ms() : 0; osm_sweet_direct_sync(IOSurfaceGetID(a->surf)); if (g_debug) { g_ps_direct_ms += now_ms() - td; g_ps_direct_n++; }
             bump_seed(a->surf);
-            icon_diag(a, "direct");
+            icon_diag(a, "direct", -1);
             if (g_debug_frames) verify_direct(c, a);
             return;
         }
@@ -429,19 +445,27 @@ static void sync_att(EAGLContext *c, int i) {
         BOOL flip = a->kind ? a->inverted : !a->inverted;      // target-form attach (the render server): YES = rows flipped, NO = as GL has them (seen on the phone: NO + flip drew the UI upside down)
         if (osm_sweet_active() && osm_sweet_blit(a->name, isTex, IOSurfaceGetID(a->surf), flip, NO)) {
             bump_seed(a->surf);
-            icon_diag(a, "gpu-blit");
+            icon_diag(a, "gpu-blit", -1);
             if (g_debug) { frame_stats(a, t_start, now_ms(), 1); maybe_dump(c, i, isTex, (uint32_t)IOSurfaceGetWidth(a->surf), (uint32_t)IOSurfaceGetHeight(a->surf), YES); }
             return;
         }
         uint32_t w, h;
         double t_cpu0 = g_debug ? now_ms() : 0;
         uint8_t *buf = read_image(c, a->name, isTex, (uint32_t)IOSurfaceGetWidth(a->surf), (uint32_t)IOSurfaceGetHeight(a->surf), &w, &h);
+        BOOL got = buf != NULL;
+        long gl_nz = -1;
+        int wr = 0;
         if (buf) {
+            if (icondiag_on() && (size_t)w * h <= 300 * 300) {
+                gl_nz = 0;
+                for (size_t k = 0; k < (size_t)w * h * 4; k++) if (buf[k]) gl_nz++;
+            }
             // GL rows are bottom-up; a "normal" surface is top-down. invertedRender means CA already drew it flipped.
-            rgba_to_surface(buf, w, h, a->surf, flip, NO);
+            wr = rgba_to_surface(buf, w, h, a->surf, flip, NO);
             free(buf);
         }
-        icon_diag(a, buf ? "cpu-copy" : "cpu-copy-failed");
+        icon_diag(a, !got ? "cpu-copy-failed" : wr == 1 ? "cpu-copy-alias" : wr < 0 ? "cpu-copy-skipped-readonly" : "cpu-copy",
+                  gl_nz);
         if (g_debug) { g_ps_cpu_ms += now_ms() - t_cpu0; g_ps_cpu_n++; }
         if (g_debug) { frame_stats(a, t_start, now_ms(), 0); maybe_dump(c, i, isTex, (uint32_t)IOSurfaceGetWidth(a->surf), (uint32_t)IOSurfaceGetHeight(a->surf), NO); }
 }
@@ -861,7 +885,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
         uint32_t w, h;
         uint8_t *buf = read_image(self, rb, NO, 0, 0, &w, &h);
         if (!buf) return NO;
-        rgba_to_surface(buf, w, h, s, YES, opaque);
+        (void)rgba_to_surface(buf, w, h, s, YES, opaque);
         free(buf);
     }
     if ([b->drawable respondsToSelector:@selector(setContents:)])
