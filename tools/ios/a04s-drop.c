@@ -502,7 +502,7 @@ main(void)
 		return 1;
 	}
 	log_fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
-	say("start, pid %d (v3)", getpid());
+	say("start, pid %d (v4)", getpid());
 	keep_alive();
 	save_dmesg(0);                          /* v3: before anything can go wrong */
 	time_t t0 = time(NULL);
@@ -515,6 +515,25 @@ main(void)
 			reap_autorun(0);
 		}
 		save_dmesg(i + 1);
+	}
+	/*
+	 * v4 (2026-11-08): while the autorun is still running past 15 minutes, dmesg-5.log is refreshed every 5 minutes
+	 * (up to 60 minutes after start), and once more right after the autorun exits, so a late crash (a backboardd
+	 * restart at 24 minutes, M6a run 3) is in the log.
+	 */
+	int was_running = autorun_pid > 0;
+	reap_autorun(0);
+	if (was_running && autorun_pid <= 0) {
+		save_dmesg(5);                      /* it ended just after the 15-minute snapshot */
+	}
+	time_t next = t0 + 20 * 60;
+	while (autorun_pid > 0 && time(NULL) - t0 < 60 * 60) {
+		sleep(5);
+		reap_autorun(0);
+		if (autorun_pid <= 0 || time(NULL) >= next) {
+			save_dmesg(5);
+			next = time(NULL) + 5 * 60;
+		}
 	}
 	reap_autorun(0);
 	if (autorun_pid > 0) {
