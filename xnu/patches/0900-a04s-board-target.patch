@@ -12,10 +12,10 @@ index 7dee125..cc95042 100644
  SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
  sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
 diff --git a/bsd/conf/files b/bsd/conf/files
-index a16d8e0..9e5d1e4 100644
+index a16d8e0..a1c90fc 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -106,6 +106,10 @@ bsd/dev/random/randomdev.c		standard
+@@ -106,6 +106,11 @@ bsd/dev/random/randomdev.c		standard
  bsd/dev/memdev.c			standard
  bsd/dev/sweet_ufs.c			standard
  bsd/dev/a5xelte_emmc.c			standard
@@ -23,15 +23,16 @@ index a16d8e0..9e5d1e4 100644
 +bsd/dev/a04s_input.c			standard
 +bsd/dev/a04s_gpu.c			standard
 +bsd/dev/a04s_power.c			standard
++bsd/dev/a04s_audclk.c			standard
  bsd/dev/herolte_ufs.c			standard
  bsd/dev/herolte_touch.c			standard
  bsd/dev/herolte_battery.c		standard
 diff --git a/bsd/dev/a04s_acpm.c b/bsd/dev/a04s_acpm.c
 new file mode 100644
-index 0000000..2c2f141
+index 0000000..f7f09e0
 --- /dev/null
 +++ b/bsd/dev/a04s_acpm.c
-@@ -0,0 +1,351 @@
+@@ -0,0 +1,391 @@
 +/*
 + * Galaxy A04s: ACPM, the mailbox protocol of the APM core, to the S2MPU12 PMIC and the
 + * AUD3004X codec on the same bus. A write there can change a supply voltage, so this file
@@ -369,6 +370,44 @@ index 0000000..2c2f141
 +	return acpm_read(0x01, 0x0C, status1);
 +}
 +
++/*
++ * v54, audio A2: the same write test as a04s_acpm_probe()'s, run again by a04s_audclk.c before and
++ * after it lets the codec's clock through. Called from a04s_input_start() before the key thread
++ * starts, so no other ACPM transfer overlaps. 0: stored and put back; ENODEV: written, not stored.
++ */
++int a04s_acpm_codec_retest(void);
++int
++a04s_acpm_codec_retest(void)
++{
++	if (!acpm_ready || !acpm_writes_ok) {
++		return ENXIO;
++	}
++	uint8_t was = 0, back = 0, again = 0;
++	int error = acpm_read(0x07, 0x34, &was);
++	if (error) {
++		return error;
++	}
++	uint8_t probe = was ^ 0x5au;
++	error = acpm_write(0x07, 0x34, probe);
++	if (!error) {
++		error = acpm_read(0x07, 0x34, &back);
++	}
++	int restore = acpm_write(0x07, 0x34, was);
++	if (!restore) {
++		restore = acpm_read(0x07, 0x34, &again);
++	}
++	if (!restore && again != was) {
++		restore = EIO;
++	}
++	if (!error && back != probe) {
++		error = ENODEV;
++	}
++	if (!error && restore) {
++		error = 100 + restore;
++	}
++	return error;
++}
++
 +void a04s_acpm_report(void);
 +void
 +a04s_acpm_report(void)
@@ -381,6 +420,8 @@ index 0000000..2c2f141
 +	    (uint8_t)(acpm_codec[2] ^ 0x5au), acpm_set_back);
 +	kprintf("LDO33 %02x LDO34 %02x PDAUD %x %x\n", acpm_ldo33, acpm_ldo34, pd_aud_config, pd_aud_status);
 +	kprintf("STATUS1 %d %02x %02x\n", acpm_status1_err, acpm_status1[0], acpm_status1[1]);
++	extern void a04s_audclk_report(void);  /* v54: bsd/dev/a04s_audclk.c */
++	a04s_audclk_report();
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_acpm_guard.h b/bsd/dev/a04s_acpm_guard.h
@@ -435,6 +476,147 @@ index 0000000..b5308db
 +}
 +
 +#endif /* A04S_ACPM_GUARD_H */
+diff --git a/bsd/dev/a04s_audclk.c b/bsd/dev/a04s_audclk.c
+new file mode 100644
+index 0000000..bdaa83f
+--- /dev/null
++++ b/bsd/dev/a04s_audclk.c
+@@ -0,0 +1,135 @@
++/*
++ * Galaxy A04s, audio route A2 (v54): the AUD3004X codec's master clock.
++ *
++ * The codec's digital block stored nothing written to it (v18's AD_VOLL test): it gets no master
++ * clock. In Samsung's clock tree for the Exynos 850 (drivers/soc/samsung/cal-if/exynos3830,
++ * cmucal-node.c) that clock is PLL_AUD -> DIV_CLK_AUD_AUDIF (CMU_AUD+0x1804) -> CLK_AUD_MCLK
++ * (+0x1800) -> the gate GOUT_BLK_AUD_UID_DFTMUX_AUD_IPCLKPORT_AUD_CODEC_MCLK (+0x206c). ABOX itself
++ * is not on that path, so none of ABOX's registers are touched. pd-aud is already on at boot (v33:
++ * "AUD PD 1 1 ON", PLL_AUD a0770300 enabled and locked), so no power-domain SMC is needed.
++ *
++ * With boot-arg a04saudclk=1, and only when pd-aud is on and PLL_AUD is enabled and locked:
++ *   1. ABOX's pads leave retention: PMU+0x20a0 bit 11 (abox.c ABOX_PAD_NORMAL for EXYNOS3830, as
++ *      abox_pad_retention(false) sets it);
++ *   2. the codec's clock is let through its gate as ra.c's ra_set_gate() does: with MANUAL (bit 20)
++ *      set, CG_VAL (bit 21) = 1; without it, ENABLE_AUTOMATIC_CLKGATING (bit 28) = 0.
++ * Those are the only register writes in this file, in pad_normal() and codec_mclk_on();
++ * tools/check_audclk_source.py refuses any other. Dividers, muxes and the PLL are only read; the
++ * PMIC is never reached from here (the codec's supplies are on ACPM, read-only, a04s_acpm.c).
++ * The codec write test (a04s_acpm_codec_retest(): AD_VOLL written, read back, restored) runs before
++ * and after. It runs from a04s_input_start() before the key thread starts, so nothing else uses
++ * ACPM meanwhile. The heartbeat line is "AUD CLK".
++ */
++#if defined(ARM64_BOARD_CONFIG_A04S)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <stdbool.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern int a04s_acpm_codec_retest(void);        /* a04s_acpm.c */
++
++#define PMU_PA                  0x11860000u
++#define PMU_PD_AUD_STATUS       0x2084u
++#define PMU_ABOX_PAD            0x20a0u         /* ABOX_PAD_NORMAL, CONFIG_SOC_EXYNOS3830 */
++#define ABOX_PAD_NORMAL_BIT     11u
++#define CMU_AUD_PA              0x14a00000u
++#define AUD_PLL_CON3            0x010cu
++#define AUD_DIV_MCLK            0x1800u         /* CLK_CON_DIV_CLK_AUD_MCLK, ratio bits 1:0 */
++#define AUD_DIV_AUDIF           0x1804u         /* CLK_CON_DIV_DIV_CLK_AUD_AUDIF, ratio bits 8:0 */
++#define AUD_GATE_CODEC_MCLK     0x206cu
++#define GATE_AUTO_BIT           28u             /* ENABLE_AUTOMATIC_CLKGATING */
++#define GATE_CG_VAL_BIT         21u
++#define GATE_MANUAL_BIT         20u
++#define PLL_ENABLE              (1u << 31)
++#define PLL_STABLE              (1u << 29)
++
++static struct {
++	const char *state;
++	uint32_t pd, pll, div_audif, div_mclk;
++	uint32_t pad_before, pad_after, gate_before, gate_after;
++	int test_before, test_after;
++} aud = { .state = "NOT RUN", .test_before = -1, .test_after = -1 };
++
++static inline uint32_t
++aud_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++/* Write 1 of 2: ABOX's pads out of retention. */
++static void __attribute__((noinline))
++pad_normal(vm_offset_t pmu)
++{
++	volatile uint32_t *r = (volatile uint32_t *)(pmu + PMU_ABOX_PAD);
++	*r = *r | (1u << ABOX_PAD_NORMAL_BIT);
++}
++
++/* Write 2 of 2: the codec's clock through its gate, as ra_set_gate(clk, 1). */
++static void __attribute__((noinline))
++codec_mclk_on(vm_offset_t cmu)
++{
++	volatile uint32_t *r = (volatile uint32_t *)(cmu + AUD_GATE_CODEC_MCLK);
++	uint32_t v = *r;
++	if (v & (1u << GATE_MANUAL_BIT)) {
++		*r = v | (1u << GATE_CG_VAL_BIT);
++	} else {
++		*r = v & ~(1u << GATE_AUTO_BIT);
++	}
++}
++
++void a04s_audclk_start(void);
++void
++a04s_audclk_start(void)
++{
++	vm_offset_t pmu = ml_io_map(PMU_PA, 0x4000);
++	if (!pmu) {
++		aud.state = "NO PMU";
++		return;
++	}
++	aud.pd = aud_rd(pmu, PMU_PD_AUD_STATUS);
++	aud.pad_before = aud.pad_after = aud_rd(pmu, PMU_ABOX_PAD);
++	if (!(aud.pd & 1u)) {
++		aud.state = "PD OFF";           /* CMU_AUD can't be read while pd-aud is off */
++		return;
++	}
++	vm_offset_t cmu = ml_io_map(CMU_AUD_PA, 0x4000);
++	if (!cmu) {
++		aud.state = "NO CMU";
++		return;
++	}
++	aud.pll = aud_rd(cmu, AUD_PLL_CON3);
++	aud.div_audif = aud_rd(cmu, AUD_DIV_AUDIF);
++	aud.div_mclk = aud_rd(cmu, AUD_DIV_MCLK);
++	aud.gate_before = aud.gate_after = aud_rd(cmu, AUD_GATE_CODEC_MCLK);
++	aud.test_before = a04s_acpm_codec_retest();
++	int want = 0;
++	(void)PE_parse_boot_argn("a04saudclk", &want, sizeof(want));
++	if (want != 1) {
++		aud.state = "READ ONLY";
++		return;
++	}
++	if ((aud.pll & (PLL_ENABLE | PLL_STABLE)) != (PLL_ENABLE | PLL_STABLE)) {
++		aud.state = "PLL NOT LOCKED";
++		return;
++	}
++	pad_normal(pmu);
++	codec_mclk_on(cmu);
++	aud.pad_after = aud_rd(pmu, PMU_ABOX_PAD);
++	aud.gate_after = aud_rd(cmu, AUD_GATE_CODEC_MCLK);
++	delay(1000);                            /* let the codec see a few thousand clock edges */
++	aud.test_after = a04s_acpm_codec_retest();
++	aud.state = aud.test_after == 0 ? "CODEC ANSWERS" : "CLOCK ON, CODEC SILENT";
++}
++
++void a04s_audclk_report(void);
++void
++a04s_audclk_report(void)
++{
++	kprintf("AUD CLK %s PD %x PLL %08x AUDIF %x MCLKDIV %x PAD %x>%x GATE %x>%x TEST %d>%d\n",
++	    aud.state, aud.pd, aud.pll, aud.div_audif, aud.div_mclk, aud.pad_before, aud.pad_after,
++	    aud.gate_before, aud.gate_after, aud.test_before, aud.test_after);
++}
++#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_emmc_guard.h b/bsd/dev/a04s_emmc_guard.h
 new file mode 100644
 index 0000000..61653da
@@ -2880,10 +3062,10 @@ index 0000000..71e3802
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_input.c b/bsd/dev/a04s_input.c
 new file mode 100644
-index 0000000..ac6bfa6
+index 0000000..63169d2
 --- /dev/null
 +++ b/bsd/dev/a04s_input.c
-@@ -0,0 +1,1342 @@
+@@ -0,0 +1,1345 @@
 +/*
 + * Galaxy A04s, stage 7: the keys (7b), and read-only first looks at the touch path (7a-1) and
 + * the GPU's power domain (7c-1).
@@ -4155,6 +4337,9 @@ index 0000000..ac6bfa6
 +	a04s_gpu_start();
 +	extern void a04s_power_start(void);
 +	a04s_power_start();
++	/* v54, audio A2: the codec's clock (bsd/dev/a04s_audclk.c), before the key thread uses ACPM. */
++	extern void a04s_audclk_start(void);
++	a04s_audclk_start();
 +	cmu_cmgp_va = cmu_cmgp;
 +	a04s_touch_spi_start();
 +	if (!alive_pins) {
@@ -7121,7 +7306,7 @@ index 0000000..e3b8eb3
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 diff --git a/iokit/Kernel/arm/HeroGPU.cpp b/iokit/Kernel/arm/HeroGPU.cpp
-index 3ba3cb8..6a5bb55 100644
+index 3ba3cb8..7ceef6e 100644
 --- a/iokit/Kernel/arm/HeroGPU.cpp
 +++ b/iokit/Kernel/arm/HeroGPU.cpp
 @@ -28,7 +28,7 @@
@@ -7217,7 +7402,7 @@ index 3ba3cb8..6a5bb55 100644
  
  public:
  	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
-@@ -300,10 +352,10 @@ HeroGPU::start(IOService *provider)
+@@ -300,14 +352,29 @@ HeroGPU::start(IOService *provider)
  		return false;
  	}
  	setProperty(kIOUserClientClassKey, "HeroGPUUserClient");
@@ -7230,7 +7415,26 @@ index 3ba3cb8..6a5bb55 100644
  	PE_parse_boot_argn("heroaccel", &accel, sizeof(accel));
  	if (accel) {
  		IOAcceleratorES *es = OSTypeAlloc(IOAcceleratorES);
-@@ -331,7 +383,8 @@ HeroGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
+ 		if (es != NULL && es->init() && es->attach(this)) {
++#if defined(ARM64_BOARD_CONFIG_A04S)
++			/*
++			 * v54 (Metal M4): with boot-arg a04smetal=1, Metal's MTLRegisterDevices looks for
++			 * /System/Library/Extensions/A04sMetal.bundle here. Its device returns nil in every process
++			 * but the Metal session's probe, so backboardd and SpringBoard get no Metal device, as before.
++			 * The class stays IOAcceleratorES: QuartzCore opens IOGPU devices on any AGXAccelerator.
++			 */
++			int metal = 0;
++			PE_parse_boot_argn("a04smetal", &metal, sizeof(metal));
++			if (metal) {
++				es->setProperty("MetalPluginName", "A04sMetal");
++				es->setProperty("MetalPluginClassName", "A04sMetalDevice");
++				IOLog("HEROGPU: IOAcceleratorES names the Metal bundle A04sMetal (a04smetal=1)\n");
++			}
++#endif
+ 			es->registerService();
+ 			IOLog("HEROGPU: IOAcceleratorES registered\n");
+ 		}
+@@ -331,7 +398,8 @@ HeroGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
  	fTask = owningTask;
  	fLock = IOLockAlloc();
  	fBOs = (struct herogpu_bo *)IOMallocZeroData(HEROGPU_MAX_BOS * sizeof(*fBOs));
@@ -7240,7 +7444,7 @@ index 3ba3cb8..6a5bb55 100644
  }
  
  IOReturn
-@@ -351,6 +404,10 @@ HeroGPUUserClient::free(void)
+@@ -351,6 +419,10 @@ HeroGPUUserClient::free(void)
  		IOFreeData(fBOs, HEROGPU_MAX_BOS * sizeof(*fBOs));
  		fBOs = NULL;
  	}
@@ -7251,7 +7455,7 @@ index 3ba3cb8..6a5bb55 100644
  	if (fLock != NULL) {
  		IOLockFree(fLock);
  		fLock = NULL;
-@@ -464,13 +521,17 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+@@ -464,13 +536,17 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
  	}
  	case kHeroGPULog:
  		/* Test programs have no console here: their lines go to the
@@ -7270,7 +7474,7 @@ index 3ba3cb8..6a5bb55 100644
  		}
  		break;
  	default:
-@@ -499,9 +560,10 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+@@ -499,9 +575,10 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
  static void
  herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  {
@@ -7282,7 +7486,7 @@ index 3ba3cb8..6a5bb55 100644
  		return;
  	}
  	IOLog("HEROGPU SELFTEST: GPU_ID %#llx rev %#llx shaders %#llx tiler features %#llx "
-@@ -511,6 +573,8 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+@@ -511,6 +588,8 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  	bzero(&bo, sizeof(bo));
  	if (!herogpu_bo_create(&bo, 0x10000)) {
  		IOLog("HEROGPU SELFTEST: buffer failed\n");
@@ -7291,7 +7495,7 @@ index 3ba3cb8..6a5bb55 100644
  		return;
  	}
  	/* Through a write-combined kernel mapping, as a client would. */
-@@ -519,7 +583,9 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+@@ -519,7 +598,9 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  	volatile uint8_t *job = map ? (volatile uint8_t *)map->getVirtualAddress() : NULL;
  	if (job == NULL) {
  		IOLog("HEROGPU SELFTEST: mapping failed\n");
@@ -7301,7 +7505,7 @@ index 3ba3cb8..6a5bb55 100644
  		return;
  	}
  	job[16] = 1 | (2 << 1);                         /* 64-bit, WRITE_VALUE */
-@@ -531,9 +597,13 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+@@ -531,9 +612,13 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  	__asm__ volatile ("dsb sy" ::: "memory");
  	uint64_t us = 0;
  	uint32_t status = herolte_gpu_submit(1, bo.va, &us);
