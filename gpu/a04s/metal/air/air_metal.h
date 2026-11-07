@@ -607,6 +607,10 @@ struct rwa_constant {
 	unsigned index;
 	uint64_t bits;
 };
+/* A04s (Metal track M6): waits until the driver's shader cache has written what it was given
+ * (Mesa writes it on a thread of its own, and a process that ends early loses what is queued).
+ * 1 when the screen has a cache at all, 0 when it has none. */
+int rwa_shader_cache_sync(struct rwa_device *device);
 void rwa_set_function_constants(struct rwa_device *device, unsigned stage,
 				const struct rwa_constant *values, unsigned count);
 struct rwa_fence;

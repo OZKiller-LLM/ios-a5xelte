@@ -190,12 +190,32 @@ a04s_cpu_now(void)
    a04s_apply_constants([self rwa], RWA_STAGE_VERTEX, d.vertexFunction);
    a04s_apply_constants([self rwa], RWA_STAGE_FRAGMENT, d.fragmentFunction);
    double t = a04s_now(), c = a04s_cpu_now();
-   id p = [super newRenderPipelineStateWithDescriptor:d error:error];
+   NSError *e = nil;
+   id p = [super newRenderPipelineStateWithDescriptor:d error:&e];
    a04s_log("render pipeline %s + %s: %s in %.2f s (CPU %.2f s)%s%s", d.vertexFunction.name.UTF8String ?: "-",
             d.fragmentFunction.name.UTF8String ?: "-", p ? "made" : "REFUSED", a04s_now() - t, a04s_cpu_now() - c,
-            !p && error && *error ? ": " : "", !p && error && *error ? (*error).localizedDescription.UTF8String : "");
+            !p && e ? ": " : "", !p && e ? e.localizedDescription.UTF8String : "");
    a04s_apply_constants([self rwa], RWA_STAGE_VERTEX, nil);
    a04s_apply_constants([self rwa], RWA_STAGE_FRAGMENT, nil);
+   if (p)
+      rwa_shader_cache_sync([self rwa]);
+   /* A04s (M6): QuartzCore ends its process when a render pipeline is refused ("Metal failed to build
+    * render pipeline"), so a refused one is answered with a stand-in whose draws are skipped and logged
+    * (bgmtl.m, BG_WORK_DRAW): one wrong layer instead of no picture at all. A04S_NULL_PIPELINES=0
+    * returns nil and the error instead, as Metal would. */
+   if (!p && !(getenv("A04S_NULL_PIPELINES") && getenv("A04S_NULL_PIPELINES")[0] == '0')) {
+      BGMTLRenderPipeline *np = [[BGMTLRenderPipeline alloc] initWithDevice:self pipelineStateDescriptor:d];
+      if (np) {
+         np->_owner = self;
+         snprintf(np->_names, sizeof(np->_names), "%s+%s", d.vertexFunction.name.UTF8String ?: "gen",
+                  d.fragmentFunction.name.UTF8String ?: "-");
+         a04s_log("render pipeline %s: a stand-in that draws nothing is handed back", np->_names);
+         p = np;
+         e = nil;
+      }
+   }
+   if (error)
+      *error = e;
    bg_unlock();
    return p;
 }
@@ -206,6 +226,8 @@ a04s_cpu_now(void)
    a04s_apply_constants([self rwa], RWA_STAGE_COMPUTE, function);
    double t = a04s_now(), c = a04s_cpu_now();
    id p = [super bgPipelineForFunction:function descriptor:descriptor error:error];
+   if (p)
+      rwa_shader_cache_sync([self rwa]);
    a04s_log("compute pipeline %s: %s in %.2f s (CPU %.2f s)%s%s", [[function name] UTF8String] ?: "-",
             p ? "made" : "REFUSED", a04s_now() - t, a04s_cpu_now() - c, !p && error && *error ? ": " : "",
             !p && error && *error ? (*error).localizedDescription.UTF8String : "");
@@ -241,8 +263,9 @@ a04s_cpu_now(void)
     * in a probe, and already right when a client such as backboardd gets this device later (M6). */
    setenv("CI_USE_MTL_DAG_FOR_CIKL_SRC", "0", 0);
    setenv("CA_USE_CGTEXTUREDATA", "0", 0);
-   a04s_log("A04sMTLDevice ready: %s, registryID %#llx", rwa_device_name([self rwa]),
-            (unsigned long long)_a04sRegistry);
+   a04s_log("A04sMTLDevice ready: %s, registryID %#llx, shader cache %s (%s)", rwa_device_name([self rwa]),
+            (unsigned long long)_a04sRegistry, rwa_shader_cache_sync([self rwa]) ? "on" : "OFF",
+            getenv("MESA_SHADER_CACHE_DIR") ? getenv("MESA_SHADER_CACHE_DIR") : "no MESA_SHADER_CACHE_DIR");
    return self;
 }
 

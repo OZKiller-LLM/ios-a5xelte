@@ -42,6 +42,27 @@
  */
 static bool library_wrapper = false;
 
+/* A04s (Metal track M6): AIR_FC="index=value,index=value,..." gives function constants the
+ * values a pipeline would (the A04s device logs them as "specialise ...: non-zero: 6=0x2 ..."),
+ * so a specialisation that failed on the phone can be translated again here. Unlisted ones
+ * stay zero. */
+static void
+apply_env_fc(struct air_constant_value *fc, unsigned num_fc)
+{
+   const char *e = getenv("AIR_FC");
+   while (e && *e) {
+      char *end;
+      unsigned long idx = strtoul(e, &end, 0);
+      if (*end != '=')
+         break;
+      unsigned long long val = strtoull(end + 1, &end, 0);
+      for (unsigned i = 0; i < num_fc; i++)
+         if (fc[i].index == idx)
+            fc[i].bits = val;
+      e = *end == ',' ? end + 1 : end;
+   }
+}
+
 static const nir_shader_compiler_options default_options = {
    .lower_fdiv = false,
 };
@@ -302,6 +323,7 @@ eval_module(const struct module_ref *mod)
    const char *err = NULL;
    struct air_constant_value *fc;
    unsigned num_fc = air_module_function_constants(ctx, mod->bitcode, mod->size, &fc);
+   apply_env_fc(fc, num_fc);
    struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
                                         .library_wrapper = library_wrapper };
    struct air_shader_info info;
@@ -395,6 +417,7 @@ interface_module(const struct module_ref *mod)
    const char *err = NULL;
    struct air_constant_value *fc;
    unsigned num_fc = air_module_function_constants(ctx, mod->bitcode, mod->size, &fc);
+   apply_env_fc(fc, num_fc);
    struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
                                         .library_wrapper = library_wrapper };
    struct air_shader_info info;
@@ -479,6 +502,7 @@ report_one(const struct module_ref *mod)
     */
    struct air_constant_value *fc;
    unsigned num_fc = air_module_function_constants(ctx, mod->bitcode, mod->size, &fc);
+   apply_env_fc(fc, num_fc);
    struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
                                         .library_wrapper = library_wrapper };
    if (num_fc)
@@ -606,6 +630,7 @@ main(int argc, char **argv)
       }
       struct air_constant_value *fc;
       unsigned num_fc = air_module_function_constants(ctx, mods[k].bitcode, mods[k].size, &fc);
+      apply_env_fc(fc, num_fc);
       struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
                                         .library_wrapper = library_wrapper };
       struct air_shader_info info;

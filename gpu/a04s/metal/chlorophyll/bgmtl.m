@@ -1133,6 +1133,11 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
             BG_LOG("clear skipped: %s\n", why);   // one bad clear no longer drops the rest of the frame (see the draw below)
       } else if (w->kind == BG_WORK_DRAW) {
          BGMTLRenderPipeline *rp = (BGMTLRenderPipeline *)w->render;
+         if (!rp || !rp->_render) {
+            // A04s (Metal track M6): a stand-in for a refused pipeline (A04sMTLDevice) draws nothing
+            BG_LOG("draw skipped: pipeline %s was refused at creation\n", rp ? rp->_names : "(none)");
+            continue;
+         }
          struct rwa_buffer *vb[BG_MAX_BINDINGS] = { NULL }, *fb[BG_MAX_BINDINGS] = { NULL };
          struct rwa_buffer_bind vt[BG_MAX_BINDINGS] = { { NULL, 0 } }, ft[BG_MAX_BINDINGS] = { { NULL, 0 } };
          struct rwa_vertex_stream streams[BG_MAX_BINDINGS] = { { NULL, 0 } };

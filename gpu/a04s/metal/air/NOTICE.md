@@ -21,6 +21,7 @@ The Metal shader front end (AIR → NIR, `air_*.c`, `nir_air.h`, `air2nir.c`, `m
     - freedreno's debug flag only where freedreno is linked;
     - pointer locals kept at translation time (`AIR_VAL_SLOT`), including a constant `metal::sampler` struct and a zero `getelementptr` or `bitcast` of one;
     - pointer members of a scratch initializer left zero.
+    - after the first phone run: the null texture reads zeros and drops writes (QuartzCore's off colour cube); a buffer the shader declares and the encoder left unbound reads a device buffer of zeros (QuartzCore's `config_buffer`); `rwa_shader_cache_sync` waits for Mesa's cache writes; `air2nir` takes function constant values from `AIR_FC`.
 - The port was done with a script kept in the session notes, which asserts every anchor. The `AIR_VAL_SLOT` and initializer changes were made by hand afterwards.
 
 ## What it was checked against

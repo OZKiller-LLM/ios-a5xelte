@@ -1561,6 +1561,30 @@ tex_coord_and_layer(struct air_ctx *c, const struct air_inst *in,
    return coord;
 }
 
+/* A04s (Metal track M6): zero of an AIR type, as a value (numbers and aggregates of them). */
+static struct air_val *
+zero_of_type(struct air_ctx *c, const struct air_type *t)
+{
+   if (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY) {
+      unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : (unsigned)t->count;
+      struct air_val *v = rzalloc(c->mem_ctx, struct air_val);
+      v->kind = AIR_VAL_AGG;
+      v->num_elems = n;
+      v->elems = rzalloc_array(c->mem_ctx, struct air_val *, MAX2(n, 1));
+      for (unsigned i = 0; i < n; i++) {
+         v->elems[i] = zero_of_type(c, t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem);
+         if (!v->elems[i])
+            return NULL;
+      }
+      return v;
+   }
+   if (t->kind != AIR_TYPE_INT && !air_type_is_float(t) &&
+       !(t->kind == AIR_TYPE_VECTOR && t->elem &&
+         (t->elem->kind == AIR_TYPE_INT || air_type_is_float(t->elem))))
+      return NULL;
+   return air_val_ssa(c, nir_imm_zero(&c->b, air_nir_components(t), air_nir_bit_size(c, t)));
+}
+
 static bool
 texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n)
 {
@@ -1568,6 +1592,24 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
    if (!parse_tex_name(n->part[0], &t))
       return air_error(c, "intrinsic: air.%s (a texture name this cannot take apart)",
                        n->part[0]);
+   /* A04s (Metal track M6): an operation on the NULL texture (air.get_null_texture, kept as
+    * AIR_PTR_NONE). Metal reads zeros from it and drops writes to it. QuartzCore's iOS 16.7
+    * ubershader picks it for a colour cube its function constants switch off, on a path whose
+    * branches are decided only at run time, so the instruction has to translate even though it
+    * never runs with the null texture: a read is zero of its result type, a write is nothing. */
+   {
+      struct air_val *tv = in->num_operands > 1 ? air_get(c, in->operands[1]) : NULL;
+      if (tv && tv->kind == AIR_VAL_PTR && tv->ptr.class == AIR_PTR_NONE) {
+         if (!in->base.type || in->base.type->kind == AIR_TYPE_VOID)
+            return true;
+         struct air_val *z = zero_of_type(c, in->base.type);
+         if (!z)
+            return air_error(c, "intrinsic: air.%s of the null texture, whose result type has "
+                                "no zero here", n->part[0]);
+         air_set(c, &in->base, z);
+         return true;
+      }
+   }
    if (t.is_buffer)
       return air_error(c, "intrinsic: air.%s (texture buffers, not yet)", n->part[0]);
    /* A comparison belongs to a depth texture and to a sample: Apple's header declares

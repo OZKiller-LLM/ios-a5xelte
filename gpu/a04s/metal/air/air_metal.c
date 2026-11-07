@@ -77,6 +77,7 @@
 #include "util/u_sampler.h"
 #include "util/u_debug.h"
 #include "util/u_gen_mipmap.h"
+#include "util/disk_cache.h"   /* A04s (M6): rwa_shader_cache_sync */
 #include "util/simple_mtx.h"
 #include "util/os_time.h"
 #include "util/hash_table.h"
@@ -110,6 +111,10 @@ struct rwa_device {
     * (rwa_set_function_constants); none set means every constant is zero, as before. */
    struct rwa_constant *fc[RWA_STAGE_COUNT];
    unsigned num_fc[RWA_STAGE_COUNT];
+
+   /* A04s (Metal track M6): zeros for a buffer a shader declares and the encoder left unbound
+    * (zero_buffer_for); made on first use. */
+   struct rwa_buffer *zero_buffer;
 
    /* NIR's options for this screen, asked once: the translator needs them to know what
     * the consumer can be handed (what it may leave for the backend to lower).
@@ -807,6 +812,18 @@ fail:
 }
 
 /* A04s (Metal track M6): see air_metal.h. */
+int
+rwa_shader_cache_sync(struct rwa_device *device)
+{
+   struct disk_cache *dc = device && device->screen->get_disk_shader_cache
+                              ? device->screen->get_disk_shader_cache(device->screen) : NULL;
+   if (!dc)
+      return 0;
+   disk_cache_wait_for_idle(dc);
+   return 1;
+}
+
+/* A04s (Metal track M6): see air_metal.h. */
 void
 rwa_set_function_constants(struct rwa_device *device, unsigned stage,
                            const struct rwa_constant *values, unsigned count)
@@ -849,6 +866,8 @@ rwa_device_close(struct rwa_device *device)
       return;
    for (unsigned i = 0; i < RWA_STAGE_COUNT; i++)
       free(device->fc[i]);
+   if (device->zero_buffer)
+      rwa_buffer_destroy(device->zero_buffer);
    if (device->default_sampler)
       device->pipe->delete_sampler_state(device->pipe, device->default_sampler);
    device->pipe->destroy(device->pipe);
@@ -4011,6 +4030,22 @@ argbuf_mask_of(const struct air_shader_info *info, const char *name, unsigned *m
  * shorter than it declares writes past the end of it, and on this GPU that is not a
  * fault but another shader's memory.
  */
+/* A04s (Metal track M6): the device's buffer of zeros, for declared and unbound buffers. */
+#define A04S_ZERO_BUFFER_SIZE (256u * 1024u)
+static struct rwa_buffer *
+zero_buffer_for(struct rwa_device *device, char *why, size_t why_size)
+{
+   if (!device->zero_buffer) {
+      device->zero_buffer = rwa_buffer_create(device, A04S_ZERO_BUFFER_SIZE, why, why_size);
+      if (!device->zero_buffer)
+         return NULL;
+      void *p = rwa_buffer_map(device->zero_buffer);
+      if (p)
+         memset(p, 0, A04S_ZERO_BUFFER_SIZE);
+   }
+   return device->zero_buffer;
+}
+
 static int
 check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
                const struct rwa_bindings *bindings,
@@ -4044,6 +4079,13 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
          struct rwa_buffer *b = mbuffer;
 
          if (!member) {
+            /* A04s (Metal track M6): a buffer the shader declares and the encoder left
+             * unbound reads zeros (bind_stage, zero_buffer_for). QuartzCore's ubershader
+             * declares every buffer any specialisation of it reads, and binds only the ones
+             * its function constants switch on -- `config_buffer` at 0 among them. */
+            if ((r->index >= bindings->buffer_count || !bindings->buffers[r->index]) &&
+                r->size <= A04S_ZERO_BUFFER_SIZE)
+               continue;
             if (r->index >= bindings->buffer_count || !bindings->buffers[r->index]) {
                say(why, why_size, "%s reads buffer %u and %u buffer%s bound", name,
                    r->index, bindings->buffer_count,
@@ -4224,7 +4266,14 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
          switch (r->kind) {
          case AIR_RESOURCE_DEVICE_BUFFER:
          case AIR_RESOURCE_CONSTANT_BUFFER:
-            b = bindings->buffers[r->index];
+            b = r->index < bindings->buffer_count ? bindings->buffers[r->index] : NULL;
+            if (!b) {
+               /* A04s (Metal track M6): unbound, and accepted by check_bindings: zeros */
+               b = zero_buffer_for(device, why, why_size);
+               if (!b)
+                  return -1;
+               break;
+            }
             /* and Metal's own offset on it, which check_bindings has already judged */
             if (direct_buffer_offset(r, bindings, table, table_count, name, &boffset, why,
                                      why_size) != 0)
