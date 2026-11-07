@@ -29,10 +29,10 @@ index a16d8e0..a1c90fc 100644
  bsd/dev/herolte_battery.c		standard
 diff --git a/bsd/dev/a04s_acpm.c b/bsd/dev/a04s_acpm.c
 new file mode 100644
-index 0000000..dad872f
+index 0000000..db7f3c8
 --- /dev/null
 +++ b/bsd/dev/a04s_acpm.c
-@@ -0,0 +1,484 @@
+@@ -0,0 +1,563 @@
 +/*
 + * Galaxy A04s: ACPM, the mailbox protocol of the APM core, to the S2MPU12 PMIC and the
 + * AUD3004X codec on the same bus. A write there can change a supply voltage, so this file
@@ -47,6 +47,7 @@ index 0000000..dad872f
 +#include <sys/errno.h>
 +#include <stdbool.h>
 +#include <kern/locks.h>
++#include <kern/clock.h>
 +#include <pexpert/pexpert.h>
 +#include <libkern/libkern.h>
 +#include "a04s_acpm_guard.h"
@@ -371,6 +372,84 @@ index 0000000..dad872f
 +	return 0;
 +}
 +
++/*
++ * v57: the write test on one allowed codec register: read, the value ^ 0x5a written and read back,
++ * the old value put back. 0: stored and restored; ENODEV: written, not stored.
++ */
++static int
++codec_test_reg(uint32_t bus_addr, uint32_t reg)
++{
++	uint8_t was = 0, back = 0, again = 0;
++	int error = acpm_read(bus_addr, reg, &was);
++	if (error) {
++		return error;
++	}
++	uint8_t probe = was ^ 0x5au;
++	error = acpm_write(bus_addr, reg, probe);
++	if (!error) {
++		error = acpm_read(bus_addr, reg, &back);
++	}
++	int restore = acpm_write(bus_addr, reg, was);
++	if (!restore) {
++		restore = acpm_read(bus_addr, reg, &again);
++	}
++	if (!restore && again != was) {
++		restore = EIO;
++	}
++	if (!error && back != probe) {
++		error = ENODEV;
++	}
++	if (!error && restore) {
++		error = 100 + restore;
++	}
++	return error;
++}
++
++/* v57: bits ORed into one allowed codec register, then read back. Only ever sets bits. */
++static int
++codec_set_bits(uint32_t bus_addr, uint32_t reg, uint8_t bits, uint8_t *before, uint8_t *after)
++{
++	int error = acpm_read(bus_addr, reg, before);
++	if (!error && (*before & bits) != bits) {
++		error = acpm_write(bus_addr, reg, (uint8_t)(*before | bits));
++	}
++	if (!error) {
++		error = acpm_read(bus_addr, reg, after);
++	}
++	return error;
++}
++
++/*
++ * v57: the codec made ready to capture, as Android's aud3004x.c does in the ADC's PRE_PMU and in
++ * capture_hw_params(): CLKGATE0 SEQ|ADC|COM on (0x25), CLKGATE2 ADC_CIC_CGL|CGR on (0x06), then
++ * RESETB0 CORE_RESETB|RSTB_ADC|ADC_RESETB released (0x2A, active-low resets) and 1 ms
++ * (AUD3004X_RESETB_TIME_USEC). First the write test on IF_FORM1 (0x20), outside the ADC block;
++ * after, the write test on AD_VOLL (0x34) again. Every write goes through acpm_write() and the codec
++ * allow-list; regs[] holds CLKGATE0, CLKGATE2 and RESETB0, each before and after.
++ */
++int a04s_acpm_codec_capture_ready(uint8_t regs[6], int *test_if, int *test_adc);
++int
++a04s_acpm_codec_capture_ready(uint8_t regs[6], int *test_if, int *test_adc)
++{
++	if (!acpm_ready || !acpm_writes_ok) {
++		return ENXIO;
++	}
++	*test_if = codec_test_reg(0x07, 0x20);                             /* AUD3004X_20_IF_FORM1 */
++	int error = codec_set_bits(0x07, 0x10, 0x25, &regs[0], &regs[1]);  /* CLKGATE0: SEQ, ADC, COM */
++	if (!error) {
++		error = codec_set_bits(0x07, 0x12, 0x06, &regs[2], &regs[3]);    /* CLKGATE2: ADC_CIC_CGL, CGR */
++	}
++	if (!error) {
++		error = codec_set_bits(0x07, 0x14, 0x2A, &regs[4], &regs[5]);    /* RESETB0: CORE, RSTB_ADC, ADC */
++	}
++	if (error) {
++		return error;
++	}
++	delay(1000);
++	*test_adc = codec_test_reg(0x07, 0x34);                            /* AUD3004X_34_AD_VOLL */
++	return 0;
++}
++
 +/* The registers Samsung's own drivers read first: s2mpu12-core.c, then aud3004x.c. */
 +void a04s_acpm_probe(void);
 +void
@@ -607,10 +686,10 @@ index 0000000..9d62d91
 +#endif /* A04S_ACPM_GUARD_H */
 diff --git a/bsd/dev/a04s_audclk.c b/bsd/dev/a04s_audclk.c
 new file mode 100644
-index 0000000..cb928c2
+index 0000000..a5cc126
 --- /dev/null
 +++ b/bsd/dev/a04s_audclk.c
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,258 @@
 +/*
 + * Galaxy A04s, audio route A2 (v54): the AUD3004X codec's master clock.
 + *
@@ -647,6 +726,13 @@ index 0000000..cb928c2
 + * and last register write in this file, and only when ABOX's bus clock gate (CMU_AUD+0x2048) isn't
 + * forced off, so the access can't stall the bus. The codec write test runs again 20 ms later.
 + * Heartbeat lines "AUD SNAP" and "AUD ABOX".
++ *
++ * v57: v56 found the codec powered and answering reads (DCTR_CM 0x02, its default) with RESETB0
++ * 0x00: core, ADC and DAC held in reset, so the AD_VOLL test can't pass. With the boot-arg
++ * "a04scodecrdy" set to 1, a04s_acpm_codec_capture_ready() does what Android does before capture: the
++ * codec's own ADC clocks on, its core and ADC out of reset, with a write test on IF_FORM1 before and
++ * on AD_VOLL after. Codec registers only, through a04s_acpm.c's allow-list; nothing here writes.
++ * Heartbeat line "AUD READY".
 + */
 +#if defined(ARM64_BOARD_CONFIG_A04S)
 +#include <sys/param.h>
@@ -660,6 +746,7 @@ index 0000000..cb928c2
 +extern int a04s_acpm_codec_retest(void);        /* a04s_acpm.c */
 +extern int a04s_acpm_codec_supplies_on(uint8_t before[2], uint8_t after[2]);   /* a04s_acpm.c, v55 */
 +extern int a04s_acpm_codec_snapshot(uint8_t out[12]);                           /* a04s_acpm.c, v56 */
++extern int a04s_acpm_codec_capture_ready(uint8_t regs[6], int *test_if, int *test_adc);  /* v57 */
 +
 +#define PMU_PA                  0x11860000u
 +#define PMU_PD_AUD_STATUS       0x2084u
@@ -696,8 +783,12 @@ index 0000000..cb928c2
 +	const char *abox;
 +	uint32_t aclk, uaif0, qch_aclk, qch_bclk0, qdis_before, qdis_after;
 +	int test_abox;
++	const char *ready_state;
++	int ready_rc, test_if, test_adc;
++	uint8_t ready[6];
 +} aud = { .state = "NOT RUN", .test_before = -1, .test_after = -1, .supply_rc = -1, .snap_rc = -1,
-+	    .abox = "NOT RUN", .test_abox = -1 };
++	    .abox = "NOT RUN", .test_abox = -1, .ready_state = "NOT RUN", .ready_rc = -1, .test_if = -1,
++	    .test_adc = -1 };
 +
 +static inline uint32_t
 +aud_rd(vm_offset_t base, uint32_t off)
@@ -765,6 +856,21 @@ index 0000000..cb928c2
 +	aud.abox = aud.test_abox == 0 ? "CODEC ANSWERS" : "BCLK ON, CODEC SILENT";
 +}
 +
++/* v57: with a04scodecrdy=1, the codec made ready to capture as Android does (a04s_acpm.c). */
++static void
++codec_step(void)
++{
++	int want = 0;
++	(void)PE_parse_boot_argn("a04scodecrdy", &want, sizeof(want));
++	if (want != 1) {
++		aud.ready_state = "READ ONLY";
++		return;
++	}
++	aud.ready_rc = a04s_acpm_codec_capture_ready(aud.ready, &aud.test_if, &aud.test_adc);
++	aud.ready_state = aud.ready_rc ? "FAILED" : aud.test_adc == 0 ? "CODEC ANSWERS" :
++	    aud.test_if == 0 ? "IF STORES, ADC SILENT" : "CODEC SILENT";
++}
++
 +void a04s_audclk_start(void);
 +void
 +a04s_audclk_start(void)
@@ -801,6 +907,7 @@ index 0000000..cb928c2
 +		    "SUPPLIES ON, CODEC SILENT";
 +	}
 +	abox_step(cmu);
++	codec_step();
 +	int want = 0;
 +	(void)PE_parse_boot_argn("a04saudclk", &want, sizeof(want));
 +	if (want != 1) {
@@ -836,6 +943,9 @@ index 0000000..cb928c2
 +	    aud.snap[6], aud.snap[7], aud.snap[8], aud.snap[9], aud.snap[10], aud.snap[11]);
 +	kprintf("AUD ABOX %s ACLK %x UAIF0 %x QCH %x %x QDIS %x>%x TEST %d\n", aud.abox, aud.aclk, aud.uaif0,
 +	    aud.qch_aclk, aud.qch_bclk0, aud.qdis_before, aud.qdis_after, aud.test_abox);
++	kprintf("AUD READY %s rc %d IF %d CLKGATE0 %02x>%02x CLKGATE2 %02x>%02x RESETB0 %02x>%02x ADC %d\n",
++	    aud.ready_state, aud.ready_rc, aud.test_if, aud.ready[0], aud.ready[1], aud.ready[2], aud.ready[3],
++	    aud.ready[4], aud.ready[5], aud.test_adc);
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_emmc_guard.h b/bsd/dev/a04s_emmc_guard.h
