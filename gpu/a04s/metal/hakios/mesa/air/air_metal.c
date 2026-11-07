@@ -271,6 +271,7 @@ struct rwa_compute {
    struct rwa_compute_info caps;
 
    bool dynamic_threadgroup;      /* a threadgroup buffer sized by the dispatch */
+   unsigned dynamic_threadgroup_length;  /* A04s M1c: set by rwa_compute_set_threadgroup_memory_length */
 
    /* the texture slots, as above, and the states built for the samplers the shader
     * declares for itself: those are nothing for a driver to create (rwa_compute_info
@@ -3948,6 +3949,37 @@ rwa_dispatch(struct rwa_compute *compute, const struct rwa_bindings *bindings,
                                why_size);
 }
 
+/* A04s (Metal track M1c): see air_metal.h. */
+int
+rwa_compute_set_threadgroup_memory_length(struct rwa_compute *compute, unsigned length,
+                                          unsigned index, char *why, size_t why_size)
+{
+   const char *name = compute->info.entry_point ? compute->info.entry_point : "the shader";
+
+   if (!compute->dynamic_threadgroup) {
+      say(why, why_size, "%s declares no threadgroup buffer to size", name);
+      return -1;
+   }
+   if (index != 0) {
+      say(why, why_size, "%s: a threadgroup buffer at index %u (only 0 is supported)",
+          name, index);
+      return -1;
+   }
+   if (length == 0 || length % 16) {
+      say(why, why_size, "%s: threadgroup memory length %u is not a nonzero multiple of 16",
+          name, length);
+      return -1;
+   }
+   if (compute->info.threadgroup_bytes) {
+      say(why, why_size, "%s has %u bytes of its own threadgroup variables as well as a "
+                         "threadgroup buffer, and both start at offset 0 (not yet handled)",
+          name, compute->info.threadgroup_bytes);
+      return -1;
+   }
+   compute->dynamic_threadgroup_length = length;
+   return 0;
+}
+
 int
 rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bindings,
                      const struct rwa_buffer_bind *table, unsigned table_count,
@@ -3989,10 +4021,10 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
       return -1;
    }
 
-   if (compute->dynamic_threadgroup) {
+   if (compute->dynamic_threadgroup && !compute->dynamic_threadgroup_length) {
       say(why, why_size, "%s takes a threadgroup buffer whose size only the dispatch can "
-                         "give (Metal's -setThreadgroupMemoryLength:atIndex:), and this "
-                         "call has no argument for it", name);
+                         "give (Metal's -setThreadgroupMemoryLength:atIndex:), and none was "
+                         "set (rwa_compute_set_threadgroup_memory_length)", name);
       return -1;
    }
 
@@ -4023,6 +4055,9 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
       .work_dim = 3,
       .block = { group_size[0], group_size[1], group_size[2] },
       .grid = { groups[0], groups[1], groups[2] },
+      /* A04s M1c: the [[threadgroup(0)]] buffer, after the kernel's static threadgroup
+       * memory in the GPU's workgroup storage (Panfrost adds it to wls_size). */
+      .variable_shared_mem = compute->dynamic_threadgroup ? compute->dynamic_threadgroup_length : 0,
    };
    pipe->launch_grid(pipe, &grid);
 

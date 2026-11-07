@@ -213,6 +213,11 @@ if [ -n "${METALLIBS:-}" ]; then
 	probe p_fbfetch --draw-vertex "$PROBE" quad_vs_p fbfetch_fs 125
 	probe p_const --draw "$PROBE" const_fs 125
 	probe p_simd_sum "$PROBE" simd_sum_k
+	# M1c: what reaches Bifrost's packer for the SIMD-group sum (CLPER's source port)
+	"$A2N" "$PROBE" simd_sum_k > "$OUT/apple/simd_sum_k.nir.txt" 2>&1 || true
+	set +e
+	BIFROST_MESA_DEBUG=shaders on_mali p_simd_sum_ir "$AMT" "$PROBE" simd_sum_k
+	set -e
 	probe p_atomic "$PROBE" atomic_count
 	probe p_half_read --draw "$PROBE" half_read_fs 125
 	cd "$OUT"

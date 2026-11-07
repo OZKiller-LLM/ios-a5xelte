@@ -1645,9 +1645,16 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       nir_def *coord = tex_coord_and_layer(c, in, &t, n, &arg, ncoord);
       if (!coord)
          return false;
+      /* A04s (Metal track M1c): a write returns void, so the type the image store hands the
+       * backend is the stored value's, not the result's -- tex_dest_type of the void result
+       * gave Bifrost's bi_reg_fmt_for_nir no type at all ("Invalid type for register
+       * format"). The value's scalar type gives float or the width; the signedness of an
+       * integer write is in the name (.s/.u), as for reads. */
+      const struct air_type *value_type = in->operands[arg]->type;
       nir_def *value = air_get_ssa(c, in->operands[arg++]);
       if (!value)
          return false;
+      dest_type = tex_dest_type(c, value_type, n);
       uint64_t lod;
       if (!tex_flag(c, in, arg, &lod))
          return false;

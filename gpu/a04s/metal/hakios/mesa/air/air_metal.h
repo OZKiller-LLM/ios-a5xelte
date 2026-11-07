@@ -94,6 +94,18 @@ struct rwa_compute *rwa_compute_create(struct rwa_device *device, const void *bi
 void rwa_compute_destroy(struct rwa_compute *compute);
 
 /*
+ * A04s (Metal track M1c): the length of a kernel's [[threadgroup(index)]] buffer, as Metal's
+ * -[MTLComputeCommandEncoder setThreadgroupMemoryLength:atIndex:] gives it, kept with the
+ * pipeline for the dispatches that follow. Without it a kernel that declares such a buffer is
+ * refused at dispatch (it was always refused before this call existed). The length is in
+ * bytes, a multiple of 16 as Metal requires. Only index 0 is supported, and not together with
+ * the kernel's own (static) threadgroup variables: the front end places the buffer at offset
+ * 0 of the threadgroup memory, where those start too. Returns 0, or -1 with a sentence.
+ */
+int rwa_compute_set_threadgroup_memory_length(struct rwa_compute *compute, unsigned length,
+					      unsigned index, char *why, size_t why_size);
+
+/*
  * A texture. The shape comes from Metal's own descriptor, in Metal's own terms, because that
  * is what a driver has in its hand when newTextureWithDescriptor: is called; translating it
  * into Gallium's terms is this library's job, and a format it cannot translate must be

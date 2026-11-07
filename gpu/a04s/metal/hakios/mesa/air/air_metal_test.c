@@ -6642,6 +6642,14 @@ main(int argc, char **argv)
    };
    const unsigned groups[3] = { 1, 1, 1 };
    const unsigned group_size[3] = { TEX, TEX, 1 };
+   /* A04s (Metal track M1c): a kernel with a [[threadgroup(0)]] buffer gets 1 KiB of it, as
+    * an application's -setThreadgroupMemoryLength:atIndex: would give; the call refuses a
+    * kernel that declares none, which is every other kernel, and that is not an error. */
+   {
+      char tg_why[WHY] = "";
+      if (rwa_compute_set_threadgroup_memory_length(compute, 1024, 0, tg_why, sizeof(tg_why)) == 0)
+         printf("air_metal_test: threadgroup buffer 0 is 1024 bytes\n");
+   }
    if (rwa_dispatch(compute, &bindings, groups, group_size, why, sizeof(why)) != 0) {
       printf("air_metal_test: rwa_dispatch: %s\n", why);
       rwa_compute_destroy(compute);
