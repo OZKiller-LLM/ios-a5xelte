@@ -1139,10 +1139,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..71e3802
+index 0000000..a030846
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
-@@ -0,0 +1,2391 @@
+@@ -0,0 +1,2407 @@
 +/*
 + * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
 + *
@@ -3532,6 +3532,22 @@ index 0000000..71e3802
 +			kprintf("GPUNOTE %.*s\n", (int)n, gpu_notes[i].text);
 +		}
 +	}
++	/*
++	 * v60: memory, for the jetsam spiral (2026-11-08): what jetsam acts on, free and wired pages (16 KiB),
++	 * the compressor, swap, and HeroGPU's own wired buffers. Reads only.
++	 */
++	extern unsigned int memorystatus_available_pages, vm_page_free_count, vm_page_wire_count;
++	extern uint32_t c_segment_pages_compressed;
++	extern int64_t c_segment_compressed_bytes;
++	extern uint64_t vm_swap_get_used_space(void);
++	extern void herogpu_mem_stats(uint64_t *live, uint64_t *peak, uint32_t *bos);
++	uint64_t bo_live = 0, bo_peak = 0;
++	uint32_t bos = 0;
++	herogpu_mem_stats(&bo_live, &bo_peak, &bos);
++	kprintf("MEM AVAIL %u FREE %u WIRED %u CMP %u PAGES %lld KB SWAP %llu KB GPUBO %u %llu KB PEAK %llu KB\n",
++	    memorystatus_available_pages, vm_page_free_count, vm_page_wire_count, c_segment_pages_compressed,
++	    (long long)(c_segment_compressed_bytes / 1024), (unsigned long long)(vm_swap_get_used_space() / 1024), bos,
++	    (unsigned long long)(bo_live / 1024), (unsigned long long)(bo_peak / 1024));
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_input.c b/bsd/dev/a04s_input.c
@@ -7780,7 +7796,7 @@ index 0000000..e3b8eb3
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 diff --git a/iokit/Kernel/arm/HeroGPU.cpp b/iokit/Kernel/arm/HeroGPU.cpp
-index 3ba3cb8..7ceef6e 100644
+index 3ba3cb8..9afb1a3 100644
 --- a/iokit/Kernel/arm/HeroGPU.cpp
 +++ b/iokit/Kernel/arm/HeroGPU.cpp
 @@ -28,7 +28,7 @@
@@ -7868,7 +7884,65 @@ index 3ba3cb8..7ceef6e 100644
  	}
  	uint32_t reg = herogpu_param_reg(param);
  	return reg == ~0u ? 0 : herolte_gpu_reg(reg);
-@@ -280,6 +331,7 @@ class HeroGPUUserClient : public IOUserClient {
+@@ -198,6 +249,37 @@ herogpu_bo_import_surface(struct herogpu_bo *bo, uint32_t id)
+ 	return true;
+ }
+ 
++/*
++ * v60: HeroGPU's own buffers -- wired kernel memory, invisible to jetsam's per-process footprints --
++ * counted live and at their peak for the heartbeat's MEM line. Imported surfaces aren't counted.
++ */
++static uint64_t herogpu_live_bytes, herogpu_peak_bytes;
++static uint32_t herogpu_live_bos;
++
++static void
++herogpu_mem_note(int64_t delta)
++{
++	uint64_t now = __atomic_add_fetch(&herogpu_live_bytes, (uint64_t)delta, __ATOMIC_RELAXED);
++	if (delta > 0) {
++		__atomic_add_fetch(&herogpu_live_bos, 1u, __ATOMIC_RELAXED);
++		uint64_t peak = __atomic_load_n(&herogpu_peak_bytes, __ATOMIC_RELAXED);
++		while (now > peak && !__atomic_compare_exchange_n(&herogpu_peak_bytes, &peak, now, false, __ATOMIC_RELAXED,
++		    __ATOMIC_RELAXED)) {
++		}
++	} else {
++		__atomic_sub_fetch(&herogpu_live_bos, 1u, __ATOMIC_RELAXED);
++	}
++}
++
++extern "C" void herogpu_mem_stats(uint64_t *live, uint64_t *peak, uint32_t *bos);
++extern "C" void
++herogpu_mem_stats(uint64_t *live, uint64_t *peak, uint32_t *bos)
++{
++	*live = __atomic_load_n(&herogpu_live_bytes, __ATOMIC_RELAXED);
++	*peak = __atomic_load_n(&herogpu_peak_bytes, __ATOMIC_RELAXED);
++	*bos = __atomic_load_n(&herogpu_live_bos, __ATOMIC_RELAXED);
++}
++
+ /* Allocate, zero, clean and GPU-map a buffer. */
+ static bool
+ herogpu_bo_create(struct herogpu_bo *bo, uint64_t size)
+@@ -237,6 +319,9 @@ herogpu_bo_create(struct herogpu_bo *bo, uint64_t size)
+ 		OSSafeReleaseNULL(bo->mem);
+ 		bo->va = 0;
+ 	}
++	if (ok) {
++		herogpu_mem_note((int64_t)bo->pages * 0x1000);       /* v60 */
++	}
+ 	return ok;
+ }
+ 
+@@ -247,6 +332,9 @@ herogpu_bo_free(struct herogpu_bo *bo)
+ 		return;
+ 	}
+ 	herolte_gpu_unmap(bo->va, bo->pages);
++	if (bo->mem != NULL) {
++		herogpu_mem_note(-(int64_t)bo->pages * 0x1000);      /* v60 */
++	}
+ 	OSSafeReleaseNULL(bo->umap);
+ 	OSSafeReleaseNULL(bo->mem);
+ 	OSSafeReleaseNULL(bo->surface);
+@@ -280,6 +368,7 @@ class HeroGPUUserClient : public IOUserClient {
  	task_t             fTask;
  	IOLock            *fLock;
  	struct herogpu_bo *fBOs;          /* handle = index + 1 */
@@ -7876,7 +7950,7 @@ index 3ba3cb8..7ceef6e 100644
  
  public:
  	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
-@@ -300,14 +352,29 @@ HeroGPU::start(IOService *provider)
+@@ -300,14 +389,29 @@ HeroGPU::start(IOService *provider)
  		return false;
  	}
  	setProperty(kIOUserClientClassKey, "HeroGPUUserClient");
@@ -7908,7 +7982,7 @@ index 3ba3cb8..7ceef6e 100644
  			es->registerService();
  			IOLog("HEROGPU: IOAcceleratorES registered\n");
  		}
-@@ -331,7 +398,8 @@ HeroGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
+@@ -331,7 +435,8 @@ HeroGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
  	fTask = owningTask;
  	fLock = IOLockAlloc();
  	fBOs = (struct herogpu_bo *)IOMallocZeroData(HEROGPU_MAX_BOS * sizeof(*fBOs));
@@ -7918,7 +7992,7 @@ index 3ba3cb8..7ceef6e 100644
  }
  
  IOReturn
-@@ -351,6 +419,10 @@ HeroGPUUserClient::free(void)
+@@ -351,6 +456,10 @@ HeroGPUUserClient::free(void)
  		IOFreeData(fBOs, HEROGPU_MAX_BOS * sizeof(*fBOs));
  		fBOs = NULL;
  	}
@@ -7929,7 +8003,7 @@ index 3ba3cb8..7ceef6e 100644
  	if (fLock != NULL) {
  		IOLockFree(fLock);
  		fLock = NULL;
-@@ -464,13 +536,17 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+@@ -464,13 +573,17 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
  	}
  	case kHeroGPULog:
  		/* Test programs have no console here: their lines go to the
@@ -7948,7 +8022,7 @@ index 3ba3cb8..7ceef6e 100644
  		}
  		break;
  	default:
-@@ -499,9 +575,10 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+@@ -499,9 +612,10 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
  static void
  herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  {
@@ -7960,7 +8034,7 @@ index 3ba3cb8..7ceef6e 100644
  		return;
  	}
  	IOLog("HEROGPU SELFTEST: GPU_ID %#llx rev %#llx shaders %#llx tiler features %#llx "
-@@ -511,6 +588,8 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+@@ -511,6 +625,8 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  	bzero(&bo, sizeof(bo));
  	if (!herogpu_bo_create(&bo, 0x10000)) {
  		IOLog("HEROGPU SELFTEST: buffer failed\n");
@@ -7969,7 +8043,7 @@ index 3ba3cb8..7ceef6e 100644
  		return;
  	}
  	/* Through a write-combined kernel mapping, as a client would. */
-@@ -519,7 +598,9 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+@@ -519,7 +635,9 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  	volatile uint8_t *job = map ? (volatile uint8_t *)map->getVirtualAddress() : NULL;
  	if (job == NULL) {
  		IOLog("HEROGPU SELFTEST: mapping failed\n");
@@ -7979,7 +8053,7 @@ index 3ba3cb8..7ceef6e 100644
  		return;
  	}
  	job[16] = 1 | (2 << 1);                         /* 64-bit, WRITE_VALUE */
-@@ -531,9 +612,13 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+@@ -531,9 +649,13 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  	__asm__ volatile ("dsb sy" ::: "memory");
  	uint64_t us = 0;
  	uint32_t status = herolte_gpu_submit(1, bo.va, &us);
