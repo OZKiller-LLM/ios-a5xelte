@@ -15,7 +15,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
+#include <mach/vm_map.h>        /* vm_read_overwrite: the iPhoneOS SDK has no mach_vm.h */
 
 extern const char *getprogname(void);
 
@@ -43,17 +43,17 @@ a04s_log(const char *fmt, ...)
 	}
 }
 
-/* Up to `len` bytes at `addr` as hex, read with mach_vm_read_overwrite so that an argument
- * that is not a pointer at all costs a "not readable" line, not a crash. */
+/* Up to `len` bytes at `addr` as hex, read with vm_read_overwrite so that an argument that is
+ * not a pointer at all costs a "not readable" line, not a crash. */
 static inline void
 a04s_log_bytes(const char *what, uintptr_t addr, size_t len)
 {
 	unsigned char buf[256];
-	mach_vm_size_t got = 0;
+	vm_size_t got = 0;
 	if (len > sizeof(buf))
 		len = sizeof(buf);
 	if (addr < 0x100000000ull || addr > 0x7fffffffffull ||
-	    mach_vm_read_overwrite(mach_task_self(), addr, len, (mach_vm_address_t)buf, &got) != KERN_SUCCESS) {
+	    vm_read_overwrite(mach_task_self(), (vm_address_t)addr, len, (vm_address_t)buf, &got) != KERN_SUCCESS) {
 		a04s_log("  %s @%#lx: not readable", what, (unsigned long)addr);
 		return;
 	}
