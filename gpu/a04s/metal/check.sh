@@ -51,7 +51,7 @@ cd "$B"
 # then the S9 script's three changes for a Linux build machine (an IOSurface call fenced off with
 # __APPLE__, glibc 2.43's call_once, the shim as one more drm-shim library).
 # Then the A04s's own Mesa patches (mesa-patches/, ours), in name order.
-PATCHES=$(cat "$HK"/mesa/patches/*.patch "$HERE"/mesa-patches/*.patch "$SELF" | sha256sum | cut -d' ' -f1)
+PATCHES=$(cat "$HK"/mesa/patches/*.patch "$HERE"/mesa-patches/*.patch "$HERE"/air/* "$SELF" | sha256sum | cut -d' ' -f1)
 if [ ! -d "$SRC" ] || [ "$(cat "$SRC/.a04s-patches" 2>/dev/null)" != "$PATCHES" ]; then
 	[ -f mesa-$VERSION.tar.xz ] || curl -sL --fail -o mesa-$VERSION.tar.xz https://archive.mesa3d.org/mesa-$VERSION.tar.xz
 	echo "$SHA256  mesa-$VERSION.tar.xz" | sha256sum -c --quiet
@@ -92,7 +92,7 @@ if [ ! -d "$SRC" ] || [ "$(cat "$SRC/.a04s-patches" 2>/dev/null)" != "$PATCHES" 
 		            "  dependencies: dep_drm_shim,\n  gnu_symbol_visibility : 'hidden',\n)\n")
 	PY
 	rm -rf "$SRC/src/compiler/air"
-	cp -r "$HK/mesa/air" "$SRC/src/compiler/air"
+	cp -r "$HERE/air" "$SRC/src/compiler/air"   # M6: the merged front end and library (air/NOTICE.md)
 	mkdir -p "$SRC/src/panfrost/drm-shim/hakios"
 	cp "$HK/mali-drmshim/hakios_mali_shim.c" "$HK/hakios.mali_va.h" "$SRC/src/panfrost/drm-shim/hakios/"
 	echo "$PATCHES" > "$SRC/.a04s-patches"

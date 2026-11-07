@@ -2,7 +2,8 @@
 # Galaxy A04s, Metal track M5: libhakiosair for the phone's iOS 16 (arm64, iPhoneOS SDK).
 #
 # The library M1 checked under the shim (gpu/a04s/metal/check.sh), built for the device: Mesa
-# 25.0.7 with the AIR (Metal) front end and libhakiosair (hakios/mesa, with the A04s changes),
+# 25.0.7 with the AIR (Metal) front end and libhakiosair (gpu/a04s/metal/air since M6: Chlorophyll's
+# copy with the S9+ copy's Panfrost changes and the A04s's; see air/NOTICE.md),
 # Gallium Panfrost for the Mali-G52 and softpipe. Panfrost reaches the GPU as it does in the 7c-6
 # route: through gpu/mesa/herodrm.c, the libdrm stand-in over HeroGPU, with gpu/mesa/patch-mesa.py's
 # Mesa changes for it. HakiOS's own Darwin patches (panfrost-darwin, freedreno-darwin) are left
@@ -36,7 +37,7 @@ echo "$SHA256  mesa-$VERSION.tar.xz" | shasum -a 256 -c --quiet
 STAMP=$(cat "$GPU_MESA/patch-mesa.py" "$GPU_MESA/hero_hw.c" "$GPU_MESA/osmesa_hero.inc" \
 	"$HK"/mesa/patches/air-frontend.patch "$HK"/mesa/patches/air-metal.patch \
 	"$HK"/mesa/patches/panfrost-pack-pointer.patch "$METAL"/mesa-patches/*.patch \
-	"$HK"/mesa/air/* "$HERE/build-mesa-ios.sh" | shasum -a 256 | cut -d' ' -f1)
+	"$METAL"/air/* "$HERE/build-mesa-ios.sh" | shasum -a 256 | cut -d' ' -f1)
 if [ "$(cat mesa/.a04s-m5 2>/dev/null)" != "$STAMP" ]; then
 	rm -rf mesa build
 	tar xJf mesa-$VERSION.tar.xz
@@ -52,7 +53,7 @@ if [ "$(cat mesa/.a04s-m5 2>/dev/null)" != "$STAMP" ]; then
 		patch -s --no-backup-if-mismatch -d mesa -p1 < "$p"
 	done
 	rm -rf mesa/src/compiler/air
-	cp -R "$HK/mesa/air" mesa/src/compiler/air
+	cp -R "$METAL/air" mesa/src/compiler/air   # M6: the merged front end and library (air/NOTICE.md)
 	echo "$STAMP" > mesa/.a04s-m5
 fi
 
@@ -64,6 +65,14 @@ $CC_IOS -O2 -Wall -fvisibility=hidden -dynamiclib \
 	-o drm-standin/libdrm.2.dylib "$GPU_MESA/herodrm.c" \
 	-framework IOKit -framework CoreFoundation
 ln -sf libdrm.2.dylib drm-standin/libdrm.dylib
+# M6: the iPhoneOS SDK's own zlib, for Mesa's shader cache (compressed entries)
+cat > pc/zlib.pc <<EOF
+Name: zlib
+Description: zlib of the iPhoneOS SDK
+Version: 1.2.12
+Libs: -lz
+Cflags:
+EOF
 cat > pc/libdrm.pc <<EOF
 Name: libdrm
 Description: HeroGPU libdrm stand-in
@@ -104,13 +113,15 @@ endian = 'little'
 EOF
 
 # Release, as the phone's OSMesa is built; softpipe stays in for RWA_SOFTWARE=1 (the probe's
-# reference run). No OSMesa: nothing here draws through OpenGL.
+# reference run). No OSMesa: nothing here draws through OpenGL. M6: Mesa's shader cache on
+# (Panfrost keeps its compiled shaders; the device points MESA_SHADER_CACHE_DIR at
+# /private/var/a04s/mesa-cache), with the SDK's zlib.
 [ -f build/build.ninja ] || meson setup build mesa --cross-file ios-cross.txt \
 	--buildtype=release -Db_ndebug=true -Dprefix=/ \
 	-Dgallium-drivers=softpipe,panfrost -Dvulkan-drivers= \
 	-Dllvm=disabled -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dplatforms= \
 	-Dosmesa=false -Dopengl=true -Dgles1=disabled -Dgles2=enabled -Dshared-glapi=enabled \
-	-Dshader-cache=disabled -Dvalgrind=disabled -Dlibunwind=disabled -Dzstd=disabled \
+	-Dshader-cache=enabled -Dzlib=enabled -Dvalgrind=disabled -Dlibunwind=disabled -Dzstd=disabled \
 	-Dxmlconfig=disabled -Dexpat=disabled -Dbuild-tests=false -Dglvnd=disabled -Dlmsensors=disabled \
 	-Dgallium-opencl=disabled -Dgallium-rusticl=false -Dgallium-xa=disabled \
 	-Dgallium-vdpau=disabled -Dgallium-va=disabled -Dtools= -Dperfetto=false -Dvideo-codecs=

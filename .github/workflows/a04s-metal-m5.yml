@@ -14,6 +14,7 @@ on:
       - "gpu/a04s/metal/m5/**"
       - "gpu/a04s/metal/chlorophyll/**"
       - "gpu/a04s/metal/hakios/mesa/**"
+      - "gpu/a04s/metal/air/**"
       - "gpu/a04s/metal/mesa-patches/**"
       - "gpu/a04s/metal/shaders/**"
       - "gpu/a04s/metal/m4/a04s_metal_log.h"

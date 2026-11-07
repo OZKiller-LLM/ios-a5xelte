@@ -591,6 +591,24 @@ int rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings 
 int rwa_finish(struct rwa_device *device, char *why, size_t why_size);
 
 /*
+ * A04s (Metal track M6): FUNCTION CONSTANT VALUES. Metal specialises a function by its
+ * constants (-[MTLLibrary newFunctionWithDescriptor:error:] with constantValues), which on
+ * iOS 16.7 runs through the device's compiler -- one this driver does not have. So the driver
+ * keeps the values itself and hands them here before it creates a pipeline: by the constant's
+ * index in the module, its value as the bits of its type (a bool or a char in the low byte, a
+ * vector's components packed from the low byte up). They apply to every creation for that stage
+ * until set again; a constant of the module not listed stays zero, as without this call.
+ * NULL/0 clears a stage.
+ */
+enum { RWA_STAGE_VERTEX, RWA_STAGE_FRAGMENT, RWA_STAGE_COMPUTE, RWA_STAGE_COUNT };
+struct rwa_constant {
+	unsigned index;
+	uint64_t bits;
+};
+void rwa_set_function_constants(struct rwa_device *device, unsigned stage,
+				const struct rwa_constant *values, unsigned count);
+
+/*
  * A04s (Metal track M5): the calls Chlorophyll's Metal device (gpu/a04s/metal/chlorophyll/bgmtl.m)
  * makes beyond this library, with Chlorophyll's signatures (MIT, see that folder's NOTICE.md).
  *

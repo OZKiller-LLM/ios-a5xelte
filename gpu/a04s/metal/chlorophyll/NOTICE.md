@@ -8,4 +8,7 @@
 |---|---|---|
 | `bgmtl.m` | `src/bgmtl.m` | Marked "A04s" in the source: a header note; the fence retry no longer asks Bergamota's `sweet_drm` for its wait record; `bgmtl_gpu_state` checks for the HeroGPU service instead of Bergamota's GPU-info call. Line endings made LF. |
 
-Not copied: Chlorophyll's AIR front end and `libbgair` (`air/`). The A04s builds `bgmtl.m` against the S9+ port's copy in `../hakios/mesa/air`, which carries the Panfrost changes M1 checked. Chlorophyll's few library calls that copy lacks were added there, marked "A04s (Metal track M5)". Also not copied: its freedreno patches, the Bergamota kernel interface, the injection and the system plug-in.
+- **M5** built `bgmtl.m` against the S9+ port's copy of the AIR front end and library (`../hakios/mesa/air`), which carries the Panfrost changes M1 checked. Chlorophyll's few library calls that copy lacked were added there.
+- **Since M6** the A04s builds from `../air`: Chlorophyll's `air/` at the same commit, with the S9+ copy's Panfrost changes and the A04s's own ported onto it (`../air/NOTICE.md`).
+- **Not copied:** Chlorophyll's freedreno patches, Bergamota's kernel interface, the injection and the system plug-in.
+- **Copied with changes:** the M6a probe's CoreAnimation scenes (`../m5/a04s_ca_scenes.m`) come from Chlorophyll's `test/bgmtl_carenderer_probe.m`.

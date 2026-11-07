@@ -19,7 +19,7 @@ OUT=$(mkdir -p "$1" && cd "$1" && pwd)
 MESA_OUT=$(cd "$2" && pwd)
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 CC="xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot $SDK"
-CF="-O2 -g -Wall -Wno-unused-function -Wno-deprecated-declarations -fno-objc-arc -I$HERE/../m4 -I$HERE/../hakios/mesa/air"
+CF="-O2 -g -Wall -Wno-unused-function -Wno-deprecated-declarations -fno-objc-arc -I$HERE/../m4 -I$HERE/../air"
 B="$OUT/metal/A04sMetal.bundle"
 rm -rf "$B"
 mkdir -p "$B" "$OUT/metal"
@@ -45,7 +45,7 @@ $CC $CF -dynamiclib -o "$B/libA04sMetalDevice.dylib" "$HERE/A04sMTLDevice.m" \
 	$PRIV -install_name @rpath/libA04sMetalDevice.dylib -Wl,-rpath,@loader_path
 
 # the probe
-$CC $CF -o "$OUT/autorun" "$HERE/a04s_metal_m5.m" -framework Foundation -framework Metal
+$CC $CF -o "$OUT/autorun" "$HERE/a04s_metal_m5.m" "$HERE/a04s_ca_scenes.m" 	-framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics
 
 for s in core m5; do
 	xcrun -sdk iphoneos metal -std=metal3.0 -mios-version-min=16.0 \

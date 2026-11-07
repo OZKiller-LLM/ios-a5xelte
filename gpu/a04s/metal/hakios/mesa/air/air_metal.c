@@ -67,6 +67,19 @@
 #include "util/u_debug.h"
 #include "util/u_gen_mipmap.h"   /* A04s (Metal track M5): rwa_texture_generate_mipmaps */
 
+/* A04s (Metal track M6): the Galaxy A04s's libdrm stand-in (gpu/mesa/herodrm.c over HeroGPU)
+ * imports an IOSurface by its ID into a buffer of its own and hands back a stand-in descriptor
+ * for Panfrost's dma-buf import, with the kernel's own pitch, offset and size; herodrm_bo_sync
+ * makes the GPU's writes visible to the CPU and the display. Weak: absent under the drm-shim
+ * of check.sh, where the import keeps HakiOS's ID-as-descriptor convention. */
+struct a04s_herodrm_surface {
+   uint32_t handle, bytes_per_row, width, height, pixel_format, offset, planes;
+   uint64_t size;
+};
+extern int herodrm_surface_import(uint32_t surface_id, struct a04s_herodrm_surface *info)
+   __attribute__((weak));
+extern int herodrm_bo_sync(uint32_t handle) __attribute__((weak));
+
 /* Two seconds, the same wait air_run uses, and for the same reason: a dispatch nobody
  * waited for is not a result, and on this GPU one timeout wedges the core for the rest
  * of the boot, so every later dispatch would be vacuous too (docs/air.md section 5).
@@ -85,6 +98,11 @@
 struct rwa_device {
    struct pipe_screen *screen;
    struct pipe_context *pipe;
+
+   /* A04s (Metal track M6): function constant values for the next creation, per stage
+    * (rwa_set_function_constants); none set means every constant is zero, as before. */
+   struct rwa_constant *fc[RWA_STAGE_COUNT];
+   unsigned num_fc[RWA_STAGE_COUNT];
 
    /* NIR's options for this screen, asked once: the translator needs them to know what
     * the consumer can be handed (what it may leave for the backend to lower).
@@ -202,6 +220,8 @@ struct rwa_texture {
    struct rwa_texture_shape shape;
    const char *format_name;         /* the MTLPixelFormat, spelled out */
    unsigned layers;                 /* array slices, or the six faces of a cube */
+
+   uint32_t surface_handle;         /* A04s (M6): herodrm's buffer of an imported IOSurface, or 0 */
 
    /* what MTLTextureUsage allowed, which is checked at every dispatch: a kernel that
     * writes a texture the application declared read-only is an application's mistake,
@@ -672,11 +692,49 @@ fail:
    return NULL;
 }
 
+/* A04s (Metal track M6): see air_metal.h. */
+void
+rwa_set_function_constants(struct rwa_device *device, unsigned stage,
+                           const struct rwa_constant *values, unsigned count)
+{
+   if (!device || stage >= RWA_STAGE_COUNT)
+      return;
+   free(device->fc[stage]);
+   device->fc[stage] = NULL;
+   device->num_fc[stage] = 0;
+   if (!values || !count)
+      return;
+   device->fc[stage] = malloc(count * sizeof(*values));
+   if (!device->fc[stage])
+      return;
+   memcpy(device->fc[stage], values, count * sizeof(*values));
+   device->num_fc[stage] = count;
+}
+
+/* The values set for a stage, written over the module's constants (all zero from
+ * air_module_function_constants) by index; how many of the module's were given. */
+static unsigned
+apply_function_constants(const struct rwa_device *device, unsigned stage,
+                         struct air_constant_value *constants, unsigned num)
+{
+   unsigned given = 0;
+   for (unsigned i = 0; i < num; i++)
+      for (unsigned k = 0; k < device->num_fc[stage]; k++)
+         if (device->fc[stage][k].index == constants[i].index) {
+            constants[i].bits = device->fc[stage][k].bits;
+            given++;
+            break;
+         }
+   return given;
+}
+
 void
 rwa_device_close(struct rwa_device *device)
 {
    if (!device)
       return;
+   for (unsigned i = 0; i < RWA_STAGE_COUNT; i++)
+      free(device->fc[i]);
    if (device->default_sampler)
       device->pipe->delete_sampler_state(device->pipe, device->default_sampler);
    device->pipe->destroy(device->pipe);
@@ -1529,8 +1587,35 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
          return NULL;
       }
 
+      /* A04s (Metal track M6): over herodrm, the surface is imported by the stand-in first,
+       * and its descriptor, pitch, offset and size are the kernel's. */
+      struct a04s_herodrm_surface hs = { 0 };
+#ifdef RWA_GPU
+      if (herodrm_surface_import) {
+         int sfd = herodrm_surface_import((uint32_t)import->id, &hs);
+         if (sfd < 0 || hs.planes > 1) {
+            say(why, why_size, "HeroGPU would not map IOSurface %d for the GPU (%s)",
+                import->id, sfd < 0 ? "no import" : "more than one plane");
+            if (sfd >= 0)
+               drmCloseBufferHandle(-1, hs.handle);
+            free(texture);
+            return NULL;
+         }
+         whandle.handle = (unsigned)sfd;
+         whandle.stride = hs.bytes_per_row;
+         whandle.offset = hs.offset;
+         whandle.size = hs.size;
+      }
+#endif
+
       texture->res = device->screen->resource_from_handle(device->screen, &templ, &whandle,
                                                           PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+      if (texture->res && hs.handle)
+         texture->surface_handle = hs.handle;
+#ifdef RWA_GPU
+      if (!texture->res && hs.handle)
+         drmCloseBufferHandle(-1, hs.handle);
+#endif
       if (!texture->res) {
          /*
           * Everything this side could check has been checked, so no reason is invented
@@ -2920,6 +3005,7 @@ rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
    struct air_constant_value *constants;
    unsigned num_constants =
       air_module_function_constants(compute->mem_ctx, bitcode, size, &constants);
+   apply_function_constants(device, RWA_STAGE_COMPUTE, constants, num_constants);   /* A04s (M6) */
 
    /* library_wrapper is false, unlike air_run --library: a wrapped air.visible function
     * is a shader made up to be measurable, not a pipeline anyone can dispatch. Metal
@@ -4143,8 +4229,11 @@ rwa_texture_generate_mipmaps(struct rwa_texture *texture)
 int
 rwa_texture_flush_surface(struct rwa_texture *texture)
 {
-   (void)texture;
-   return 0;
+   /* A04s (Metal track M6): herodrm's cache clean of the surface's buffer, after the GPU
+    * work that wrote it has finished; nothing to do for a texture of our own. */
+   if (!texture || !texture->surface_handle || !herodrm_bo_sync)
+      return 0;
+   return herodrm_bo_sync(texture->surface_handle);
 }
 
 /*
@@ -4413,6 +4502,7 @@ rwa_module_textures(struct rwa_device *device, const void *bitcode, size_t size,
    struct air_constant_value *constants;
    unsigned num_constants =
       air_module_function_constants(mem_ctx, bitcode, size, &constants);
+   apply_function_constants(device, RWA_STAGE_FRAGMENT, constants, num_constants);   /* A04s (M6) */
    const struct air_to_nir_options options = {
       .constants = constants,
       .num_constants = num_constants,
@@ -4560,6 +4650,7 @@ rwa_module_argbufs(struct rwa_device *device, const void *bitcode, size_t size,
    struct air_constant_value *constants;
    unsigned num_constants =
       air_module_function_constants(mem_ctx, bitcode, size, &constants);
+   apply_function_constants(device, RWA_STAGE_FRAGMENT, constants, num_constants);   /* A04s (M6) */
    const struct air_to_nir_options options = {
       .constants = constants,
       .num_constants = num_constants,
@@ -6232,6 +6323,7 @@ rwa_render_create(struct rwa_device *device,
    struct air_constant_value *ffc;
    unsigned num_ffc =
       air_module_function_constants(render->mem_ctx, fragment_bitcode, fragment_size, &ffc);
+   apply_function_constants(device, RWA_STAGE_FRAGMENT, ffc, num_ffc);   /* A04s (M6) */
    const struct air_to_nir_options fopts = { .constants = ffc, .num_constants = num_ffc };
    const char *error;
    nir_shader *fs = air_to_nir(render->mem_ctx, fragment_bitcode, fragment_size,
@@ -6287,6 +6379,7 @@ rwa_render_create(struct rwa_device *device,
       struct air_constant_value *vfc;
       unsigned num_vfc =
          air_module_function_constants(render->mem_ctx, vertex_bitcode, vertex_size, &vfc);
+      apply_function_constants(device, RWA_STAGE_VERTEX, vfc, num_vfc);   /* A04s (M6) */
       const struct air_to_nir_options vopts = { .constants = vfc, .num_constants = num_vfc };
       vs = air_to_nir(render->mem_ctx, vertex_bitcode, vertex_size, vertex_entry, &vopts,
                       device->nir_options, &render->vinfo, &error);

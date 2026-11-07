@@ -43,6 +43,15 @@ The first Metal device that computes and draws, run by a probe on the phone. CI:
 - **The probe:** `m5/a04s_metal_m5.m` installs the bundle, then runs `fill_buffer` (4096 values), a triangle (`shaders/m5.metal`, vertex and constant buffers) and a quad with a varying. It runs once on softpipe as the reference and once on the Mali-G52, each in a child process, and logs PASS or FAIL per test.
 - **`hakios/mesa/air` additions for it**, marked "A04s (Metal track M5)": Chlorophyll's fence calls, render-pass clear, GPU texture copy and mipmaps, and scissor.
 
+## M6a: CoreAnimation's own Metal renderer on the device, in the probe only
+
+- **The library moves to `air/`:** Chlorophyll's newer front end, with the S9+ copy's Panfrost changes and the A04s's ported onto it (`air/NOTICE.md`). Over iOS 16.7's QuartzCore metallib it translates 139 of 141 functions locally, against 135 for the M5 copy, including both `fixed_frag_*` ubershaders. `check.sh` re-runs M1's checks on it in CI.
+- **Function constants:** QuartzCore's ubershader is specialised by about 58 constants per pipeline. The device takes over `-[_MTLLibrary newFunctionWithDescriptor:error:]` and `newFunctionWithName:constantValues:error:` for its own libraries, keeps the values with the function, and hands them to the library (`rwa_set_function_constants`) when it builds the pipeline. On iOS 16.7 Metal would otherwise specialise through a compiler the device does not have.
+- **Shader cache:** Mesa's disk cache is on (with the SDK's zlib), in `/private/var/a04s/mesa-cache`.
+- **Timing:** every pipeline build is logged with its wall and CPU time.
+- **IOSurfaces:** textures over IOSurfaces go through `herodrm_surface_import` (CoreAnimation's layer contents), and the GPU's writes are flushed with `herodrm_bo_sync`.
+- **The probe** (same autorun) adds `m5/a04s_ca_scenes.m`, Chlorophyll's seven CoreAnimation scenes adapted. Each is drawn by a `CARenderer` on the Metal device and by CoreAnimation's CPU path, compared, and logged as `M6 RESULT`. backboardd is not touched.
+
 ## Where `hakios/` comes from
 
 Everything under `hakios/` is copied unchanged from the Galaxy S9+ port, [github.com/danstronics/ios-s9plus-exynos](https://github.com/danstronics/ios-s9plus-exynos) at `2d09239`, directory `core/` (a snapshot of HakiOS/Scion). Its author OK'd reuse for other ports. Its licence, `hakios/LICENSE`, is MIT for userland and tools and APSL-2.0 for kernel-derived files (`hakios/LICENSE.APSL`). Mesa's patches touch Mesa files under Mesa's licences.

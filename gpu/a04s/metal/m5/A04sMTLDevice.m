@@ -19,12 +19,148 @@
 #include "../chlorophyll/bgmtl.m"
 
 #include "a04s_metal_log.h"
+#include <sys/stat.h>
+#include <time.h>
 
 typedef mach_port_t a04s_io_registry_entry_t;
 extern kern_return_t IORegistryEntryGetRegistryEntryID(a04s_io_registry_entry_t entry, uint64_t *id);
 
 /* -[_MTLDevice targetDeviceInfo]: {u64, u32, const char *name}, as M4 answered it. */
 static const struct { uint64_t a; uint32_t b; const char *name; } a04s_target_info = { 0, 0, "a04s-mali-g52" };
+
+/* ---- A04s (Metal track M6): function constants -------------------------------------------------
+ *
+ * QuartzCore's Metal renderer on iOS 16.7 draws through ogl_metal_uber.metal, whose fragment and
+ * vertex functions are specialised by some 58 function constants per pipeline
+ * (-[MTLLibrary newFunctionWithDescriptor:error:] with constantValues). Metal specialises through
+ * the device's compiler, which this device does not have, so here the library's two specialising
+ * calls are taken over for libraries of this device: the function comes back unspecialised, with
+ * the values kept beside it (an associated object), and the pipeline hands them to libhakiosair
+ * (rwa_set_function_constants), whose translator folds them. Libraries of any other device are
+ * left to Metal. */
+
+static char a04s_fc_key;
+
+/* bytes of one MTLDataType value; 0 for a type a function constant cannot have */
+static unsigned
+a04s_type_size(NSUInteger t)
+{
+   unsigned comp = 0, base = 0;
+   if (t >= MTLDataTypeFloat && t <= MTLDataTypeFloat4) { comp = 4; base = MTLDataTypeFloat; }
+   else if (t >= MTLDataTypeHalf && t <= MTLDataTypeHalf4) { comp = 2; base = MTLDataTypeHalf; }
+   else if (t >= MTLDataTypeInt && t <= MTLDataTypeInt4) { comp = 4; base = MTLDataTypeInt; }
+   else if (t >= MTLDataTypeUInt && t <= MTLDataTypeUInt4) { comp = 4; base = MTLDataTypeUInt; }
+   else if (t >= MTLDataTypeShort && t <= MTLDataTypeShort4) { comp = 2; base = MTLDataTypeShort; }
+   else if (t >= MTLDataTypeUShort && t <= MTLDataTypeUShort4) { comp = 2; base = MTLDataTypeUShort; }
+   else if (t >= MTLDataTypeChar && t <= MTLDataTypeChar4) { comp = 1; base = MTLDataTypeChar; }
+   else if (t >= MTLDataTypeUChar && t <= MTLDataTypeUChar4) { comp = 1; base = MTLDataTypeUChar; }
+   else if (t >= MTLDataTypeBool && t <= MTLDataTypeBool4) { comp = 1; base = MTLDataTypeBool; }
+   else return 0;
+   return comp * (unsigned)(t - base + 1);
+}
+
+/* The values of `cv` for the constants `fn` declares, as libhakiosair takes them, in an NSData
+ * of struct rwa_constant; logged once per specialisation. */
+static NSData *
+a04s_constants_for(id fn, id cv, NSString *name)
+{
+   NSDictionary *decl = [fn respondsToSelector:@selector(functionConstantsDictionary)] ? [fn functionConstantsDictionary] : nil;
+   SEL getv = sel_registerName("constantValueWithFunctionConstant:");
+   if (!decl.count || ![cv respondsToSelector:getv]) {
+      a04s_log("specialise %s: %lu constants declared, values %s", name.UTF8String, (unsigned long)decl.count,
+               [cv respondsToSelector:getv] ? "readable" : "NOT readable (no constantValueWithFunctionConstant:)");
+      return nil;
+   }
+   NSMutableData *out = [NSMutableData data];
+   char shown[900] = "";
+   unsigned given = 0;
+   for (MTLFunctionConstant *c in decl.allValues) {
+      const void *p = ((const void *(*)(id, SEL, id))objc_msgSend)(cv, getv, c);
+      if (!p)
+         continue;
+      unsigned n = a04s_type_size(c.type);
+      struct rwa_constant k = { (unsigned)c.index, 0 };
+      memcpy(&k.bits, p, n < 8 ? n : 8);
+      [out appendBytes:&k length:sizeof(k)];
+      given++;
+      if (k.bits && strlen(shown) < sizeof(shown) - 48) {
+         char one[48];
+         snprintf(one, sizeof(one), " %lu=%#llx", (unsigned long)c.index, (unsigned long long)k.bits);
+         strlcat(shown, one, sizeof(shown));
+      }
+   }
+   a04s_log("specialise %s: %lu declared, %u given; non-zero:%s", name.UTF8String, (unsigned long)decl.count, given,
+            shown[0] ? shown : " none");
+   return out;
+}
+
+static id
+a04s_base_function(id lib, NSString *name)
+{
+   id fn = [lib newFunctionWithName:name];
+   SEL internal = sel_registerName("newFunctionWithNameInternal:");
+   if (!fn && [lib respondsToSelector:internal])
+      fn = ((id (*)(id, SEL, id))objc_msgSend)(lib, internal, name);
+   return fn;
+}
+
+static id (*a04s_orig_nfd)(id, SEL, id, NSError **);
+static id (*a04s_orig_nfncv)(id, SEL, id, id, NSError **);
+
+static id
+a04s_specialise(id lib, NSString *name, id cv, NSError **error)
+{
+   id fn = a04s_base_function(lib, name);
+   if (!fn) {
+      a04s_log("specialise %s: the library has no such function", name.UTF8String);
+      if (error)
+         *error = [NSError errorWithDomain:@"MTLLibraryErrorDomain" code:5
+                                  userInfo:@{ NSLocalizedDescriptionKey : [NSString stringWithFormat:@"no function %@", name] }];
+      return nil;
+   }
+   if (cv) {
+      NSData *k = a04s_constants_for(fn, cv, name);
+      if (k)
+         objc_setAssociatedObject(fn, &a04s_fc_key, k, OBJC_ASSOCIATION_RETAIN);
+   }
+   return fn;
+}
+
+static id
+a04s_nfd(id lib, SEL cmd, MTLFunctionDescriptor *d, NSError **error)
+{
+   if (![[lib device] isKindOfClass:[BGMTLDevice class]])
+      return a04s_orig_nfd(lib, cmd, d, error);
+   return a04s_specialise(lib, d.name, d.constantValues, error);
+}
+
+static id
+a04s_nfncv(id lib, SEL cmd, NSString *name, MTLFunctionConstantValues *cv, NSError **error)
+{
+   if (![[lib device] isKindOfClass:[BGMTLDevice class]])
+      return a04s_orig_nfncv(lib, cmd, name, cv, error);
+   return a04s_specialise(lib, name, cv, error);
+}
+
+/* the function's kept values to libhakiosair, for one stage (NULL clears it) */
+static void
+a04s_apply_constants(struct rwa_device *rwa, unsigned stage, id fn)
+{
+   NSData *k = fn ? objc_getAssociatedObject(fn, &a04s_fc_key) : nil;
+   rwa_set_function_constants(rwa, stage, k.bytes, (unsigned)(k.length / sizeof(struct rwa_constant)));
+}
+
+static double
+a04s_cpu_now(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+   return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+@interface BGMTLDevice (A04sPrivate)
+- (id)bgPipelineForFunction:(id)function descriptor:(id)descriptor error:(NSError **)error;
+@end
 
 @interface A04sMTLDevice : BGMTLDevice
 @end
@@ -33,11 +169,63 @@ static const struct { uint64_t a; uint32_t b; const char *name; } a04s_target_in
    uint64_t _a04sRegistry;
 }
 
++ (void)load
+{
+   Class lib = objc_getClass("_MTLLibrary");
+   Method m = lib ? class_getInstanceMethod(lib, @selector(newFunctionWithDescriptor:error:)) : NULL;
+   if (m)
+      a04s_orig_nfd = (void *)method_setImplementation(m, (IMP)a04s_nfd);
+   m = lib ? class_getInstanceMethod(lib, @selector(newFunctionWithName:constantValues:error:)) : NULL;
+   if (m)
+      a04s_orig_nfncv = (void *)method_setImplementation(m, (IMP)a04s_nfncv);
+   a04s_log("A04sMTLDevice: function specialisation taken over for this device's libraries (%s, %s)",
+            a04s_orig_nfd ? "newFunctionWithDescriptor:error:" : "-", a04s_orig_nfncv ? "newFunctionWithName:constantValues:error:" : "-");
+}
+
+/* Every pipeline: its constants to the library, and how long it took, in wall and CPU time
+ * (M5 run 2 spent 40-70 s per pipeline: compiling, or waiting on the storage?). */
+- (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error
+{
+   bg_lock();
+   a04s_apply_constants([self rwa], RWA_STAGE_VERTEX, d.vertexFunction);
+   a04s_apply_constants([self rwa], RWA_STAGE_FRAGMENT, d.fragmentFunction);
+   double t = a04s_now(), c = a04s_cpu_now();
+   id p = [super newRenderPipelineStateWithDescriptor:d error:error];
+   a04s_log("render pipeline %s + %s: %s in %.2f s (CPU %.2f s)%s%s", d.vertexFunction.name.UTF8String ?: "-",
+            d.fragmentFunction.name.UTF8String ?: "-", p ? "made" : "REFUSED", a04s_now() - t, a04s_cpu_now() - c,
+            !p && error && *error ? ": " : "", !p && error && *error ? (*error).localizedDescription.UTF8String : "");
+   a04s_apply_constants([self rwa], RWA_STAGE_VERTEX, nil);
+   a04s_apply_constants([self rwa], RWA_STAGE_FRAGMENT, nil);
+   bg_unlock();
+   return p;
+}
+
+- (id)bgPipelineForFunction:(id)function descriptor:(id)descriptor error:(NSError **)error
+{
+   bg_lock();
+   a04s_apply_constants([self rwa], RWA_STAGE_COMPUTE, function);
+   double t = a04s_now(), c = a04s_cpu_now();
+   id p = [super bgPipelineForFunction:function descriptor:descriptor error:error];
+   a04s_log("compute pipeline %s: %s in %.2f s (CPU %.2f s)%s%s", [[function name] UTF8String] ?: "-",
+            p ? "made" : "REFUSED", a04s_now() - t, a04s_cpu_now() - c, !p && error && *error ? ": " : "",
+            !p && error && *error ? (*error).localizedDescription.UTF8String : "");
+   a04s_apply_constants([self rwa], RWA_STAGE_COMPUTE, nil);
+   bg_unlock();
+   return p;
+}
+
 - (instancetype)initWithAcceleratorPort:(uint32_t)port
 {
    const char *soft = getenv("RWA_SOFTWARE");
-   a04s_log("A04sMTLDevice initWithAcceleratorPort: %u (M5, %s)", port,
+   a04s_log("A04sMTLDevice initWithAcceleratorPort: %u (M6, %s)", port,
             soft && soft[0] == '1' ? "softpipe: RWA_SOFTWARE=1" : "Panfrost on the Mali-G52");
+   /* A04s (M6): Panfrost's compiled shaders kept across processes and boots (Mesa's disk cache),
+    * in a folder every client of the device can write. */
+   if (!getenv("MESA_SHADER_CACHE_DIR")) {
+      mkdir("/private/var/a04s/mesa-cache", 0777);
+      chmod("/private/var/a04s/mesa-cache", 0777);
+      setenv("MESA_SHADER_CACHE_DIR", "/private/var/a04s/mesa-cache", 0);
+   }
    self = [super initWithAcceleratorPort:port];
    if (!self)
       return nil;

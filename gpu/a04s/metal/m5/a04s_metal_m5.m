@@ -362,10 +362,22 @@ test_quad(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLLibrary> core, const c
 	return bad == 0 && cb.status == MTLCommandBufferStatusCompleted;
 }
 
+int a04s_ca_scenes(id<MTLDevice> d, const char *mode, const char *only);   /* a04s_ca_scenes.m (M6a) */
+
+static bool
+env_off(const char *name)
+{
+	const char *v = getenv(name);
+	return v && v[0] == '0';
+}
+
 static int
 child(const char *mode)
 {
 	a04s_log("child %s: start (RWA_SOFTWARE=%s)", mode, getenv("RWA_SOFTWARE") ? getenv("RWA_SOFTWARE") : "unset");
+	/* Chlorophyll's two QuartzCore/CoreImage settings, before either reads them (M6a) */
+	setenv("CA_USE_CGTEXTUREDATA", "0", 0);
+	setenv("CI_USE_MTL_DAG_FOR_CIKL_SRC", "0", 0);
 	STEP("MTLCreateSystemDefaultDevice");
 	id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
 	if (!dev) {
@@ -381,14 +393,24 @@ child(const char *mode)
 		a04s_log("child %s: %s", mode, q ? "a library did not load" : "no command queue");
 		return 3;
 	}
-	bool c = test_compute(dev, q, core);
-	a04s_log("M5 RESULT %s compute: %s", mode, c ? "PASS" : "FAIL");
-	bool t = test_triangle(dev, q, m5, mode);
-	a04s_log("M5 RESULT %s triangle: %s", mode, t ? "PASS" : "FAIL");
-	bool u = test_quad(dev, q, core, mode);
-	a04s_log("M5 RESULT %s quad: %s", mode, u ? "PASS" : "FAIL");
+	bool c = true, t = true, u = true;
+	if (!env_off("A04S_M5_TESTS")) {
+		c = test_compute(dev, q, core);
+		a04s_log("M5 RESULT %s compute: %s", mode, c ? "PASS" : "FAIL");
+		t = test_triangle(dev, q, m5, mode);
+		a04s_log("M5 RESULT %s triangle: %s", mode, t ? "PASS" : "FAIL");
+		u = test_quad(dev, q, core, mode);
+		a04s_log("M5 RESULT %s quad: %s", mode, u ? "PASS" : "FAIL");
+	}
+	/* M6a: CoreAnimation's Metal renderer on this device, in this process. Not on softpipe by
+	 * default: CoreAnimation's layer contents are IOSurfaces, which only the GPU can import. */
+	int ca_bad = 0;
+	if (!env_off("A04S_CA") && (strcmp(mode, "softpipe") || getenv("A04S_CA"))) {
+		STEP("ca scenes");
+		ca_bad = a04s_ca_scenes(dev, mode, getenv("A04S_CA_SCENES"));
+	}
 	STEP("done");
-	return c && t && u ? 0 : 1;
+	return c && t && u && !ca_bad ? 0 : 1;
 }
 
 /* ---- the parent ----------------------------------------------------------------------------- */
