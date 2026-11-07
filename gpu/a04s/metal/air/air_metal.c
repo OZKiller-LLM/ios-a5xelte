@@ -4178,6 +4178,12 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
           */
          if (member)
             break;
+         /* A04s (Metal track M6): an API sampler the encoder left unbound gets the device's
+          * default sampler state (bind_stage). QuartzCore's ubershader declares img_samp_0/1
+          * and binds them only for the images its function constants switch on (M6a run 2:
+          * every draw of every scene was refused here). */
+         if (r->index >= bindings->sampler_count || !bindings->samplers[r->index])
+            break;
          if (r->index >= bindings->sampler_count || !bindings->samplers[r->index]) {
             say(why, why_size, "%s takes sampler %u from the API and %u sampler%s bound",
                 name, r->index, bindings->sampler_count,
@@ -4287,7 +4293,7 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
             break;
          case AIR_RESOURCE_SAMPLER:
             if (!r->inline_sampler)
-               sm = bindings->samplers[r->index];
+               sm = r->index < bindings->sampler_count ? bindings->samplers[r->index] : NULL;
             break;
          default:
             break;
@@ -4462,8 +4468,17 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
             /* Metal's sampler, and the instruction's choice of which of its two state
              * objects: struct rwa_sampler.
              */
-            samplers[r->index] = (compare_sampler && compare_sampler[r->index])
-                                    ? sm->cso_compare : sm->cso;
+            if (!sm) {
+               /* A04s (Metal track M6): unbound, and accepted by check_bindings */
+               samplers[r->index] = default_sampler(device);
+               if (!samplers[r->index]) {
+                  say(why, why_size, "%s would not make a sampler at all", rwa_device_name(device));
+                  return -1;
+               }
+            } else {
+               samplers[r->index] = (compare_sampler && compare_sampler[r->index])
+                                       ? sm->cso_compare : sm->cso;
+            }
          }
          num_samplers = MAX2(num_samplers, r->index + 1);
          break;

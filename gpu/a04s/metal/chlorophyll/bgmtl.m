@@ -1980,7 +1980,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
       w->textures[idx] = [[(BGMTLDevice *)[_cb device] bgNullTextureForType:_pipeline->_decls[i].type_known ? _pipeline->_decls[i].type : 2
                                                                     element:_pipeline->_decls[i].element] retain];
       if (idx + 1 > w->texture_count) w->texture_count = idx + 1;
-      BG_LOG("draw: texture slot %u was not bound; a zero texture stands in\n", idx);
+      // A04s (Metal track M6): QuartzCore's ubershader leaves most of its 15 slots unbound on every draw; the
+      // first 32 are logged, then this is quiet (M6a run 2 wrote 1485 of these lines to slow storage)
+      static unsigned a04s_null_logged;
+      if (a04s_null_logged < 32 && ++a04s_null_logged)
+         BG_LOG("draw: texture slot %u was not bound; a zero texture stands in%s\n", idx,
+                a04s_null_logged == 32 ? " (no more of these lines)" : "");
    }
    w->color_count = _ncolor;
    for (unsigned i = 0; i < _ncolor; i++) w->color[i] = [_color[i] retain];

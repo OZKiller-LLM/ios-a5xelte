@@ -6,7 +6,7 @@
 
 | File here | From | A04s changes |
 |---|---|---|
-| `bgmtl.m` | `src/bgmtl.m` | Marked "A04s" in the source: a header note; the fence retry no longer asks Bergamota's `sweet_drm` for its wait record; `bgmtl_gpu_state` checks for the HeroGPU service instead of Bergamota's GPU-info call. M6: a draw through a stand-in for a refused pipeline is skipped and logged. Line endings made LF. |
+| `bgmtl.m` | `src/bgmtl.m` | Marked "A04s" in the source: a header note; the fence retry no longer asks Bergamota's `sweet_drm` for its wait record; `bgmtl_gpu_state` checks for the HeroGPU service instead of Bergamota's GPU-info call. M6: a draw through a stand-in for a refused pipeline is skipped and logged. The unbound-texture line is logged 32 times at most. Line endings made LF. |
 
 - **M5** built `bgmtl.m` against the S9+ port's copy of the AIR front end and library (`../hakios/mesa/air`), which carries the Panfrost changes M1 checked. Chlorophyll's few library calls that copy lacked were added there.
 - **Since M6** the A04s builds from `../air`: Chlorophyll's `air/` at the same commit, with the S9+ copy's Panfrost changes and the A04s's own ported onto it (`../air/NOTICE.md`).
