@@ -1,0 +1,31 @@
+A04s (Metal track M1c): keep a uniform/FAU value or a constant out of CLPER's source 0.
+
+Bifrost's CLPER reads source 0 from a register port only (bi_pack_add_clper_i32 asserts
+(1 << src0) & 0x7). nir_lower_subgroups' shuffle loop reads load_subgroup_invocation through
+read_invocation; Bifrost emits the invocation as a MOV of the lane-id FAU value, copy
+propagation folded it into CLPER, and a Metal simd_sum() compiled for the Mali-G52 (v7)
+failed to pack. With BIFROST_MESA_DEBUG=noopt it compiled, which pointed at the optimiser.
+Mesa 25.0.7. Ours, under Mesa's licence for the file it changes (MIT).
+
+--- a/src/panfrost/compiler/bi_opt_copy_prop.c
++++ b/src/panfrost/compiler/bi_opt_copy_prop.c
+@@ -107,6 +107,19 @@
+          if (repl.type == BI_INDEX_CONSTANT && bi_reads_fau(ins))
+             continue;
+ 
++         /* CLPER reads its source 0 from a register port only
++          * (bi_pack_add_clper_i32: (1 << src0) & 0x7), so a uniform, a
++          * special FAU value such as the lane ID, or a constant must not be
++          * propagated there: nir_lower_subgroups' shuffle loop reads
++          * load_subgroup_invocation through read_invocation, which became
++          * CLPER.i32 lane-id and failed to pack on Bifrost v7.
++          */
++         if ((ins->op == BI_OPCODE_CLPER_I32 ||
++              ins->op == BI_OPCODE_CLPER_OLD_I32) &&
++             s == 0 &&
++             (repl.type == BI_INDEX_FAU || repl.type == BI_INDEX_CONSTANT))
++            continue;
++
+          if (!bi_is_null(repl))
+             bi_replace_src(ins, s, repl);
+       }

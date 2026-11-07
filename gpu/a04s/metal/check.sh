@@ -48,13 +48,15 @@ cd "$B"
 # The sources: the release, every HakiOS Mesa patch in name order (as the S9 port applies them),
 # then the S9 script's three changes for a Linux build machine (an IOSurface call fenced off with
 # __APPLE__, glibc 2.43's call_once, the shim as one more drm-shim library).
-PATCHES=$(cat "$HK"/mesa/patches/*.patch "$SELF" | sha256sum | cut -d' ' -f1)
+# Then the A04s's own Mesa patches (mesa-patches/, ours), in name order.
+PATCHES=$(cat "$HK"/mesa/patches/*.patch "$HERE"/mesa-patches/*.patch "$SELF" | sha256sum | cut -d' ' -f1)
 if [ ! -d "$SRC" ] || [ "$(cat "$SRC/.a04s-patches" 2>/dev/null)" != "$PATCHES" ]; then
 	[ -f mesa-$VERSION.tar.xz ] || curl -sL --fail -o mesa-$VERSION.tar.xz https://archive.mesa3d.org/mesa-$VERSION.tar.xz
 	echo "$SHA256  mesa-$VERSION.tar.xz" | sha256sum -c --quiet
 	rm -rf "$SRC" build
 	tar xJf mesa-$VERSION.tar.xz
 	for p in "$HK"/mesa/patches/*.patch; do patch -s --no-backup-if-mismatch -d "$SRC" -p1 < "$p"; done
+	for p in "$HERE"/mesa-patches/*.patch; do patch -s --no-backup-if-mismatch -d "$SRC" -p1 < "$p"; done
 	cp -r "$HK/mesa/hakios-drm" "$SRC/src/hakios-drm"
 	python3 - "$SRC" <<-'PY'
 		import sys
