@@ -29,10 +29,10 @@ index a16d8e0..a1c90fc 100644
  bsd/dev/herolte_battery.c		standard
 diff --git a/bsd/dev/a04s_acpm.c b/bsd/dev/a04s_acpm.c
 new file mode 100644
-index 0000000..5916a61
+index 0000000..dad872f
 --- /dev/null
 +++ b/bsd/dev/a04s_acpm.c
-@@ -0,0 +1,459 @@
+@@ -0,0 +1,484 @@
 +/*
 + * Galaxy A04s: ACPM, the mailbox protocol of the APM core, to the S2MPU12 PMIC and the
 + * AUD3004X codec on the same bus. A write there can change a supply voltage, so this file
@@ -346,6 +346,31 @@ index 0000000..5916a61
 +	return 0;
 +}
 +
++/*
++ * v56: the codec seen again after its supplies come on, reads only. The two supplies live, the
++ * OTP current trims (zero while unpowered, nonzero on a powered, calibrated part), RESETB0 (0x14),
++ * DCTR_CM (0xD0), and the four digital registers the probe read before the switch-on.
++ */
++int a04s_acpm_codec_snapshot(uint8_t out[12]);
++int
++a04s_acpm_codec_snapshot(uint8_t out[12])
++{
++	static const uint8_t regs[12][2] = {
++		{ 0x01, 0x4B }, { 0x01, 0x4C }, { 0x03, 0xA2 }, { 0x03, 0xA3 }, { 0x03, 0xA4 }, { 0x03, 0xA6 },
++		{ 0x07, 0x14 }, { 0x07, 0xD0 }, { 0x07, 0x16 }, { 0x07, 0x20 }, { 0x07, 0x34 }, { 0x07, 0x37 },
++	};
++	if (!acpm_ready) {
++		return ENXIO;
++	}
++	for (unsigned i = 0; i < 12; i++) {
++		int error = acpm_read(regs[i][0], regs[i][1], &out[i]);
++		if (error) {
++			return error;
++		}
++	}
++	return 0;
++}
++
 +/* The registers Samsung's own drivers read first: s2mpu12-core.c, then aud3004x.c. */
 +void a04s_acpm_probe(void);
 +void
@@ -582,10 +607,10 @@ index 0000000..9d62d91
 +#endif /* A04S_ACPM_GUARD_H */
 diff --git a/bsd/dev/a04s_audclk.c b/bsd/dev/a04s_audclk.c
 new file mode 100644
-index 0000000..eb21edd
+index 0000000..cb928c2
 --- /dev/null
 +++ b/bsd/dev/a04s_audclk.c
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,227 @@
 +/*
 + * Galaxy A04s, audio route A2 (v54): the AUD3004X codec's master clock.
 + *
@@ -612,6 +637,16 @@ index 0000000..eb21edd
 + * bits 00). With boot-arg a04scodecpwr=1 (the owner's decision, 2026-11-07),
 + * a04s_acpm_codec_supplies_on() switches them on as Android's s2mpu12 driver does, then the write
 + * test runs again 5 ms later. The PMIC write itself lives in a04s_acpm.c, behind its own guard.
++ *
++ * v56: v55 switched the supplies on (read back 0xEC 0xEC) and the codec still stored nothing. Android
++ * does two more things first (aud3004x.c, abox.c): it waits AUD3004X_PDB_CLK_MSEC (20 ms) before
++ * the first codec access, and aud3004x_enable() calls abox_enable_mclk(true), which sets
++ * ABOX_QCHANNEL_DISABLE (ABOX SFR 0x14a50000 + 0x38) bit 2, ABOX_BCLK_UAIF0, so the codec's bit
++ * clock isn't Q-channel gated. Now the wait is 20 ms, then a04s_acpm_codec_snapshot() reads the
++ * codec again (reads only). With boot-arg a04sabox=1, abox_mclk_on() sets that one bit: the third
++ * and last register write in this file, and only when ABOX's bus clock gate (CMU_AUD+0x2048) isn't
++ * forced off, so the access can't stall the bus. The codec write test runs again 20 ms later.
++ * Heartbeat lines "AUD SNAP" and "AUD ABOX".
 + */
 +#if defined(ARM64_BOARD_CONFIG_A04S)
 +#include <sys/param.h>
@@ -624,6 +659,7 @@ index 0000000..eb21edd
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern int a04s_acpm_codec_retest(void);        /* a04s_acpm.c */
 +extern int a04s_acpm_codec_supplies_on(uint8_t before[2], uint8_t after[2]);   /* a04s_acpm.c, v55 */
++extern int a04s_acpm_codec_snapshot(uint8_t out[12]);                           /* a04s_acpm.c, v56 */
 +
 +#define PMU_PA                  0x11860000u
 +#define PMU_PD_AUD_STATUS       0x2084u
@@ -639,6 +675,14 @@ index 0000000..eb21edd
 +#define GATE_MANUAL_BIT         20u
 +#define PLL_ENABLE              (1u << 31)
 +#define PLL_STABLE              (1u << 29)
++#define AUD_GATE_BCLK_UAIF0     0x2004u         /* CLK_BLK_AUD_UID_ABOX_IPCLKPORT_BCLK_UAIF0, read only */
++#define AUD_GATE_ABOX_ACLK      0x2048u         /* GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_ACLK, read only */
++#define AUD_QCH_ABOX_ACLK       0x3010u         /* QCH_CON_ABOX_QCH_ACLK, read only */
++#define AUD_QCH_ABOX_BCLK0      0x3014u         /* QCH_CON_ABOX_QCH_BCLK0, read only */
++#define ABOX_SFR_PA             0x14a50000u     /* abox@14a50000 "sfr", exynos3830.dts */
++#define ABOX_QCHANNEL_DISABLE   0x0038u         /* abox_soc_2.h */
++#define QCH_BCLK_UAIF0_BIT      2u              /* abox.h enum qchannel: ABOX_BCLK_UAIF0 */
++#define CODEC_SETTLE_US         20000u          /* aud3004x.h AUD3004X_PDB_CLK_MSEC */
 +
 +static struct {
 +	const char *state;
@@ -647,7 +691,13 @@ index 0000000..eb21edd
 +	int test_before, test_after;
 +	int supply_rc;
 +	uint8_t supply_before[2], supply_after[2];
-+} aud = { .state = "NOT RUN", .test_before = -1, .test_after = -1, .supply_rc = -1 };
++	int snap_rc;
++	uint8_t snap[12];
++	const char *abox;
++	uint32_t aclk, uaif0, qch_aclk, qch_bclk0, qdis_before, qdis_after;
++	int test_abox;
++} aud = { .state = "NOT RUN", .test_before = -1, .test_after = -1, .supply_rc = -1, .snap_rc = -1,
++	    .abox = "NOT RUN", .test_abox = -1 };
 +
 +static inline uint32_t
 +aud_rd(vm_offset_t base, uint32_t off)
@@ -674,6 +724,45 @@ index 0000000..eb21edd
 +	} else {
 +		*r = v & ~(1u << GATE_AUTO_BIT);
 +	}
++}
++
++/* Write 3 of 3 (v56): ABOX's UAIF0 bit clock out of Q-channel gating, as abox_enable_mclk(true). */
++static void __attribute__((noinline))
++abox_mclk_on(vm_offset_t abox)
++{
++	volatile uint32_t *r = (volatile uint32_t *)(abox + ABOX_QCHANNEL_DISABLE);
++	*r = *r | (1u << QCH_BCLK_UAIF0_BIT);
++}
++
++/* v56: the ABOX clock gates, read; with a04sabox=1 the UAIF0 bit clock on, then the write test. */
++static void
++abox_step(vm_offset_t cmu)
++{
++	aud.aclk = aud_rd(cmu, AUD_GATE_ABOX_ACLK);
++	aud.uaif0 = aud_rd(cmu, AUD_GATE_BCLK_UAIF0);
++	aud.qch_aclk = aud_rd(cmu, AUD_QCH_ABOX_ACLK);
++	aud.qch_bclk0 = aud_rd(cmu, AUD_QCH_ABOX_BCLK0);
++	int want = 0;
++	(void)PE_parse_boot_argn("a04sabox", &want, sizeof(want));
++	if (want != 1) {
++		aud.abox = "READ ONLY";
++		return;
++	}
++	if ((aud.aclk & (1u << GATE_MANUAL_BIT)) && !(aud.aclk & (1u << GATE_CG_VAL_BIT))) {
++		aud.abox = "ACLK OFF";          /* ABOX's registers wouldn't answer: not touched */
++		return;
++	}
++	vm_offset_t abox = ml_io_map(ABOX_SFR_PA, 0x1000);
++	if (!abox) {
++		aud.abox = "NO MAP";
++		return;
++	}
++	aud.qdis_before = aud.qdis_after = aud_rd(abox, ABOX_QCHANNEL_DISABLE);
++	abox_mclk_on(abox);
++	aud.qdis_after = aud_rd(abox, ABOX_QCHANNEL_DISABLE);
++	delay(CODEC_SETTLE_US);
++	aud.test_abox = a04s_acpm_codec_retest();
++	aud.abox = aud.test_abox == 0 ? "CODEC ANSWERS" : "BCLK ON, CODEC SILENT";
 +}
 +
 +void a04s_audclk_start(void);
@@ -705,11 +794,13 @@ index 0000000..eb21edd
 +	(void)PE_parse_boot_argn("a04scodecpwr", &power, sizeof(power));
 +	if (power == 1) {
 +		aud.supply_rc = a04s_acpm_codec_supplies_on(aud.supply_before, aud.supply_after);
-+		delay(5000);                   /* the LDOs' ramp (12 mV/us) and the codec's power-on reset */
++		delay(CODEC_SETTLE_US);        /* v56: Android's 20 ms before the first codec access (v55: 5 ms) */
++		aud.snap_rc = a04s_acpm_codec_snapshot(aud.snap);
 +		aud.test_after = a04s_acpm_codec_retest();
 +		aud.state = aud.supply_rc ? "SUPPLIES REFUSED" : aud.test_after == 0 ? "SUPPLIES ON, CODEC ANSWERS" :
 +		    "SUPPLIES ON, CODEC SILENT";
 +	}
++	abox_step(cmu);
 +	int want = 0;
 +	(void)PE_parse_boot_argn("a04saudclk", &want, sizeof(want));
 +	if (want != 1) {
@@ -740,6 +831,11 @@ index 0000000..eb21edd
 +	    aud.state, aud.pd, aud.pll, aud.div_audif, aud.div_mclk, aud.pad_before, aud.pad_after,
 +	    aud.gate_before, aud.gate_after, aud.test_before, aud.test_after, aud.supply_rc,
 +	    aud.supply_before[0], aud.supply_before[1], aud.supply_after[0], aud.supply_after[1]);
++	kprintf("AUD SNAP %d LDO %02x %02x OTP %02x %02x %02x %02x RESETB0 %02x DCTR %02x REGS %02x %02x %02x %02x\n",
++	    aud.snap_rc, aud.snap[0], aud.snap[1], aud.snap[2], aud.snap[3], aud.snap[4], aud.snap[5],
++	    aud.snap[6], aud.snap[7], aud.snap[8], aud.snap[9], aud.snap[10], aud.snap[11]);
++	kprintf("AUD ABOX %s ACLK %x UAIF0 %x QCH %x %x QDIS %x>%x TEST %d\n", aud.abox, aud.aclk, aud.uaif0,
++	    aud.qch_aclk, aud.qch_bclk0, aud.qdis_before, aud.qdis_after, aud.test_abox);
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_emmc_guard.h b/bsd/dev/a04s_emmc_guard.h
