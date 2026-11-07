@@ -14,6 +14,13 @@ This folder holds only off-phone work. Nothing here touches the A04s kernel or i
 3. Metal: hand-written AIR modules (`hakios/air/*.ll`, none of them Apple's) go through AIR → NIR → Panfrost's Bifrost compiler into job chains. Each must compile and build chains. Mesa's pandecode writes every chain, and `pandecode-check.py` judges it: no decoder complaints, every pointer inside a buffer the shim gave, shader code in executable memory.
 4. OpenGL ES: OSMesa on Panfrost as the G52 (the userland of the 7c-6 route, off the phone), judged the same way, plus a softpipe picture compared with the one kept from the S9+ port.
 
+## M1b: our own Metal shaders, compiled by Apple's compiler
+
+`shaders/core.metal` and `shaders/probe.metal` are this repository's own shaders.
+- **Compilation:** the CI's macOS job compiles them with the iPhoneOS SDK's `metal` (MSL 3.0, iOS 16 deployment target, as iOS 16.7's libraries are built). The Linux job feeds the metallibs through the same path (`METALLIBS=dir check.sh ...`).
+- **Core functions must pass:** a buffer kernel, a fragment shader reading `[[position]]`, and a vertex/fragment pair with a varying.
+- **The rest are probes:** half precision, texture writes, threadgroup memory, sampling with a sampler and a constexpr sampler, framebuffer fetch, function constants, SIMD-group functions, atomics, `half` texture reads. Each result is printed as "compiled, N chains, pandecode-check PASS" or "NOT YET" with the refusal, without failing the run.
+
 **What it does not prove:**
 - that the G52 runs these chains (no GPU executes anything);
 - that the registers beyond the four read on the phone are right;

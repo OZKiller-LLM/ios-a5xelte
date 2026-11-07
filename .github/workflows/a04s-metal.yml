@@ -1,8 +1,10 @@
 name: a04s-metal
 
-# Galaxy A04s, Metal track M1: the Metal shader path (AIR -> NIR -> Bifrost v7) and Panfrost's job
-# chains for the Mali-G52, checked under Mesa's drm-shim without the phone (gpu/a04s/metal). Only
-# Mesa, HakiOS's MIT code and this repository's are used; no Apple file.
+# Galaxy A04s, Metal track M1/M1b: the Metal shader path (AIR -> NIR -> Bifrost v7) and Panfrost's
+# job chains for the Mali-G52, checked under Mesa's drm-shim without the phone (gpu/a04s/metal).
+# M1b's shaders are this repository's own (gpu/a04s/metal/shaders), compiled by Apple's Metal
+# compiler on a macOS runner. Only Mesa, HakiOS's MIT code and this repository's are used; no file
+# of Apple's operating system.
 
 on:
   workflow_dispatch:
@@ -17,11 +19,60 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  metallibs:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile our Metal shaders for iOS 16 (MSL 3.0)
+        run: |
+          set -e
+          xcrun -sdk iphoneos metal --version | head -3
+          mkdir -p metallibs
+          for f in core probe; do
+            xcrun -sdk iphoneos metal -std=metal3.0 -mios-version-min=16.0 \
+              -o "metallibs/$f.metallib" "gpu/a04s/metal/shaders/$f.metal"
+          done
+          python3 - metallibs/*.metallib <<'PY'
+          import struct, sys
+          TYPES = {0: 'vertex', 1: 'fragment', 2: 'kernel', 3: 'exported', 4: 'visible'}
+          for p in sys.argv[1:]:
+              b = open(p, 'rb').read()
+              assert b[:4] == b'MTLB', p
+              vmaj, vmin, ftype = struct.unpack_from('<HHB', b, 6)
+              fl = struct.unpack_from('<Q', b, 24)[0]
+              n = struct.unpack_from('<I', b, fl)[0]
+              off, out = fl + 4, []
+              for _ in range(n):
+                  size = struct.unpack_from('<I', b, off)[0]
+                  t, name, air = off + 4, '?', ''
+                  kind = '?'
+                  while t + 6 <= off + size and b[t:t + 4] != b'ENDT':
+                      tag, ln = b[t:t + 4], struct.unpack_from('<H', b, t + 4)[0]
+                      d = b[t + 6:t + 6 + ln]
+                      if tag == b'NAME': name = d.rstrip(b'\0').decode()
+                      if tag == b'TYPE': kind = TYPES.get(d[0], str(d[0]))
+                      if tag == b'VERS': air = 'AIR %d.%d MSL %d.%d' % struct.unpack_from('<HHHH', d)
+                      t += 6 + ln
+                  out.append('%s (%s, %s)' % (name, kind, air))
+                  off += size
+              print('%s: container %d.%d, type %d, %d functions: %s' % (p, vmaj, vmin, ftype, n, '; '.join(out)))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: a04s-metallibs
+          path: metallibs/
+
   check:
+    needs: metallibs
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: a04s-metallibs
+          path: metallibs
       - name: Deps
         run: |
           sudo apt-get update -qq
@@ -30,7 +81,8 @@ jobs:
       - name: Build Mesa and run the checks
         run: |
           set -o pipefail
-          bash gpu/a04s/metal/check.sh "$RUNNER_TEMP/a04s-metal" out 2>&1 | tee check.log
+          METALLIBS="$GITHUB_WORKSPACE/metallibs" \
+            bash gpu/a04s/metal/check.sh "$RUNNER_TEMP/a04s-metal" out 2>&1 | tee check.log
       # Logs and artifacts need a GitHub sign-in; check-run annotations are public.
       - name: Publish the results as annotations
         if: always()
@@ -40,19 +92,19 @@ jobs:
           import pathlib, re, sys
           esc = lambda s: s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
           lines = [re.sub(r'\x1b\[[0-9;]*m', '', l) for l in open(sys.argv[1], errors='replace').read().splitlines()]
-          keep = [l for l in lines if re.match(r'(== |Metal |GL|softpipe|a04s-metal-check|air2nir)', l)]
+          keep = [l for l in lines if re.match(r'(== |-- |   |Metal |Probe |GL|softpipe|a04s-metal-check|air2nir)', l)]
           print('::notice title=a04s-metal summary::' + esc('\n'.join(keep)[:60000]))
           out = pathlib.Path(sys.argv[2])
-          for p in sorted((out / 'air').glob('*.nir.txt'))[:6]:
+          for p in sorted((out / 'air').glob('*.nir.txt'))[:4]:
               print('::notice title=NIR ' + p.name + '::' + esc(p.read_text(errors='replace')[:20000]))
+          bad = re.compile(r'(\berror:|^FAILED:|undefined reference|Assertion .* failed|meson\.build:\d+:\d+: ERROR)')
           for name in ('meson-setup.log', 'ninja.log'):
               p = out / name
               if p.exists():
-                  t = [l for l in p.read_text(errors='replace').splitlines()
-                       if re.search(r'error|ERROR|FAILED|undefined reference|Assertion', l)]
+                  t = [l for l in p.read_text(errors='replace').splitlines() if bad.search(l)]
                   if t:
                       print('::error title=' + name + '::' + esc('\n'.join(t[:40])[:30000]))
-          if any('FAIL' in l for l in keep) or not any('PASS' in l for l in keep):
+          if any('FAIL' in l and 'Probe' not in l for l in keep) or not any('PASS' in l for l in keep):
               print('::error title=check tail::' + esc('\n'.join(lines[-80:])[-30000:]))
           PY
       - uses: actions/upload-artifact@v4

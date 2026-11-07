@@ -170,6 +170,54 @@ run_metal fragpos --draw fragpos.bc fragPos 125
 run_metal argbuf --draw-argbuf argbuf_set.bc argbuf_direct.bc
 cd "$OUT"
 
+# M1b: our own Metal shaders (shaders/*.metal), compiled by Apple's Metal compiler on a macOS
+# runner into METALLIBS (core.metallib, probe.metallib), as iOS 16's own libraries are built.
+# The core functions must pass; a probe's outcome is recorded either way.
+probe() {
+	local name=$1
+	shift
+	set +e
+	on_mali "$name" "$AMT" "$@"
+	local rc=$?
+	set -e
+	local chains why
+	chains=$(sed -n 's/.* \([0-9]*\) chains submitted.*/\1/p' "$name/stderr.log")
+	if grep -q 'Assertion' "$name/stdout.log" "$name/stderr.log" || [ "${chains:-0}" = 0 ]; then
+		why=$(grep -h -i 'refus\|not handled\|not implemented\|unsupported\|would not\|Assertion\|error' \
+			"$name/stdout.log" "$name/stderr.log" | head -2 | cut -c1-300 | tr '\n' ' ')
+		echo "Probe $name: NOT YET (exit $rc): ${why:-no chain built}"
+	elif python3 "$CHECK" "$name" "$name/shim.trace" "$name/stderr.log" > "$name/pandecode-check.log"; then
+		echo "Probe $name: compiled for the G52, ${chains} chains built, pandecode-check PASS"
+	else
+		echo "Probe $name: compiled, ${chains} chains, pandecode-check FAILED: $(tail -1 "$name/pandecode-check.log")"
+	fi
+}
+if [ -n "${METALLIBS:-}" ]; then
+	echo "== Metal, Apple-compiled: our shaders from Apple's Metal compiler, onto Panfrost as the Mali-G52"
+	mkdir -p "$OUT/apple"
+	cd "$OUT/apple"
+	for lib in "$METALLIBS"/*.metallib; do
+		echo "-- $(basename "$lib"): the front end alone (air2nir --report)"
+		"$A2N" --report "$lib" 2>&1 | sed 's/^/   /' | cut -c1-300 || true
+	done
+	CORE=$METALLIBS/core.metallib
+	PROBE=$METALLIBS/probe.metallib
+	run_metal m1b_fill_buffer "$CORE" fill_buffer
+	run_metal m1b_gradient_fs --draw "$CORE" gradient_fs 125
+	run_metal m1b_quad_uv --draw-vertex "$CORE" quad_vs uv_fs 125
+	probe m1b_half_scale "$CORE" half_scale
+	probe m1b_tex_gradient "$CORE" tex_gradient 125
+	probe m1b_group_sum "$CORE" group_sum
+	probe m1b_blit --draw-vertex "$CORE" quad_vs blit_fs 125
+	probe m1b_blit_const --draw-vertex "$CORE" quad_vs blit_const_fs 125
+	probe p_fbfetch --draw-vertex "$PROBE" quad_vs_p fbfetch_fs 125
+	probe p_const --draw "$PROBE" const_fs 125
+	probe p_simd_sum "$PROBE" simd_sum_k
+	probe p_atomic "$PROBE" atomic_count
+	probe p_half_read --draw "$PROBE" half_read_fs 125
+	cd "$OUT"
+fi
+
 echo "== OpenGL ES on Panfrost, as the Mali-G52 (the 7c-6 route's userland)"
 if on_mali "$OUT/gl/mali" "$OUT/gl_drmshim" 720 1600 "$OUT/gl/mali/readback.rgba" fill; then
 	grep '^gl_drmshim: Mesa' "$OUT/gl/mali/stdout.log" || true
