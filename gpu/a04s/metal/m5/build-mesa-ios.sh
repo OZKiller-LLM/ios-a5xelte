@@ -37,7 +37,7 @@ echo "$SHA256  mesa-$VERSION.tar.xz" | shasum -a 256 -c --quiet
 STAMP=$(cat "$GPU_MESA/patch-mesa.py" "$GPU_MESA/hero_hw.c" "$GPU_MESA/osmesa_hero.inc" \
 	"$HK"/mesa/patches/air-frontend.patch "$HK"/mesa/patches/air-metal.patch \
 	"$HK"/mesa/patches/panfrost-pack-pointer.patch "$METAL"/mesa-patches/*.patch \
-	"$METAL"/air/* "$HERE/build-mesa-ios.sh" | shasum -a 256 | cut -d' ' -f1)
+	"$METAL"/air/* "$HERE/patch-pan-disk-cache.py" "$HERE/build-mesa-ios.sh" | shasum -a 256 | cut -d' ' -f1)
 if [ "$(cat mesa/.a04s-m5 2>/dev/null)" != "$STAMP" ]; then
 	rm -rf mesa build
 	tar xJf mesa-$VERSION.tar.xz
@@ -52,6 +52,8 @@ if [ "$(cat mesa/.a04s-m5 2>/dev/null)" != "$STAMP" ]; then
 	for p in "$METAL"/mesa-patches/*.patch; do
 		patch -s --no-backup-if-mismatch -d mesa -p1 < "$p"
 	done
+	# 4. M6: Panfrost's shader cache without an ELF build-id
+	python3 "$HERE/patch-pan-disk-cache.py" mesa
 	rm -rf mesa/src/compiler/air
 	cp -R "$METAL/air" mesa/src/compiler/air   # M6: the merged front end and library (air/NOTICE.md)
 	echo "$STAMP" > mesa/.a04s-m5

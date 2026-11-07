@@ -7107,7 +7107,7 @@ rwa_render_create(struct rwa_device *device,
    add_cb_deltas(fs, &render->finfo, device->ubo_base);
    if (!render->generated_vertex) {
       size_unsized_constants(vs, &render->vinfo);
-      add_cb_deltas(vs, &render->vinfo);
+      add_cb_deltas(vs, &render->vinfo, device->ubo_base);
    }
 
    /* Compile both stages now. A failure here is a creation failure and says so; the
