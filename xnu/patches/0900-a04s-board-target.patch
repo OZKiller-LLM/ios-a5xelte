@@ -29,10 +29,10 @@ index a16d8e0..a1c90fc 100644
  bsd/dev/herolte_battery.c		standard
 diff --git a/bsd/dev/a04s_acpm.c b/bsd/dev/a04s_acpm.c
 new file mode 100644
-index 0000000..f7f09e0
+index 0000000..5916a61
 --- /dev/null
 +++ b/bsd/dev/a04s_acpm.c
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,459 @@
 +/*
 + * Galaxy A04s: ACPM, the mailbox protocol of the APM core, to the S2MPU12 PMIC and the
 + * AUD3004X codec on the same bus. A write there can change a supply voltage, so this file
@@ -278,6 +278,74 @@ index 0000000..f7f09e0
 +	return ACPM_RETURN(cmd[1]) ? EIO : 0;
 +}
 +
++/*
++ * v55: one write to the codec's supplies, if a04s_acpm_guard.h's supply table allows that exact
++ * {bus, register, value}. Checked on the arguments, and again on the command built. The only other
++ * function that sends a write.
++ */
++static int __attribute__((noinline))
++acpm_supply_write(uint32_t bus_addr, uint32_t reg, uint8_t value)
++{
++	if (!acpm_writes_ok || !a04s_supply_write_allowed(bus_addr, reg, value)) {
++		acpm_refused++;
++		return EPERM;
++	}
++	uint32_t cmd[4] = { 0 };
++	cmd[0] = (reg & 0xffu) | ((bus_addr & 0xfu) << 8);
++	cmd[1] = ACPM_FUNC_WRITE | ((uint32_t)value << 8);
++	if (!a04s_supply_write_allowed((cmd[0] >> 8) & 0xfu, cmd[0] & 0xffu, (cmd[1] >> 8) & 0xffu)) {
++		acpm_refused++;
++		return EPERM;
++	}
++	int error = acpm_transfer(cmd);
++	if (error) {
++		return error;
++	}
++	return ACPM_RETURN(cmd[1]) ? EIO : 0;
++}
++
++/*
++ * v55 (the owner's decision, 2026-11-07): the codec's supplies on, as Samsung's s2mpu12 regulator
++ * driver does at every Android boot (regulator-always-on). Called from a04s_audclk.c before the
++ * key thread starts. Only when both read voltage code 0x2c, as Android leaves them; each gets its
++ * enable bits set once, the voltage bits kept, and is read back. Never off, never another voltage.
++ */
++int a04s_acpm_codec_supplies_on(uint8_t before[2], uint8_t after[2]);
++int
++a04s_acpm_codec_supplies_on(uint8_t before[2], uint8_t after[2])
++{
++	static const uint8_t regs[2] = { 0x4B, 0x4C };         /* S2MPU12_PMIC_L33CTRL, L34CTRL */
++	if (!acpm_ready || !acpm_writes_ok || !a04s_supply_guard_self_test()) {
++		return ENXIO;
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		int error = acpm_read(0x01, regs[i], &before[i]);
++		if (error) {
++			return error;
++		}
++		after[i] = before[i];
++		if ((before[i] & 0x3Fu) != 0x2Cu) {
++			return EDOM;                  /* not the voltage Android runs it at: neither is touched */
++		}
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		if ((before[i] & 0xC0u) != 0xC0u) {
++			int error = acpm_supply_write(0x01, regs[i], (uint8_t)((before[i] & 0x3Fu) | 0xC0u));
++			if (error) {
++				return error;
++			}
++		}
++		int error = acpm_read(0x01, regs[i], &after[i]);
++		if (error) {
++			return error;
++		}
++		if (after[i] != 0xECu) {
++			return EIO;
++		}
++	}
++	return 0;
++}
++
 +/* The registers Samsung's own drivers read first: s2mpu12-core.c, then aud3004x.c. */
 +void a04s_acpm_probe(void);
 +void
@@ -426,10 +494,10 @@ index 0000000..f7f09e0
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_acpm_guard.h b/bsd/dev/a04s_acpm_guard.h
 new file mode 100644
-index 0000000..b5308db
+index 0000000..9d62d91
 --- /dev/null
 +++ b/bsd/dev/a04s_acpm_guard.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,82 @@
 +/*
 + * Galaxy A04s: the only registers a kernel may write over ACPM. The same bus carries the
 + * S2MPU12 PMIC's regulators: its top and PMIC pages (bus addresses 0x00 and 0x01) set supply
@@ -475,13 +543,49 @@ index 0000000..b5308db
 +	       !a04s_acpm_write_allowed(0x17, 0x34) && !a04s_acpm_write_allowed(0x07, 0x100);
 +}
 +
++/*
++ * v55 (the owner's decision, 2026-11-07): the codec's two supplies, switched on as Samsung's
++ * s2mpu12 regulator driver does at every Android boot (regulator-always-on, mode 3, the voltage
++ * left as it is). These are the only PMIC writes there are: the PMIC page (bus 0x01), L33CTRL
++ * 0x4B ("vdd_aldo1") and L34CTRL 0x4C ("vdd_aldo2"), value 0xEC: enable bits 7:6 = 11 and voltage
++ * code 0x2c, 1.80 V on LDO33 (700 mV + 25 mV steps) and 2.90 V on LDO34 (1800 mV + 25 mV steps),
++ * both inside the device tree's ranges. {bus, register, value}; tools/check_kernel_acpm.py reads
++ * this table out of the built kernel and refuses any other entry.
++ */
++const volatile uint32_t a04s_acpm_supply[2][3] __attribute__((used)) = {
++	{ 0x01u, 0x4bu, 0xecu },
++	{ 0x01u, 0x4cu, 0xecu },
++};
++
++static inline bool
++a04s_supply_write_allowed(uint32_t bus, uint32_t reg, uint32_t value)
++{
++	for (unsigned i = 0; i < 2; i++) {
++		if (a04s_acpm_supply[i][0] == bus && a04s_acpm_supply[i][1] == reg && a04s_acpm_supply[i][2] == value) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* Both entries allowed; their neighbours, other values and other pages refused. */
++static inline bool
++a04s_supply_guard_self_test(void)
++{
++	return a04s_supply_write_allowed(0x01, 0x4b, 0xec) && a04s_supply_write_allowed(0x01, 0x4c, 0xec) &&
++	       !a04s_supply_write_allowed(0x01, 0x4b, 0x2c) && !a04s_supply_write_allowed(0x01, 0x4b, 0xed) &&
++	       !a04s_supply_write_allowed(0x01, 0x4c, 0xff) && !a04s_supply_write_allowed(0x01, 0x4a, 0xec) &&
++	       !a04s_supply_write_allowed(0x01, 0x4d, 0xec) && !a04s_supply_write_allowed(0x00, 0x4b, 0xec) &&
++	       !a04s_supply_write_allowed(0x07, 0x34, 0xec);
++}
++
 +#endif /* A04S_ACPM_GUARD_H */
 diff --git a/bsd/dev/a04s_audclk.c b/bsd/dev/a04s_audclk.c
 new file mode 100644
-index 0000000..bdaa83f
+index 0000000..eb21edd
 --- /dev/null
 +++ b/bsd/dev/a04s_audclk.c
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,156 @@
 +/*
 + * Galaxy A04s, audio route A2 (v54): the AUD3004X codec's master clock.
 + *
@@ -503,6 +607,11 @@ index 0000000..bdaa83f
 + * The codec write test (a04s_acpm_codec_retest(): AD_VOLL written, read back, restored) runs before
 + * and after. It runs from a04s_input_start() before the key thread starts, so nothing else uses
 + * ACPM meanwhile. The heartbeat line is "AUD CLK".
++ *
++ * v55: A2 found the clock and pads already on, and the codec's supplies off (LDO33/LDO34 enable
++ * bits 00). With boot-arg a04scodecpwr=1 (the owner's decision, 2026-11-07),
++ * a04s_acpm_codec_supplies_on() switches them on as Android's s2mpu12 driver does, then the write
++ * test runs again 5 ms later. The PMIC write itself lives in a04s_acpm.c, behind its own guard.
 + */
 +#if defined(ARM64_BOARD_CONFIG_A04S)
 +#include <sys/param.h>
@@ -514,6 +623,7 @@ index 0000000..bdaa83f
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern int a04s_acpm_codec_retest(void);        /* a04s_acpm.c */
++extern int a04s_acpm_codec_supplies_on(uint8_t before[2], uint8_t after[2]);   /* a04s_acpm.c, v55 */
 +
 +#define PMU_PA                  0x11860000u
 +#define PMU_PD_AUD_STATUS       0x2084u
@@ -535,7 +645,9 @@ index 0000000..bdaa83f
 +	uint32_t pd, pll, div_audif, div_mclk;
 +	uint32_t pad_before, pad_after, gate_before, gate_after;
 +	int test_before, test_after;
-+} aud = { .state = "NOT RUN", .test_before = -1, .test_after = -1 };
++	int supply_rc;
++	uint8_t supply_before[2], supply_after[2];
++} aud = { .state = "NOT RUN", .test_before = -1, .test_after = -1, .supply_rc = -1 };
 +
 +static inline uint32_t
 +aud_rd(vm_offset_t base, uint32_t off)
@@ -589,10 +701,21 @@ index 0000000..bdaa83f
 +	aud.div_mclk = aud_rd(cmu, AUD_DIV_MCLK);
 +	aud.gate_before = aud.gate_after = aud_rd(cmu, AUD_GATE_CODEC_MCLK);
 +	aud.test_before = a04s_acpm_codec_retest();
++	int power = 0;
++	(void)PE_parse_boot_argn("a04scodecpwr", &power, sizeof(power));
++	if (power == 1) {
++		aud.supply_rc = a04s_acpm_codec_supplies_on(aud.supply_before, aud.supply_after);
++		delay(5000);                   /* the LDOs' ramp (12 mV/us) and the codec's power-on reset */
++		aud.test_after = a04s_acpm_codec_retest();
++		aud.state = aud.supply_rc ? "SUPPLIES REFUSED" : aud.test_after == 0 ? "SUPPLIES ON, CODEC ANSWERS" :
++		    "SUPPLIES ON, CODEC SILENT";
++	}
 +	int want = 0;
 +	(void)PE_parse_boot_argn("a04saudclk", &want, sizeof(want));
 +	if (want != 1) {
-+		aud.state = "READ ONLY";
++		if (power != 1) {
++			aud.state = "READ ONLY";
++		}
 +		return;
 +	}
 +	if ((aud.pll & (PLL_ENABLE | PLL_STABLE)) != (PLL_ENABLE | PLL_STABLE)) {
@@ -612,9 +735,11 @@ index 0000000..bdaa83f
 +void
 +a04s_audclk_report(void)
 +{
-+	kprintf("AUD CLK %s PD %x PLL %08x AUDIF %x MCLKDIV %x PAD %x>%x GATE %x>%x TEST %d>%d\n",
++	kprintf("AUD CLK %s PD %x PLL %08x AUDIF %x MCLKDIV %x PAD %x>%x GATE %x>%x TEST %d>%d "
++	    "SUPPLY %d %02x %02x>%02x %02x\n",
 +	    aud.state, aud.pd, aud.pll, aud.div_audif, aud.div_mclk, aud.pad_before, aud.pad_after,
-+	    aud.gate_before, aud.gate_after, aud.test_before, aud.test_after);
++	    aud.gate_before, aud.gate_after, aud.test_before, aud.test_after, aud.supply_rc,
++	    aud.supply_before[0], aud.supply_before[1], aud.supply_after[0], aud.supply_after[1]);
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_emmc_guard.h b/bsd/dev/a04s_emmc_guard.h
