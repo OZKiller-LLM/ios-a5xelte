@@ -93,7 +93,21 @@ jobs:
           esc = lambda s: s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
           lines = [re.sub(r'\x1b\[[0-9;]*m', '', l) for l in open(sys.argv[1], errors='replace').read().splitlines()]
           keep = [l for l in lines if re.match(r'(== |-- |   |Metal |Probe |GL|softpipe|a04s-metal-check|air2nir)', l)]
-          print('::notice title=a04s-metal summary::' + esc('\n'.join(keep)[:60000]))
+          # GitHub cuts a long annotation, so the summary goes out in parts of at most 3500
+          # characters, and the M1b results (core and probes) get one of their own first.
+          m1b = [l for l in keep if re.match(r'(Probe |Metal m1b_|== Metal, Apple|-- |   module=)', l)]
+          if m1b:
+              print('::notice title=a04s-metal M1b results::' + esc('\n'.join(l[:400] for l in m1b)[:3500]))
+          part, size, n = [], 0, 1
+          for l in keep:
+              l = l[:500]
+              if size + len(l) > 3500 and part:
+                  print('::notice title=a04s-metal summary %d::' % n + esc('\n'.join(part)))
+                  part, size, n = [], 0, n + 1
+              part.append(l)
+              size += len(l) + 1
+          if part:
+              print('::notice title=a04s-metal summary %d::' % n + esc('\n'.join(part)))
           out = pathlib.Path(sys.argv[2])
           for p in sorted((out / 'air').glob('*.nir.txt'))[:4]:
               print('::notice title=NIR ' + p.name + '::' + esc(p.read_text(errors='replace')[:20000]))
