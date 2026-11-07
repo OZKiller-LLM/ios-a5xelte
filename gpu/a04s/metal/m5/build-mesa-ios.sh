@@ -36,7 +36,7 @@ echo "$SHA256  mesa-$VERSION.tar.xz" | shasum -a 256 -c --quiet
 STAMP=$(cat "$GPU_MESA/patch-mesa.py" "$GPU_MESA/hero_hw.c" "$GPU_MESA/osmesa_hero.inc" \
 	"$HK"/mesa/patches/air-frontend.patch "$HK"/mesa/patches/air-metal.patch \
 	"$HK"/mesa/patches/panfrost-pack-pointer.patch "$METAL"/mesa-patches/*.patch \
-	"$HK"/mesa/air/* "$0" | shasum -a 256 | cut -d' ' -f1)
+	"$HK"/mesa/air/* "$HERE/build-mesa-ios.sh" | shasum -a 256 | cut -d' ' -f1)
 if [ "$(cat mesa/.a04s-m5 2>/dev/null)" != "$STAMP" ]; then
 	rm -rf mesa build
 	tar xJf mesa-$VERSION.tar.xz
