@@ -40,9 +40,11 @@ OUT=$(mkdir -p "$2" && cd "$2" && pwd)
 SRC=$B/mesa-$VERSION
 LLVM_AS=${LLVM_AS:-$(command -v llvm-as || ls /usr/lib/llvm-*/bin/llvm-as 2>/dev/null | tail -1)}
 
-# The Mali-G52 MP1 of the Galaxy A04s, as the phone reported it (runbook, 7c-2 and 7c-5b):
-# GPU ID 72120000, L2F 7100206, SC 1, L2 1. Everything else stays the shim's stated assumption.
-export HAKIOS_MALI_REGS=${HAKIOS_MALI_REGS:-prod_id=0x7212,revision=0x0,shader_present=0x1,l2_present=0x1,l2_features=0x07100206}
+# The Mali-G52 MP1 of the Galaxy A04s, as the phone reported it: GPU ID 72120000, L2F 7100206,
+# SC 1, L2 1 (runbook, 7c-2 and 7c-5b), and HeroGPU's GetParam after 7c-6 (2026-11-07): JS_PRESENT
+# 7, MMU_FEATURES 0x2830, MAX_THREADS 0x300, THREAD_TLS_ALLOC 0 and AFBC_FEATURES 0. Everything
+# else stays the shim's stated assumption.
+export HAKIOS_MALI_REGS=${HAKIOS_MALI_REGS:-prod_id=0x7212,revision=0x0,shader_present=0x1,l2_present=0x1,l2_features=0x07100206,js_present=0x7,mmu_features=0x2830,max_threads=0x300,tls_alloc=0x0,afbc_features=0x0}
 
 cd "$B"
 # The sources: the release, every HakiOS Mesa patch in name order (as the S9 port applies them),
