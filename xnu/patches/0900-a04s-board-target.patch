@@ -29,10 +29,10 @@ index a16d8e0..a1c90fc 100644
  bsd/dev/herolte_battery.c		standard
 diff --git a/bsd/dev/a04s_acpm.c b/bsd/dev/a04s_acpm.c
 new file mode 100644
-index 0000000..db7f3c8
+index 0000000..8718d81
 --- /dev/null
 +++ b/bsd/dev/a04s_acpm.c
-@@ -0,0 +1,563 @@
+@@ -0,0 +1,586 @@
 +/*
 + * Galaxy A04s: ACPM, the mailbox protocol of the APM core, to the S2MPU12 PMIC and the
 + * AUD3004X codec on the same bus. A write there can change a supply voltage, so this file
@@ -450,6 +450,29 @@ index 0000000..db7f3c8
 +	return 0;
 +}
 +
++/*
++ * v58: registers lo..hi of one bus address read into out[lo..hi], reads only (the codec dump in
++ * a04s_audclk.c). A failed read stops and returns its error.
++ */
++int a04s_acpm_read_range(uint32_t bus_addr, uint32_t lo, uint32_t hi, uint8_t out[256]);
++int
++a04s_acpm_read_range(uint32_t bus_addr, uint32_t lo, uint32_t hi, uint8_t out[256])
++{
++	if (!acpm_ready) {
++		return ENXIO;
++	}
++	if (bus_addr > 0xFu || hi > 0xFFu || lo > hi) {
++		return EINVAL;
++	}
++	for (uint32_t reg = lo; reg <= hi; reg++) {
++		int error = acpm_read(bus_addr, reg, &out[reg]);
++		if (error) {
++			return error;
++		}
++	}
++	return 0;
++}
++
 +/* The registers Samsung's own drivers read first: s2mpu12-core.c, then aud3004x.c. */
 +void a04s_acpm_probe(void);
 +void
@@ -686,10 +709,10 @@ index 0000000..9d62d91
 +#endif /* A04S_ACPM_GUARD_H */
 diff --git a/bsd/dev/a04s_audclk.c b/bsd/dev/a04s_audclk.c
 new file mode 100644
-index 0000000..a5cc126
+index 0000000..0234827
 --- /dev/null
 +++ b/bsd/dev/a04s_audclk.c
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,331 @@
 +/*
 + * Galaxy A04s, audio route A2 (v54): the AUD3004X codec's master clock.
 + *
@@ -733,6 +756,12 @@ index 0000000..a5cc126
 + * codec's own ADC clocks on, its core and ADC out of reset, with a write test on IF_FORM1 before and
 + * on AD_VOLL after. Codec registers only, through a04s_acpm.c's allow-list; nothing here writes.
 + * Heartbeat line "AUD READY".
++ *
++ * v58: v57's writes were all accepted and none kept, and only DCTR_CM has ever read non-zero. With
++ * the boot-arg "a04scodecdump" set to 1, codec_dump() reads the codec's digital (0x07) and analog
++ * (0x08) pages, the registers aud3004x.c marks readable, before and after the supplies come on,
++ * plus the PMIC's LDO controls (0x01, 0x40-0x4F) as a control. Reads only. The first two
++ * heartbeats print it as "AUD DUMP" lines; 0xEE marks a register not read.
 + */
 +#if defined(ARM64_BOARD_CONFIG_A04S)
 +#include <sys/param.h>
@@ -747,6 +776,7 @@ index 0000000..a5cc126
 +extern int a04s_acpm_codec_supplies_on(uint8_t before[2], uint8_t after[2]);   /* a04s_acpm.c, v55 */
 +extern int a04s_acpm_codec_snapshot(uint8_t out[12]);                           /* a04s_acpm.c, v56 */
 +extern int a04s_acpm_codec_capture_ready(uint8_t regs[6], int *test_if, int *test_adc);  /* v57 */
++extern int a04s_acpm_read_range(uint32_t bus_addr, uint32_t lo, uint32_t hi, uint8_t out[256]);  /* v58 */
 +
 +#define PMU_PA                  0x11860000u
 +#define PMU_PD_AUD_STATUS       0x2084u
@@ -871,6 +901,39 @@ index 0000000..a5cc126
 +	    aud.test_if == 0 ? "IF STORES, ADC SILENT" : "CODEC SILENT";
 +}
 +
++/* v58: the readable ranges of aud3004x.c's digital and analog regmaps, and the PMIC control. */
++static const struct {
++	uint8_t bus, lo, hi, page;
++} dump_ranges[] = {
++	{ 0x07, 0x08, 0x29, 0 }, { 0x07, 0x2F, 0x4E, 0 }, { 0x07, 0x50, 0x86, 0 }, { 0x07, 0x88, 0x8E, 0 },
++	{ 0x07, 0x90, 0x9E, 0 }, { 0x07, 0xA0, 0xFC, 0 },
++	{ 0x08, 0x00, 0x1F, 1 }, { 0x08, 0x30, 0x38, 1 }, { 0x08, 0x50, 0x62, 1 }, { 0x08, 0x70, 0x8C, 1 },
++	{ 0x08, 0x90, 0xA3, 1 },
++	{ 0x01, 0x40, 0x4F, 2 },
++};
++static const uint8_t dump_bus[3] = { 0x07, 0x08, 0x01 };
++static uint8_t dump[2][3][256];
++static int dump_rc[2] = { -1, -1 };
++
++static void
++codec_dump(int which)
++{
++	for (unsigned p = 0; p < 3; p++) {
++		for (unsigned i = 0; i < 256; i++) {
++			dump[which][p][i] = 0xEE;
++		}
++	}
++	dump_rc[which] = 0;
++	for (unsigned i = 0; i < sizeof(dump_ranges) / sizeof(dump_ranges[0]); i++) {
++		int rc = a04s_acpm_read_range(dump_ranges[i].bus, dump_ranges[i].lo, dump_ranges[i].hi,
++		    dump[which][dump_ranges[i].page]);
++		if (rc) {
++			dump_rc[which] = rc;
++			return;
++		}
++	}
++}
++
 +void a04s_audclk_start(void);
 +void
 +a04s_audclk_start(void)
@@ -898,10 +961,18 @@ index 0000000..a5cc126
 +	aud.test_before = a04s_acpm_codec_retest();
 +	int power = 0;
 +	(void)PE_parse_boot_argn("a04scodecpwr", &power, sizeof(power));
++	int want_dump = 0;
++	(void)PE_parse_boot_argn("a04scodecdump", &want_dump, sizeof(want_dump));
++	if (want_dump == 1) {
++		codec_dump(0);
++	}
 +	if (power == 1) {
 +		aud.supply_rc = a04s_acpm_codec_supplies_on(aud.supply_before, aud.supply_after);
 +		delay(CODEC_SETTLE_US);        /* v56: Android's 20 ms before the first codec access (v55: 5 ms) */
 +		aud.snap_rc = a04s_acpm_codec_snapshot(aud.snap);
++		if (want_dump == 1) {
++			codec_dump(1);
++		}
 +		aud.test_after = a04s_acpm_codec_retest();
 +		aud.state = aud.supply_rc ? "SUPPLIES REFUSED" : aud.test_after == 0 ? "SUPPLIES ON, CODEC ANSWERS" :
 +		    "SUPPLIES ON, CODEC SILENT";
@@ -946,6 +1017,31 @@ index 0000000..a5cc126
 +	kprintf("AUD READY %s rc %d IF %d CLKGATE0 %02x>%02x CLKGATE2 %02x>%02x RESETB0 %02x>%02x ADC %d\n",
 +	    aud.ready_state, aud.ready_rc, aud.test_if, aud.ready[0], aud.ready[1], aud.ready[2], aud.ready[3],
 +	    aud.ready[4], aud.ready[5], aud.test_adc);
++	static int dumps_printed;
++	if (dumps_printed >= 2 || dump_rc[0] < 0) {
++		return;
++	}
++	dumps_printed++;
++	for (int w = 0; w < 2; w++) {
++		kprintf("AUD DUMP %s rc %d\n", w ? "AFTER" : "BEFORE", dump_rc[w]);
++		if (dump_rc[w] < 0) {
++			continue;                     /* not taken (no supply switch-on this boot) */
++		}
++		for (unsigned p = 0; p < 3; p++) {
++			for (unsigned row = 0; row < 256; row += 16) {
++				const uint8_t *b = &dump[w][p][row];
++				bool any = false;
++				for (unsigned i = 0; i < 16; i++) {
++					any = any || b[i] != 0xEE;
++				}
++				if (any) {
++					kprintf("AUD DUMP %c %02x %02x: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
++					    "%02x %02x %02x %02x\n", w ? 'A' : 'B', dump_bus[p], row, b[0], b[1], b[2], b[3], b[4], b[5],
++					    b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
++				}
++			}
++		}
++	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_emmc_guard.h b/bsd/dev/a04s_emmc_guard.h
