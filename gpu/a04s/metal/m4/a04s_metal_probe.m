@@ -73,21 +73,46 @@ remove_all(void)
 	}
 }
 
+/* M4 run 2: where the probe is, for the heartbeat. The first phone run stopped logging after
+ * "supportsFamily Apple4" with no exit; a thread now names the current step every 10 s, so a
+ * hang shows as repeated heartbeats on one step and slow disk flushes as slow lines. */
+static const char *volatile g_step = "start";
+#define STEP(s) (g_step = (s))
+
+static void *
+heartbeat(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		sleep(10);
+		a04s_log("heartbeat: alive, step \"%s\"", g_step);
+	}
+	return NULL;
+}
+
 int
 main(int argc, char **argv)
 {
 	@autoreleasepool {
-		a04s_log("a04s-metal-probe (M4): uid %d, argv[0] %s", getuid(), argv[0]);
+		a04s_log("a04s-metal-probe (M4 run 2): uid %d, argv[0] %s", getuid(), argv[0]);
+		/* A time limit, so the drop agent always sees the autorun end: A04S_METAL_TIMEOUT
+		 * seconds (default 300), then SIGALRM's default action ends the process. */
+		const char *to = getenv("A04S_METAL_TIMEOUT");
+		alarm(to ? (unsigned)atoi(to) : 300);
+		pthread_t hb;
+		pthread_create(&hb, NULL, heartbeat, NULL);
 		const char *rm = getenv("A04S_METAL_REMOVE");
 		if (rm && !strcmp(rm, "1")) {
 			remove_all();
 			a04s_log("a04s-metal-probe: removal done");
 			return 0;
 		}
+		STEP("install");
 		install_bundle();
 		setenv("A04S_METAL", "1", 1);
 		setenv("MTL_MONOLITHIC_COMPILER", "1", 0);
 
+		STEP("MTLCreateSystemDefaultDevice");
 		id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
 		if (!dev) {
 			a04s_log("MTLCreateSystemDefaultDevice: nil (is a04smetal=1 set, and the bundle in place?)");
@@ -100,9 +125,19 @@ main(int argc, char **argv)
 			{ 1005, "Apple5" }, { 1006, "Apple6" }, { 1007, "Apple7" }, { 1008, "Apple8" },
 			{ 3001, "Common1" }, { 3002, "Common2" }, { 3003, "Common3" }, { 5001, "Metal3" },
 		};
-		for (unsigned i = 0; i < sizeof(fam) / sizeof(fam[0]); i++)
-			a04s_log("  supportsFamily %s: %s", fam[i].n,
-				 [dev supportsFamily:(MTLGPUFamily)fam[i].f] ? "YES" : "no");
+		STEP("supportsFamily");
+		{
+			/* all twelve asked first, then logged on one line: the answers do not wait on
+			 * the disk in between */
+			char fams[512] = "";
+			for (unsigned i = 0; i < sizeof(fam) / sizeof(fam[0]); i++) {
+				BOOL yes = [dev supportsFamily:(MTLGPUFamily)fam[i].f];
+				strlcat(fams, fam[i].n, sizeof(fams));
+				strlcat(fams, yes ? "=YES " : "=no ", sizeof(fams));
+			}
+			a04s_log("  supportsFamily: %s", fams);
+		}
+		STEP("respondsToSelector / thread limits");
 		/* Anything past the registration path is asked only when answered: a selector the
 		 * device lacks is logged by its resolveInstanceMethod: (through respondsToSelector:)
 		 * instead of ending the run before the compile request. */
@@ -127,19 +162,23 @@ main(int argc, char **argv)
 		}
 		NSError *err = nil;
 		dispatch_data_t data = dispatch_data_create(lib.bytes, lib.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+		STEP("newLibraryWithData");
 		id<MTLLibrary> library = [dev newLibraryWithData:data error:&err];
 		a04s_log("newLibraryWithData: %s%s%s", library ? object_getClassName(library) : "nil",
 			 err ? ", error: " : "", err ? err.localizedDescription.UTF8String : "");
 		if (!library)
 			return 0;
 		a04s_log("  functions: %s", [library.functionNames componentsJoinedByString:@", "].UTF8String);
+		STEP("newFunctionWithName");
 		id<MTLFunction> fn = [library newFunctionWithName:@"fill_buffer"];
 		a04s_log("newFunctionWithName: fill_buffer -> %s", fn ? object_getClassName(fn) : "nil");
 		if (!fn)
 			return 0;
 		err = nil;
 		a04s_log("newComputePipelineStateWithFunction: fill_buffer ... (the request to the plug-in)");
+		STEP("newComputePipelineStateWithFunction (compiler plug-in)");
 		id<MTLComputePipelineState> ps = [dev newComputePipelineStateWithFunction:fn error:&err];
+		STEP("done");
 		a04s_log("newComputePipelineStateWithFunction: %s%s%s", ps ? object_getClassName(ps) : "nil",
 			 err ? ", error: " : "", err ? err.localizedDescription.UTF8String : "");
 		a04s_log("a04s-metal-probe: done");
