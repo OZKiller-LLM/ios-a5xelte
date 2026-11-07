@@ -217,6 +217,8 @@ if [ -n "${METALLIBS:-}" ]; then
 	"$A2N" "$PROBE" simd_sum_k > "$OUT/apple/simd_sum_k.nir.txt" 2>&1 || true
 	set +e
 	BIFROST_MESA_DEBUG=shaders on_mali p_simd_sum_ir "$AMT" "$PROBE" simd_sum_k
+	BIFROST_MESA_DEBUG=noopt on_mali p_simd_sum_noopt "$AMT" "$PROBE" simd_sum_k
+	echo "Probe p_simd_sum with BIFROST_MESA_DEBUG=noopt: $(grep -h 'chains submitted\|Assertion' p_simd_sum_noopt/stderr.log p_simd_sum_noopt/stdout.log | head -2 | cut -c1-200 | tr '\n' ' ')"
 	set -e
 	probe p_atomic "$PROBE" atomic_count
 	probe p_half_read --draw "$PROBE" half_read_fs 125

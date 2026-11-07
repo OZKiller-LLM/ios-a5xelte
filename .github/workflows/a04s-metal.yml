@@ -113,11 +113,15 @@ jobs:
               print('::notice title=NIR ' + p.name + '::' + esc(p.read_text(errors='replace')[:20000]))
           # M1c: the SIMD-group sum, as NIR and as Bifrost IR, in parts small enough to keep
           for p, title in ((out / 'apple' / 'simd_sum_k.nir.txt', 'NIR simd_sum_k'),
-                           (out / 'apple' / 'p_simd_sum_ir' / 'stderr.log', 'Bifrost IR simd_sum_k')):
+                           (out / 'apple' / 'p_simd_sum_ir' / 'stdout.log', 'Bifrost IR simd_sum_k')):
               if p.exists():
                   t = p.read_text(errors='replace')
                   if 'Bifrost' in title:
-                      t = '\n'.join(l for l in t.splitlines() if 'pandecode' not in l)[-14000:]
+                      # the backend's own IR, from where the Bifrost passes start
+                      i = t.find('shader: MESA_SHADER_COMPUTE')
+                      j = t.rfind('shader: MESA_SHADER_COMPUTE')
+                      t = t[j:] if j > i >= 0 else t
+                      t = t[-14000:]
                   for k in range(0, min(len(t), 14000), 3500):
                       print('::notice title=%s (%d)::' % (title, k // 3500 + 1) + esc(t[k:k + 3500]))
           bad = re.compile(r'(\berror:|^FAILED:|undefined reference|Assertion .* failed|meson\.build:\d+:\d+: ERROR)')
