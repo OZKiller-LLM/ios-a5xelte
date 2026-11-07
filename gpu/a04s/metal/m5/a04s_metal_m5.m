@@ -36,6 +36,7 @@
 #include <mach-o/dyld.h>
 #include <signal.h>
 #include <spawn.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 
@@ -50,13 +51,34 @@ static const char *KILL = "/System/Library/Extensions/A04sMetal.bundle/a04smetal
 static const char *volatile g_step = "start";
 #define STEP(s) (g_step = (s))
 
+/* M6a run 4: what the process is waiting on. M6a run 3 spent 335 s building one pipeline with
+ * 3.5 s of CPU and no slow kernel call (herodrm's stats), so each heartbeat now also says how much
+ * memory the process holds (phys_footprint), how many pages it has read back from storage since
+ * the last line (pageins), and how much CPU it used: many page-ins and little CPU is memory
+ * pressure on the eMMC, neither is a lock. */
 static void *
 heartbeat(void *arg)
 {
 	(void)arg;
+	uint64_t last_pageins = 0;
+	double last_cpu = 0;
 	for (;;) {
 		sleep(10);
-		a04s_log("heartbeat: alive, step \"%s\"", g_step);
+		task_vm_info_data_t vm;
+		mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+		uint64_t footprint = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &n) == KERN_SUCCESS
+					     ? vm.phys_footprint : 0;
+		task_events_info_data_t ev;
+		n = TASK_EVENTS_INFO_COUNT;
+		uint64_t pageins = task_info(mach_task_self(), TASK_EVENTS_INFO, (task_info_t)&ev, &n) == KERN_SUCCESS
+					   ? (uint64_t)ev.pageins : 0;
+		struct rusage ru;
+		getrusage(RUSAGE_SELF, &ru);
+		double cpu = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
+		a04s_log("heartbeat: alive, step \"%s\"; footprint %.1f MB, %llu page-ins, CPU %.1f s in the last 10 s",
+			 g_step, footprint / 1048576.0, (unsigned long long)(pageins - last_pageins), cpu - last_cpu);
+		last_pageins = pageins;
+		last_cpu = cpu;
 	}
 	return NULL;
 }
