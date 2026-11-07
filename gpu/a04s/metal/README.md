@@ -21,6 +21,12 @@ This folder holds only off-phone work. Nothing here touches the A04s kernel or i
 - **Core functions must pass:** a buffer kernel, a fragment shader reading `[[position]]`, and a vertex/fragment pair with a varying.
 - **The rest are probes:** half precision, texture writes, threadgroup memory, sampling with a sampler and a constexpr sampler, framebuffer fetch, function constants, SIMD-group functions, atomics, `half` texture reads. Each result is printed as "compiled, N chains, pandecode-check PASS" or "NOT YET" with the refusal, without failing the run.
 
+**First results (CI run 42316582117):**
+- All 15 functions translate.
+- The three core pairs pass.
+- Of the probes, these compile to chains that pass pandecode-check: half, samplers (constexpr too), framebuffer fetch, a function constant, atomics, and `half` texture reads.
+- Not yet: a kernel's texture write (a Bifrost compiler assertion on the image store's type), threadgroup memory (the test doesn't dispatch it yet) and `simd_sum` (a Bifrost packer assertion on v7).
+
 **What it does not prove:**
 - that the G52 runs these chains (no GPU executes anything);
 - that the registers beyond the four read on the phone are right;
