@@ -1139,10 +1139,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..e4caa95
+index 0000000..96d6b56
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
-@@ -0,0 +1,2412 @@
+@@ -0,0 +1,2416 @@
 +/*
 + * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
 + *
@@ -3542,17 +3542,21 @@ index 0000000..e4caa95
 +	extern uint64_t vm_swap_get_used_space(void);
 +	extern void herogpu_mem_stats(uint64_t *live, uint64_t *peak, uint32_t *bos);
 +	extern void sweet_surface_mem_stats(uint32_t *live, uint64_t *buffers, uint64_t *wrapped, uint64_t *state);   /* v61 */
++	extern size_t zone_pages_wired;                       /* v62: osfmk/kern/zalloc.c */
++	extern unsigned int inuse_pmap_pages_count;           /* v62: osfmk/arm/pmap/pmap_data.c, page tables */
++	extern unsigned int vm_page_wire_count_initial;       /* v62: wired at startup */
 +	uint64_t bo_live = 0, bo_peak = 0, sbuf = 0, swrap = 0, sstate = 0;
 +	uint32_t bos = 0, surfs = 0;
 +	herogpu_mem_stats(&bo_live, &bo_peak, &bos);
 +	sweet_surface_mem_stats(&surfs, &sbuf, &swrap, &sstate);
 +	kprintf("MEM AVAIL %u FREE %u WIRED %u CMP %u PAGES %lld KB SWAP %llu KB GPUBO %u %llu KB PEAK %llu KB "
-+	    "SURF %u BUF %llu KB WRAP %llu KB STATE %llu KB\n",
++	    "SURF %u BUF %llu KB WRAP %llu KB STATE %llu KB ZONE %llu PMAP %u BOOT %u\n",
 +	    memorystatus_available_pages, vm_page_free_count, vm_page_wire_count, c_segment_pages_compressed,
 +	    (long long)(c_segment_compressed_bytes / 1024), (unsigned long long)(vm_swap_get_used_space() / 1024), bos,
 +	    (unsigned long long)(bo_live / 1024), (unsigned long long)(bo_peak / 1024), surfs,
 +	    (unsigned long long)(sbuf / 1024), (unsigned long long)(swrap / 1024),
-+	    (unsigned long long)(sstate / 1024));
++	    (unsigned long long)(sstate / 1024),
++	    (unsigned long long)zone_pages_wired, inuse_pmap_pages_count, vm_page_wire_count_initial);
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_input.c b/bsd/dev/a04s_input.c
