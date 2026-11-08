@@ -1139,10 +1139,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..a030846
+index 0000000..e4caa95
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
-@@ -0,0 +1,2407 @@
+@@ -0,0 +1,2412 @@
 +/*
 + * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
 + *
@@ -3541,13 +3541,18 @@ index 0000000..a030846
 +	extern int64_t c_segment_compressed_bytes;
 +	extern uint64_t vm_swap_get_used_space(void);
 +	extern void herogpu_mem_stats(uint64_t *live, uint64_t *peak, uint32_t *bos);
-+	uint64_t bo_live = 0, bo_peak = 0;
-+	uint32_t bos = 0;
++	extern void sweet_surface_mem_stats(uint32_t *live, uint64_t *buffers, uint64_t *wrapped, uint64_t *state);   /* v61 */
++	uint64_t bo_live = 0, bo_peak = 0, sbuf = 0, swrap = 0, sstate = 0;
++	uint32_t bos = 0, surfs = 0;
 +	herogpu_mem_stats(&bo_live, &bo_peak, &bos);
-+	kprintf("MEM AVAIL %u FREE %u WIRED %u CMP %u PAGES %lld KB SWAP %llu KB GPUBO %u %llu KB PEAK %llu KB\n",
++	sweet_surface_mem_stats(&surfs, &sbuf, &swrap, &sstate);
++	kprintf("MEM AVAIL %u FREE %u WIRED %u CMP %u PAGES %lld KB SWAP %llu KB GPUBO %u %llu KB PEAK %llu KB "
++	    "SURF %u BUF %llu KB WRAP %llu KB STATE %llu KB\n",
 +	    memorystatus_available_pages, vm_page_free_count, vm_page_wire_count, c_segment_pages_compressed,
 +	    (long long)(c_segment_compressed_bytes / 1024), (unsigned long long)(vm_swap_get_used_space() / 1024), bos,
-+	    (unsigned long long)(bo_live / 1024), (unsigned long long)(bo_peak / 1024));
++	    (unsigned long long)(bo_live / 1024), (unsigned long long)(bo_peak / 1024), surfs,
++	    (unsigned long long)(sbuf / 1024), (unsigned long long)(swrap / 1024),
++	    (unsigned long long)(sstate / 1024));
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_input.c b/bsd/dev/a04s_input.c
@@ -8631,10 +8636,51 @@ index f1e25f9..cdfabe0 100644
   * For the GPU copy test (bsd/dev/herolte_gpu.c): the 4 KiB physical pages
   * of the last full-screen iOS surface, its layout and kernel address. The
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index aba42b4..81458f1 100644
+index aba42b4..e5f82bb 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -251,6 +251,39 @@ sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+@@ -76,6 +76,19 @@ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
++static uint32_t      sweet_surface_live;        /* v61: surfaces alive (each has a wired state page) */
++static uint64_t      sweet_surface_wrapped;     /* v61: bytes of client memory wired by prepare() */
++
++/* v61: for the heartbeat's MEM line (bsd/dev/a04s_gpu.c). */
++extern "C" void sweet_surface_mem_stats(uint32_t *live, uint64_t *buffers, uint64_t *wrapped, uint64_t *state);
++extern "C" void
++sweet_surface_mem_stats(uint32_t *live, uint64_t *buffers, uint64_t *wrapped, uint64_t *state)
++{
++	*live = __atomic_load_n(&sweet_surface_live, __ATOMIC_RELAXED);
++	*buffers = __atomic_load_n(&sweet_surface_wired, __ATOMIC_RELAXED);
++	*wrapped = __atomic_load_n(&sweet_surface_wrapped, __ATOMIC_RELAXED);
++	*state = (uint64_t)*live * page_size;
++}
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+@@ -86,6 +99,12 @@ SweetSurface::free()
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
++	if (wiredClient != 0) {
++		__atomic_sub_fetch(&sweet_surface_wrapped, (uint64_t)wiredClient, __ATOMIC_RELAXED);   /* v61 */
++	}
++	if (state != NULL) {
++		__atomic_sub_fetch(&sweet_surface_live, 1u, __ATOMIC_RELAXED);                        /* v61 */
++	}
+ 	OSSafeReleaseNULL(kernelMap);
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+@@ -214,6 +233,7 @@ sweet_surface_alloc(void)
+ 		return NULL;
+ 	}
+ 	bzero(s->state->getBytesNoCopy(), page_size);
++	__atomic_add_fetch(&sweet_surface_live, 1u, __ATOMIC_RELAXED);                         /* v61 */
+ 	return s;
+ }
+ 
+@@ -251,6 +271,39 @@ sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
  	return s;
  }
  
@@ -8674,7 +8720,7 @@ index aba42b4..81458f1 100644
  mach_port_name_t
  sweet_surface_port_in_task(SweetSurface *s, task_t task)
  {
-@@ -302,7 +335,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -302,7 +355,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
  	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
  		return kIOReturnBadArgument;
  	}
@@ -8683,7 +8729,7 @@ index aba42b4..81458f1 100644
  	/*
  	 * Every surface is memory this driver allocates (wrapping client memory
  	 * is refused), and clients take the row pitch from the lock result: round
-@@ -709,7 +742,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -709,7 +762,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  	}
  	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
  	ret = sweet_surface_layout(s, props);
@@ -8692,7 +8738,16 @@ index aba42b4..81458f1 100644
  	/*
  	 * A surface over the client's own memory, page aligned (SpringBoard's
  	 * 1008x1792 RGhA picture): the surface IS those pages, wired, so what the
-@@ -753,7 +786,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -728,6 +781,8 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 				s->memory = over;
+ 				s->mapCache = kIOMapDefaultCache;
+ 				wrapped = true;
++				s->wiredClient = s->allocSize;                                         /* v61 */
++				__atomic_add_fetch(&sweet_surface_wrapped, (uint64_t)s->allocSize, __ATOMIC_RELAXED);
+ 				if (!sweet_surface_publish(s)) {
+ 					ret = kIOReturnNoResources;
+ 				}
+@@ -753,7 +808,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  			ret = kIOReturnNoMemory;
  		} else {
  			bzero(mem->getBytesNoCopy(), s->allocSize);
@@ -8701,7 +8756,7 @@ index aba42b4..81458f1 100644
  			/*
  			 * A surface over the client's own memory: not mapped here, but it
  			 * must at least start with those pixels. Ignored, the surface
-@@ -782,7 +815,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -782,7 +837,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u -> 0x%x\n",
  		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
  		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
@@ -8710,7 +8765,7 @@ index aba42b4..81458f1 100644
  		/* which keys a surface is asked for with, to tell who is meant to fill it */
  		OSCollectionIterator *keys = OSCollectionIterator::withCollection(props);
  		if (keys != NULL) {
-@@ -867,7 +900,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+@@ -867,7 +922,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
  		 * NULL+0x30.
  		 */
  		sweet_surf_log_once("sel", selector);
@@ -8720,10 +8775,18 @@ index aba42b4..81458f1 100644
  			static int told;
  			if (told < 12) {
 diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
-index fbcdfac..679b0ba 100644
+index fbcdfac..7cb8671 100644
 --- a/iokit/Kernel/arm/SweetSurface.h
 +++ b/iokit/Kernel/arm/SweetSurface.h
-@@ -57,6 +57,11 @@ SweetSurface *sweet_surface_copy(uint32_t id);
+@@ -39,6 +39,7 @@ public:
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++	uint32_t                  wiredClient;  /* v61: bytes of client memory wired by prepare() (wrapped) */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -57,6 +58,11 @@ SweetSurface *sweet_surface_copy(uint32_t id);
   */
  SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
      uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
