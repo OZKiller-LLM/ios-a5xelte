@@ -970,8 +970,12 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
             OSType dpf = IOSurfaceGetPixelFormat(surface);
             BOOL bgra_like = dpf == 'BGRA' || (dpf == 0 && IOSurfaceGetBytesPerElement(surface) == 4 && IOSurfaceGetPlaneCount(surface) == 0);
             if (g_direct && !inverted && osm_sweet_active() && bgra_like && osm_sweet_attach_direct(name, IOSurfaceGetID(surface))) direct = YES;
-            // keep what the surface already shows: CoreAnimation redraws only the damaged part of a swap-chain buffer
-            else if (IOSurfaceGetPixelFormat(surface) == 'BGRA')
+            // keep what the surface already shows: CoreAnimation redraws only the damaged part of a swap-chain buffer.
+            // A04s (2026-11-09): every BGRA-like surface, not only fourcc 'BGRA'. The page dots and the search magnifier are
+            // no-fourcc 4-byte surfaces whose rows aren't 64-byte aligned (no direct path): they started as an empty texture,
+            // CoreAnimation's vibrancy read them through framebuffer fetch as zeros, and the sync then wrote those zeros over
+            // the glyph SpringBoard had drawn (BGL_ICONDIAG: "cpu-copy ... gl 0").
+            else if (bgra_like)
                 [self texImageIOSurface:surface target:GL_TEXTURE_2D internalFormat:GL_RGBA width:w height:h format:GL_BGRA_EXT type:GL_UNSIGNED_BYTE plane:0 invert:!inverted];   // same row order as the sync
         }
         if (glGetError() != GL_NO_ERROR) EAGL_DEBUG("attachImage: storage for %ux%u failed\n", w, h);
