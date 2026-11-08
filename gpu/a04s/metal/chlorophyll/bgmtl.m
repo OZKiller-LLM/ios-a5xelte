@@ -178,6 +178,8 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW, BG_WORK_TEXCO
    unsigned clear_stencil, stencil_ref[2];
    BOOL have_range;
    float depth_range[2];
+   BOOL have_viewport;             // A04s (M6): MTLViewport origin and size
+   float viewport[4];
    BOOL have_scissor;
    unsigned scissor[4];
    // texture blits: source/destination slice+level, origins and the size of the region, buffer layout
@@ -403,6 +405,8 @@ bg_install_fallback(Class c)
    unsigned _clear_stencil_v, _stencil_ref[2];
    BOOL _have_range;
    float _range[2];
+   BOOL _have_vp;                  // A04s (M6): setViewport: origin and size
+   float _vp[4];
    BOOL _have_scissor;
    unsigned _scissor[4];
 }
@@ -1165,6 +1169,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
          if (w->depth_state) dr.depth_stencil = [(BGMTLDepthStencil *)w->depth_state rwaState];
          dr.stencil_reference[0] = w->stencil_ref[0]; dr.stencil_reference[1] = w->stencil_ref[1];
          if (w->have_range) dr.depth_range = w->depth_range;
+         if (w->have_viewport) dr.viewport = w->viewport;   // A04s (M6)
          if (w->have_scissor) dr.scissor = w->scissor;
          dr.vertex = (struct rwa_bindings){ .buffers = vb, .buffer_count = w->vcount };
          dr.fragment = (struct rwa_bindings){ .buffers = fb, .buffer_count = w->count, .textures = texs, .texture_count = w->texture_count,
@@ -1847,6 +1852,11 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    for (unsigned i = 0; i < 8; i++) {
       MTLRenderPassColorAttachmentDescriptor *a = [[d colorAttachments] objectAtIndexedSubscript:i];
       if (!a || ![a texture]) continue;
+      // A04s (M6): this device draws into level 0, slice 0 of an attachment; say so when a pass asks for another
+      if ([a level] || [a slice] || [a depthPlane])
+         BG_LOG("render pass: colour %u asks for level %lu slice %lu plane %lu of a %lux%lu texture; level 0 slice 0 is drawn\n", i,
+                (unsigned long)[a level], (unsigned long)[a slice], (unsigned long)[a depthPlane],
+                (unsigned long)[[a texture] width], (unsigned long)[[a texture] height]);
       _color[i] = [[a texture] retain];
       _ncolor = i + 1;
       if ([a loadAction] == MTLLoadActionClear) {
@@ -1921,6 +1931,8 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 {
    BG_TRACE("setViewport %g %g %g %g z %g..%g\n", v.originX, v.originY, v.width, v.height, v.znear, v.zfar);
    _range[0] = (float)v.znear; _range[1] = (float)v.zfar; _have_range = YES;
+   // A04s (M6): the rectangle too (CoreAnimation draws parts of its blur chain into part of an attachment)
+   _vp[0] = (float)v.originX; _vp[1] = (float)v.originY; _vp[2] = (float)v.width; _vp[3] = (float)v.height; _have_vp = YES;
 }
 - (void)setDepthStencilState:(id)state { BG_TRACE("setDepthStencilState %p\n", state); [_depth_state release]; _depth_state = [state retain]; }
 - (void)setStencilReferenceValue:(uint32_t)v { BG_TRACE("setStencilReference %u\n", v); _stencil_ref[0] = _stencil_ref[1] = v; }
@@ -1995,6 +2007,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    w->stencil_ref[0] = _stencil_ref[0]; w->stencil_ref[1] = _stencil_ref[1];
    if (_have_scissor) { w->have_scissor = YES; memcpy(w->scissor, _scissor, sizeof(_scissor)); }
    if (_have_range) { w->have_range = YES; w->depth_range[0] = _range[0]; w->depth_range[1] = _range[1]; }
+   if (_have_vp) { w->have_viewport = YES; memcpy(w->viewport, _vp, sizeof(_vp)); }   // A04s (M6)
    w->primitive = prim; w->vstart = start; w->vcount_verts = count; w->instances = inst; w->base_instance = bi;
    w->index_buffer = [ib retain]; w->index_type = it; w->index_offset = io; w->base_vertex = bv;
    [_cb bgRecord:w];

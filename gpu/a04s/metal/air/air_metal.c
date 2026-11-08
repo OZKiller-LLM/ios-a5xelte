@@ -7919,8 +7919,13 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
        * it is landed against -- it must turn from (100+x, 200+y, ...) into
        * (100+x, 200+(3-y), ...), the texture mirrored vertically, on both back ends.
        */
-      .scale = { w / 2.0f, -(h / 2.0f), zfar - znear },
-      .translate = { w / 2.0f, h / 2.0f, znear } });
+      /* A04s (Metal track M6): Metal's viewport rectangle when the encoder set one (CoreAnimation
+       * draws its blur chain into parts of an attachment); the whole attachment otherwise. */
+      .scale = { (draw->viewport ? draw->viewport[2] : w) / 2.0f,
+                 -((draw->viewport ? draw->viewport[3] : h) / 2.0f), zfar - znear },
+      .translate = { (draw->viewport ? draw->viewport[0] : 0.0f) + (draw->viewport ? draw->viewport[2] : w) / 2.0f,
+                     (draw->viewport ? draw->viewport[1] : 0.0f) + (draw->viewport ? draw->viewport[3] : h) / 2.0f,
+                     znear } });
 
    {
       /* Chlorophyll: Metal's scissor test (see rwa_draw.scissor), clamped to the attachment as Metal requires. */

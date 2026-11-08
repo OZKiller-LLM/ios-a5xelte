@@ -1351,6 +1351,11 @@ struct rwa_draw {
 	 * left origin, which is Gallium's window space under this library's flipped
 	 * viewport. Appended, like the fields above. */
 	const unsigned *scissor;
+
+	/* A04s (Metal track M6): MTLRenderCommandEncoder's viewport rectangle,
+	 * { originX, originY, width, height } in attachment pixels (top-left origin), or NULL
+	 * for the whole attachment. Its znear/zfar stay in `depth_range`. Appended. */
+	const float *viewport;
 };
 
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
