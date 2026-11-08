@@ -115,6 +115,7 @@ struct rwa_device {
    /* A04s (Metal track M6): zeros for a buffer a shader declares and the encoder left unbound
     * (zero_buffer_for); made on first use. */
    struct rwa_buffer *zero_buffer;
+   void *metal_default_sampler;   /* A04s (M6): metal_default_sampler */
 
    /* NIR's options for this screen, asked once: the translator needs them to know what
     * the consumer can be handed (what it may leave for the backend to lower).
@@ -870,6 +871,8 @@ rwa_device_close(struct rwa_device *device)
       free(device->fc[i]);
    if (device->zero_buffer)
       rwa_buffer_destroy(device->zero_buffer);
+   if (device->metal_default_sampler)
+      device->pipe->delete_sampler_state(device->pipe, device->metal_default_sampler);
    if (device->default_sampler)
       device->pipe->delete_sampler_state(device->pipe, device->default_sampler);
    device->pipe->destroy(device->pipe);
@@ -3985,6 +3988,27 @@ default_sampler(struct rwa_device *device)
    return device->default_sampler;
 }
 
+/* A04s (Metal track M6): what an unbound API sampler stands in as -- MTLSamplerDescriptor's own defaults:
+ * normalized coordinates, nearest, clamp to edge, no mipmaps. default_sampler() above is air_run's, with
+ * UNNORMALIZED coordinates, and a shader sampling at 0..1 through it reads its texture's corner texel only: CoreAnimation's
+ * blur chain (M6a runs 4-5) then read the transparent border of its 258x258 layer copy everywhere. */
+static void *
+metal_default_sampler(struct rwa_device *device)
+{
+   if (!device->metal_default_sampler) {
+      device->metal_default_sampler = device->pipe->create_sampler_state(device->pipe,
+         &(struct pipe_sampler_state){
+            .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+            .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+            .wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+            .min_img_filter = PIPE_TEX_FILTER_NEAREST,
+            .mag_img_filter = PIPE_TEX_FILTER_NEAREST,
+            .min_mip_filter = PIPE_TEX_MIPFILTER_NONE,
+            .unnormalized_coords = false });
+   }
+   return device->metal_default_sampler;
+}
+
 /*
  * Which Metal buffer indices a module declares ARGUMENT BUFFERS at, one bit each, and a
  * refusal when one is past the 32 a mask holds.
@@ -4470,7 +4494,7 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
              */
             if (!sm) {
                /* A04s (Metal track M6): unbound, and accepted by check_bindings */
-               samplers[r->index] = default_sampler(device);
+               samplers[r->index] = metal_default_sampler(device);
                if (!samplers[r->index]) {
                   say(why, why_size, "%s would not make a sampler at all", rwa_device_name(device));
                   return -1;

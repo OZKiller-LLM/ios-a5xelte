@@ -1261,6 +1261,8 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
          [self bgFailWith:[NSString stringWithUTF8String:why] code:3];
       else if (_status != 5)
          _status = 4;
+      if (_status == 4 && getenv("A04S_PASS_STATS"))
+         [self a04sPassStats];
       {
          unsigned nd = 0;
          for (BGWork *w in _work)
@@ -1287,6 +1289,48 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
       dispatch_group_leave(_done);
       [self release];
    });
+}
+
+// A04s (Metal track M6), A04S_PASS_STATS with a synchronous commit (BGMTL_TRACE or BGMTL_SYNC): every colour attachment
+// this command buffer drew into, read back once it completed, with how much of it is non-zero and a few pixels. Each
+// pass of an off-screen chain (CoreAnimation's downsample and blur) writes its own texture, so this shows which pass
+// first produced nothing. 8-bit 4-channel formats only; the first 24 small ones are also written to
+// /private/var/a04s/m6-pass-NN-WxH.bgra.
+- (void)a04sPassStats
+{
+   static unsigned seq;
+   NSMutableArray *seen = [NSMutableArray array];
+   for (BGWork *w in _work) {
+      if (w->kind != BG_WORK_DRAW && w->kind != BG_WORK_CLEAR) continue;
+      for (unsigned i = 0; i < w->color_count; i++) {
+         BGMTLTexture *t = (BGMTLTexture *)w->color[i];
+         if (!t || [seen containsObject:t]) continue;
+         [seen addObject:t];
+         NSUInteger pf = [t pixelFormat], wd = [t width], ht = [t height];
+         if (pf != MTLPixelFormatBGRA8Unorm && pf != MTLPixelFormatRGBA8Unorm && pf != MTLPixelFormatBGRA8Unorm_sRGB &&
+             pf != MTLPixelFormatRGBA8Unorm_sRGB) {
+            BG_LOG("pass stats: %p %lux%lu fmt %lu not read\n", t, (unsigned long)wd, (unsigned long)ht, (unsigned long)pf);
+            continue;
+         }
+         uint8_t *px = malloc(wd * ht * 4);
+         if (!px) continue;
+         [t getBytes:px bytesPerRow:wd * 4 fromRegion:MTLRegionMake2D(0, 0, wd, ht) mipmapLevel:0];
+         size_t nz = 0;
+         for (size_t k = 0; k < wd * ht * 4; k++) nz += px[k] != 0;
+         const uint8_t *c = px + 4 * ((ht / 2) * wd + wd / 2), *e = px + 4 * (1 * wd + 1);
+         BG_LOG("pass stats %u: %p %lux%lu fmt %lu: %zu of %lu bytes non-zero; centre %02x%02x%02x%02x, (1,1) %02x%02x%02x%02x\n",
+                seq, t, (unsigned long)wd, (unsigned long)ht, (unsigned long)pf, nz, (unsigned long)(wd * ht * 4),
+                c[0], c[1], c[2], c[3], e[0], e[1], e[2], e[3]);
+         if (seq < 24 && wd <= 300 && ht <= 300) {
+            char path[128];
+            snprintf(path, sizeof(path), "/private/var/a04s/m6-pass-%02u-%lux%lu.bgra", seq, (unsigned long)wd, (unsigned long)ht);
+            FILE *f = fopen(path, "wb");
+            if (f) { fwrite(px, 1, wd * ht * 4, f); fclose(f); }
+         }
+         seq++;
+         free(px);
+      }
+   }
 }
 
 // What follows a completed (or failed) command buffer; run by the completion queue, or inline when tracing.
@@ -1958,8 +2002,17 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:l < 16 ? 16 : l options:0] autorelease];
    if (b) { [_scratch addObject:b]; [self setFragmentBuffer:b offset:0 atIndex:i]; }
 }
-- (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _tex[i] = t; if (i + 1 > _thigh) _thigh = (unsigned)i + 1; } }
-- (void)setFragmentSamplerState:(id)s atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _smp[i] = s; if (i + 1 > _shigh) _shigh = (unsigned)i + 1; } }
+- (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i
+{
+   BG_TRACE("setFragmentTexture %p (%lux%lu) index %lu\n", t, t ? (unsigned long)[t width] : 0, t ? (unsigned long)[t height] : 0,
+            (unsigned long)i);   // A04s (M6): which texture each blur pass reads
+   if (i < BG_MAX_TEX) { _tex[i] = t; if (i + 1 > _thigh) _thigh = (unsigned)i + 1; }
+}
+- (void)setFragmentSamplerState:(id)s atIndex:(NSUInteger)i
+{
+   BG_TRACE("setFragmentSamplerState %p index %lu\n", s, (unsigned long)i);   // A04s (M6)
+   if (i < BG_MAX_TEX) { _smp[i] = s; if (i + 1 > _shigh) _shigh = (unsigned)i + 1; }
+}
 - (void)setViewport:(MTLViewport)v
 {
    BG_TRACE("setViewport %g %g %g %g z %g..%g\n", v.originX, v.originY, v.width, v.height, v.znear, v.zfar);
