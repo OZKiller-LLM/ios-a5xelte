@@ -647,6 +647,51 @@ static const struct { const char *name; void **orig; void *hook; } g_dirty_hooks
     { "glFramebufferRenderbuffer", (void **)&o_FramebufferRenderbuffer, h_FramebufferRenderbuffer }, { "glDeleteFramebuffers", (void **)&o_DeleteFramebuffers, h_DeleteFramebuffers },
 };
 
+// A04s (2026-11-08), BGL_ICONDIAG=1: why the page dots and the search magnifier come out empty. CoreAnimation's GLES
+// renderer reads the framebuffer only through GL_EXT_shader_framebuffer_fetch ("#extension
+// GL_EXT_shader_framebuffer_fetch : require", gl_LastFragData[]); Mesa may advertise only the _non_coherent variant,
+// which CA doesn't know. Log once what the context advertises, then every shader that asks for the framebuffer:
+// whether it compiled, and its log if not.
+static void (*o_CompileShader)(GLuint);
+static BOOL has_token(const char *list, const char *tok) {
+    size_t n = strlen(tok);
+    for (const char *p = list; p && (p = strstr(p, tok)); p += n)
+        if ((p == list || p[-1] == ' ') && (p[n] == ' ' || p[n] == 0)) return YES;
+    return NO;
+}
+static void h_CompileShader(GLuint sh) {
+    o_CompileShader(sh);
+    if (!icondiag_on()) return;
+    static int said_ext, n;
+    if (!said_ext) {
+        said_ext = 1;
+        const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+        fprintf(stderr, "FETCH context: GL_EXT_shader_framebuffer_fetch %s, _non_coherent %s, ARM_shader_framebuffer_fetch %s; "
+                "renderer %s, version %s\n", has_token(ext, "GL_EXT_shader_framebuffer_fetch") ? "YES" : "no",
+                has_token(ext, "GL_EXT_shader_framebuffer_fetch_non_coherent") ? "YES" : "no",
+                has_token(ext, "GL_ARM_shader_framebuffer_fetch") ? "YES" : "no",
+                (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));
+    }
+    GLint len = 0;
+    glGetShaderiv(sh, GL_SHADER_SOURCE_LENGTH, &len);
+    if (len <= 0 || len > 65536 || n >= 60) return;
+    char *src = malloc((size_t)len + 1);
+    if (!src) return;
+    glGetShaderSource(sh, len + 1, NULL, src);
+    src[len] = 0;
+    if (strstr(src, "framebuffer_fetch") || strstr(src, "gl_LastFragData")) {
+        GLint ok = 0, loglen = 0;
+        glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+        glGetShaderiv(sh, GL_INFO_LOG_LENGTH, &loglen);
+        char info[300] = "";
+        if (!ok && loglen > 0) glGetShaderInfoLog(sh, sizeof info, NULL, info);
+        for (char *q = info; *q; q++) if (*q == '\n') *q = ' ';
+        n++;
+        fprintf(stderr, "FETCH shader %u: %d bytes, compiled %s%s%s\n", sh, len, ok ? "OK" : "NO", info[0] ? ": " : "", info);
+    }
+    free(src);
+}
+
 static void eagl_install_hooks(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -654,6 +699,9 @@ static void eagl_install_hooks(void) {
         for (int i = 0; i < gl_nfuncs; i++) {
             if (!strcmp(gl_names[i], "glFlush")) { mesa_glFlush = gl_tab[i]; gl_tab[i] = (void *)shim_glFlush; }
             if (!strcmp(gl_names[i], "glFinish")) { mesa_glFinish = gl_tab[i]; gl_tab[i] = (void *)shim_glFinish; }
+            if (!strcmp(gl_names[i], "glCompileShader") && gl_tab[i] != (void *)gl_unimpl) {
+                o_CompileShader = gl_tab[i]; gl_tab[i] = (void *)h_CompileShader;     // A04s: the framebuffer-fetch diagnosis
+            }
         }
         g_debug = getenv("EAGL_SHIM_DEBUG") != NULL; g_debug_frames = g_debug && !strcmp(getenv("EAGL_SHIM_DEBUG"), "2");
         g_dirty_track = !getenv("BGL_SYNC_ALL");
