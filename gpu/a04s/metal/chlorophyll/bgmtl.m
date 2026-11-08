@@ -344,6 +344,8 @@ bg_install_fallback(Class c)
    struct rwa_texture *_tex;
    struct rwa_texture_shape _shape;
    CFTypeRef _surface;   // retained IOSurface, when the memory is one
+   BOOL _surfCopy;       // A04s (M6): the surface could not be imported; _tex is a copy refreshed from it (rwaTextureSampledLocked)
+   uint32_t _surfSeed;   // A04s (M6): the surface's seed at the last refresh, 0 = never
    NSUInteger _plane;
    @public
    id _linSrc;           // newLinearTextureWithDescriptor: the buffer whose bytes this texture shows (retained)
@@ -1632,6 +1634,20 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
       /* a CAMetalLayer drawable: CoreAnimation made the IOSurface and sends the device this one message; the texture IS that memory */
       bg_lock();
       _tex = rwa_texture_from_surface([device rwa], &_shape, (int)IOSurfaceGetID((IOSurfaceRef)surface), 0, 0, why, sizeof(why));
+      /* A04s (Metal track M6): a surface the GPU cannot take as it is -- small glyph and mask backing stores whose rows
+       * are not 64-byte aligned, the EAGL route's missing page dots and magnifier -- gets a texture of our own, filled
+       * from the surface's pixels when it is sampled and the surface's seed has moved since. Without it the texture was
+       * nil and the layer was simply not drawn. Not for a render target: CoreAnimation's drawables import directly. */
+      if (!_tex) {
+         static unsigned logged;
+         if (logged++ < 16)
+            BG_LOG("IOSurface %u (%zux%zu, %zu bytes a row) not importable (%s); a copy refreshed from it stands in\n",
+                   IOSurfaceGetID((IOSurfaceRef)surface), IOSurfaceGetWidthOfPlane((IOSurfaceRef)surface, plane),
+                   IOSurfaceGetHeightOfPlane((IOSurfaceRef)surface, plane),
+                   IOSurfaceGetBytesPerRowOfPlane((IOSurfaceRef)surface, plane), why);
+         _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
+         _surfCopy = _tex != NULL;
+      }
       bg_unlock();
       _surface = CFRetain(surface);
       _plane = plane;
@@ -1671,6 +1687,23 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    // CPU caches. The surface's seed moves at every write unlock, so the cache is cleaned whenever the seed differs from the one
    // last cleaned at (per surface ID: QuartzCore makes new texture objects for the same surface all the time). The import cache
    // (one kernel clean per surface, ever) left those layers stale or missing until this.
+   if (_surfCopy && _surface && _tex) {
+      /* A04s (Metal track M6): the copy of a surface that could not be imported, refreshed when its seed moved */
+      uint32_t seed = IOSurfaceGetSeed((IOSurfaceRef)_surface);
+      if (!_surfSeed || seed != _surfSeed) {
+         IOSurfaceRef s = (IOSurfaceRef)_surface;
+         if (IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL) == 0) {
+            char why[256] = { 0 };
+            const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _shape.width, _shape.height ? _shape.height : 1, 1 };
+            if (rwa_texture_write(_tex, 0, 0, o, sz, IOSurfaceGetBaseAddressOfPlane(s, _plane),
+                                  IOSurfaceGetBytesPerRowOfPlane(s, _plane), why, sizeof(why)) != 0)
+               BG_LOG("IOSurface copy refresh: %s\n", why);
+            IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+            _surfSeed = seed ? seed : 1;
+         }
+      }
+      return [self rwaTexture];
+   }
    if (_surface && _tex) {
       static NSMutableDictionary *seeds;
       static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
