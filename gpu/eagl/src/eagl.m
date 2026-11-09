@@ -409,6 +409,27 @@ static int icondiag_on(void) {
     return on;
 }
 
+// A04s (2026-11-09), BGL_ICONDIAG: what a tiny glyph holds. `bgra` says the byte order; the summary is RGBA hex.
+// Pixels with alpha, the largest alpha, and the four commonest non-zero colours with their counts.
+static void px_stats(const uint8_t *p, uint32_t w, uint32_t h, size_t stride, BOOL bgra, char *out, size_t outn) {
+    uint32_t col[4] = { 0 }, cnt[4] = { 0 };
+    unsigned na = 0, maxa = 0;
+    for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x < w; x++) {
+            const uint8_t *q = p + (size_t)y * stride + (size_t)x * 4;
+            uint8_t r = bgra ? q[2] : q[0], g = q[1], b = bgra ? q[0] : q[2], a = q[3];
+            if (a) na++;
+            if (a > maxa) maxa = a;
+            uint32_t c = ((uint32_t)r << 24) | ((uint32_t)g << 16) | ((uint32_t)b << 8) | a;
+            if (!c) continue;
+            int k = 0;
+            while (k < 4 && cnt[k] && col[k] != c) k++;
+            if (k < 4) { col[k] = c; cnt[k]++; }
+        }
+    int n = snprintf(out, outn, "alpha>0 %u/%u, max alpha %u, top", na, w * h, maxa);
+    for (int k = 0; k < 4 && cnt[k] && n > 0 && (size_t)n < outn; k++) n += snprintf(out + n, outn - (size_t)n, " %08x x%u", col[k], cnt[k]);
+}
+
 // A04s: gl_nz = non-zero bytes in the GL-side readback (the CPU path only; -1 elsewhere), so an empty glyph shows whether
 // nothing was drawn (gl 0) or the drawing never reached the surface (gl > 0, surface 0).
 static void icon_diag(Attach *a, const char *path, long gl_nz) {
@@ -459,6 +480,12 @@ static void sync_att(EAGLContext *c, int i) {
             if (icondiag_on() && (size_t)w * h <= 300 * 300) {
                 gl_nz = 0;
                 for (size_t k = 0; k < (size_t)w * h * 4; k++) if (buf[k]) gl_nz++;
+                static int ngl;
+                if ((size_t)w * h <= 32 * 32 && ngl++ < 40) {
+                    char s[200];
+                    px_stats(buf, w, h, (size_t)w * 4, NO, s, sizeof s);
+                    fprintf(stderr, "GLYPH gl surface %u %ux%u: %s\n", IOSurfaceGetID(a->surf), w, h, s);
+                }
             }
             // GL rows are bottom-up; a "normal" surface is top-down. invertedRender means CA already drew it flipped.
             wr = rgba_to_surface(buf, w, h, a->surf, flip, NO);
@@ -702,6 +729,12 @@ static void eagl_install_hooks(void) {
             if (!strcmp(gl_names[i], "glCompileShader") && gl_tab[i] != (void *)gl_unimpl) {
                 o_CompileShader = gl_tab[i]; gl_tab[i] = (void *)h_CompileShader;     // A04s: the framebuffer-fetch diagnosis
             }
+        }
+        // A04s (2026-11-09): where our libraries sit, so a crash's pc can be placed (backboardd's SIGBUS at 0x101b99f5c).
+        for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+            const char *nm = _dyld_get_image_name(i);
+            if (nm && (strstr(nm, "/private/var/a04s/") || strstr(nm, "heroeagl") || strstr(nm, "OSMesa") || strstr(nm, "libdrm")))
+                fprintf(stderr, "IMAGE %p slide %lx %s\n", (const void *)_dyld_get_image_header(i), (unsigned long)_dyld_get_image_vmaddr_slide(i), nm);
         }
         g_debug = getenv("EAGL_SHIM_DEBUG") != NULL; g_debug_frames = g_debug && !strcmp(getenv("EAGL_SHIM_DEBUG"), "2");
         g_dirty_track = !getenv("BGL_SYNC_ALL");
@@ -975,8 +1008,17 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
             // no-fourcc 4-byte surfaces whose rows aren't 64-byte aligned (no direct path): they started as an empty texture,
             // CoreAnimation's vibrancy read them through framebuffer fetch as zeros, and the sync then wrote those zeros over
             // the glyph SpringBoard had drawn (BGL_ICONDIAG: "cpu-copy ... gl 0").
-            else if (bgra_like)
+            else if (bgra_like) {
+                static int nsrc;
+                if (icondiag_on() && (size_t)w * h <= 32 * 32 && nsrc++ < 40 && IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) == KERN_SUCCESS) {
+                    const uint8_t *sp = IOSurfaceGetBaseAddress(surface);
+                    char s[200] = "no mapping";
+                    if (sp) px_stats(sp, w, h, IOSurfaceGetBytesPerRow(surface), YES, s, sizeof s);
+                    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+                    fprintf(stderr, "GLYPH src surface %u %ux%u inverted %d: %s\n", IOSurfaceGetID(surface), w, h, inverted, s);
+                }
                 [self texImageIOSurface:surface target:GL_TEXTURE_2D internalFormat:GL_RGBA width:w height:h format:GL_BGRA_EXT type:GL_UNSIGNED_BYTE plane:0 invert:!inverted];   // same row order as the sync
+            }
         }
         if (glGetError() != GL_NO_ERROR) EAGL_DEBUG("attachImage: storage for %ux%u failed\n", w, h);
     }
