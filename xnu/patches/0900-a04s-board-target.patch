@@ -1139,10 +1139,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..96d6b56
+index 0000000..e7260cc
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
-@@ -0,0 +1,2416 @@
+@@ -0,0 +1,2422 @@
 +/*
 + * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
 + *
@@ -3557,6 +3557,12 @@ index 0000000..96d6b56
 +	    (unsigned long long)(sbuf / 1024), (unsigned long long)(swrap / 1024),
 +	    (unsigned long long)(sstate / 1024),
 +	    (unsigned long long)zone_pages_wired, inuse_pmap_pages_count, vm_page_wire_count_initial);
++	/* v63: the largest zones, once a minute (every 12th 5-second report). */
++	extern void a04s_zone_top(void);
++	static unsigned zone_report;
++	if (zone_report++ % 12u == 0) {
++		a04s_zone_top();
++	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_A04S */
 diff --git a/bsd/dev/a04s_input.c b/bsd/dev/a04s_input.c
@@ -9281,6 +9287,45 @@ index 76d70b9..9c3a4b9 100644
  #endif /* ARM64_BOARD_CONFIG_SWEET || ARM64_BOARD_CONFIG_A5XELTE */
  
  kern_return_t
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index 25438c9..d478b02 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -10910,3 +10910,34 @@ zone_alloc_replenish_test(__unused int64_t in, int64_t *out)
+ SYSCTL_TEST_REGISTER(zone_alloc_replenish_test, zone_alloc_replenish_test);
+ 
+ #endif /* DEBUG || DEVELOPMENT */
++
++/*
++ * A04s (v63; harmless on other boards, as zalloc.c doesn't see the board macro): the eight zones holding the most wired pages, for the heartbeat's leak hunt
++ * (bsd/dev/a04s_gpu.c). Reads only; no lock, the counts are a snapshot.
++ */
++void a04s_zone_top(void);
++void
++a04s_zone_top(void)
++{
++	zone_t top[8] = { NULL };
++	uint32_t wired[8] = { 0 };
++	zone_foreach(z) {
++		uint32_t w = os_atomic_load(&z->z_wired_cur, relaxed);
++		for (int k = 0; k < 8; k++) {
++			if (top[k] == NULL || w > wired[k]) {
++				for (int m = 7; m > k; m--) {
++					top[m] = top[m - 1];
++					wired[m] = wired[m - 1];
++				}
++				top[k] = z;
++				wired[k] = w;
++				break;
++			}
++		}
++	}
++	kprintf("ZONETOP");
++	for (int k = 0; k < 8 && top[k] != NULL; k++) {
++		kprintf(" %s%s %u", zone_heap_name(top[k]), top[k]->z_name ? top[k]->z_name : "?", wired[k]);
++	}
++	kprintf("\n");
++}
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 index c37636f..3b3e639 100644
 --- a/pexpert/arm/pe_fiq.c
