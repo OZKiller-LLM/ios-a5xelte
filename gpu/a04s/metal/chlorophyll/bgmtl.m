@@ -1863,6 +1863,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    st.max_anisotropy = (unsigned)[d maxAnisotropy];
    st.normalized_coordinates = [d normalizedCoordinates];
    st.lod_min = [d lodMinClamp]; st.lod_max = [d lodMaxClamp];
+   // A04s (M6 run 7): every sampler's settings, to compare with what the shader expects
+   BG_TRACE("sampler %p: address %u %u %u filter min %u mag %u mip %u compare %u aniso %u normalized %u lod %g..%g\n", self,
+            st.address[0], st.address[1], st.address[2], st.min_filter, st.mag_filter, st.mip_filter, st.compare_function,
+            st.max_anisotropy, st.normalized_coordinates, st.lod_min, st.lod_max);
    char why[256] = { 0 };
    bg_lock();
    _smp = rwa_sampler_create([device rwa], &st, why, sizeof(why));
@@ -1983,10 +1987,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 - (void)setVertexBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i
 { BG_TRACE("setVertexBuffer %p offset %lu index %lu\n", b, (unsigned long)o, (unsigned long)i); if (i < BG_MAX_BINDINGS) { _vbuf[i] = b; _voff[i] = o; if (i + 1 > _vhigh) _vhigh = (unsigned)i + 1; } }
 - (void)setFragmentBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i
-{ if (i < BG_MAX_BINDINGS) { _fbuf[i] = b; _foff[i] = o; if (i + 1 > _fhigh) _fhigh = (unsigned)i + 1; } }
+{ BG_TRACE("setFragmentBuffer %p offset %lu index %lu\n", b, (unsigned long)o, (unsigned long)i);   // A04s (M6 run 7)
+  if (i < BG_MAX_BINDINGS) { _fbuf[i] = b; _foff[i] = o; if (i + 1 > _fhigh) _fhigh = (unsigned)i + 1; } }
 // CoreAnimation binds a buffer once per pass and then only moves the offset between draws
 - (void)setVertexBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < BG_MAX_BINDINGS) _voff[i] = o; }
-- (void)setFragmentBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < BG_MAX_BINDINGS) _foff[i] = o; }
+- (void)setFragmentBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i
+{ BG_TRACE("setFragmentBufferOffset %lu index %lu\n", (unsigned long)o, (unsigned long)i); if (i < BG_MAX_BINDINGS) _foff[i] = o; }
 - (void)setVertexBuffers:(const id *)b offsets:(const NSUInteger *)o withRange:(NSRange)r
 { for (NSUInteger k = 0; k < r.length; k++) [self setVertexBuffer:b[k] offset:o[k] atIndex:r.location + k]; }
 - (void)setFragmentBuffers:(const id *)b offsets:(const NSUInteger *)o withRange:(NSRange)r
@@ -1999,6 +2005,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 }
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)l atIndex:(NSUInteger)i
 {
+   BG_TRACE("setFragmentBytes length %lu index %lu\n", (unsigned long)l, (unsigned long)i);   // A04s (M6 run 7)
    id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:l < 16 ? 16 : l options:0] autorelease];
    if (b) { [_scratch addObject:b]; [self setFragmentBuffer:b offset:0 atIndex:i]; }
 }
@@ -2050,6 +2057,24 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
             BG_LOG("  v%u: pos %g %g %g %g  a1 %g %g  a2 %g %g  col %g %g %g %g\n", v, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
                    (float)h[0], (float)h[1], (float)h[2], (float)h[3]);
          }
+      }
+      // A04s (M6 run 7): what each bound fragment buffer holds at the draw: 16 floats from its offset, and the 8 halves
+      // at byte 64 (where QuartzCore's downsample keeps its weights), as far as the buffer reaches
+      for (unsigned i = 0; i < _fhigh; i++) {
+         if (!_fbuf[i]) continue;
+         NSUInteger len = [(BGMTLBuffer *)_fbuf[i] length], off = _foff[i];
+         const uint8_t *p = (const uint8_t *)[(BGMTLBuffer *)_fbuf[i] contents] + off;
+         size_t avail = len > off ? len - off : 0;
+         char line[600]; size_t n = 0;
+         for (unsigned k = 0; k < 16 && 4 * (k + 1) <= avail; k++)
+            n += snprintf(line + n, sizeof(line) - n, "%g%s", ((const float *)p)[k], k % 4 == 3 ? " | " : " ");
+         if (avail >= 80) {
+            n += snprintf(line + n, sizeof(line) - n, "h64:");
+            for (unsigned k = 0; k < 8; k++) n += snprintf(line + n, sizeof(line) - n, " %g", (float)((const __fp16 *)(p + 64))[k]);
+         } else if (avail >= 2 && avail < 16) {
+            n += snprintf(line + n, sizeof(line) - n, "h0: %g", (float)((const __fp16 *)p)[0]);
+         }
+         BG_LOG("  fbuf[%u] len %lu off %lu: %s\n", i, (unsigned long)len, (unsigned long)off, line);
       }
       for (unsigned i = 0; i < _vhigh; i++) {
          if (!_vbuf[i]) continue;

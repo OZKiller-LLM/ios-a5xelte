@@ -27,3 +27,41 @@ fragment float4 tri_fs(TriOut in [[stage_in]])
 {
     return in.color;
 }
+
+// Galaxy A04s, Metal track M6a run 7: the shape of QuartzCore's four-tap downsample, in our own
+// words, to tell a sampling problem from one in CoreAnimation's inputs. The texture sits in slot 3
+// and its sampler in slot 0 (slots 0-2 left empty), the tap offsets and half-precision weights come
+// from a constant buffer at index 1 (the weights at byte 64 of 80) and a half scale from index 6,
+// and the result is a half4: all as downsample_4_frag_lph declares them.
+struct DsOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex DsOut ds_quad_vs(uint vid [[vertex_id]])
+{
+    const float2 corners[4] = { float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1) };
+    DsOut o;
+    o.position = float4(corners[vid], 0.0f, 1.0f);
+    o.uv = corners[vid] * float2(0.5f, -0.5f) + 0.5f;
+    return o;
+}
+
+struct DsTaps {
+    float2 offset[4];   // bytes 0-31
+    float4 unused[2];   // bytes 32-63
+    half4 weight;       // bytes 64-71
+    half4 unused2;      // bytes 72-79
+};
+
+fragment half4 ds_like_fs(DsOut in [[stage_in]],
+                          texture2d<half> src [[texture(3)]],
+                          sampler smp [[sampler(0)]],
+                          constant DsTaps &taps [[buffer(1)]],
+                          constant half &scale [[buffer(6)]])
+{
+    half4 acc = half4(0.0h);
+    for (int k = 0; k < 4; k++)
+        acc += src.sample(smp, in.uv + taps.offset[k], level(0)) * taps.weight[k];
+    return half4(acc.rgb * scale, acc.a);
+}

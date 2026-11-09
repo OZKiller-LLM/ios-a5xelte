@@ -45,7 +45,7 @@ $CC $CF -dynamiclib -o "$B/libA04sMetalDevice.dylib" "$HERE/A04sMTLDevice.m" \
 	$PRIV -install_name @rpath/libA04sMetalDevice.dylib -Wl,-rpath,@loader_path
 
 # the probe
-$CC $CF -o "$OUT/autorun" "$HERE/a04s_metal_m5.m" "$HERE/a04s_ca_scenes.m" 	-framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics
+$CC $CF -o "$OUT/autorun" "$HERE/a04s_metal_m5.m" "$HERE/a04s_ca_scenes.m" "$HERE/a04s_m6_sampling.m" 	-framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics
 
 for s in core m5; do
 	xcrun -sdk iphoneos metal -std=metal3.0 -mios-version-min=16.0 \

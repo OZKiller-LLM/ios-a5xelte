@@ -21,7 +21,8 @@
  * Every line goes to /private/var/a04s/metal-probe.log (flushed) and stderr (autorun.log). The
  * Metal device's own lines (bgmtl) go to stderr only. Exit 0 once both runs were tried.
  *
- * Environment (autorun.env): A04S_M5_ONLY=softpipe|gpu runs one of the two; A04S_METAL_TIMEOUT
+ * Environment (autorun.env): A04S_M6_SAMPLING=1 runs the M6a run 7 sampling tests
+ * (a04s_m6_sampling.m) before the CoreAnimation scenes; A04S_M5_ONLY=softpipe|gpu runs one of the two; A04S_METAL_TIMEOUT
  * (seconds, default 150) limits each child and four times that the whole probe.
  *
  * REMOVAL: with A04S_METAL_REMOVE=1 it only deletes what M4 and M5 installed --
@@ -385,6 +386,8 @@ test_quad(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLLibrary> core, const c
 }
 
 int a04s_ca_scenes(id<MTLDevice> d, const char *mode, const char *only);   /* a04s_ca_scenes.m (M6a) */
+int a04s_m6_sampling(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLLibrary> core, id<MTLLibrary> m5,
+		      const char *mode);   /* a04s_m6_sampling.m (M6a run 7) */
 
 static bool
 env_off(const char *name)
@@ -424,6 +427,13 @@ child(const char *mode)
 		u = test_quad(dev, q, core, mode);
 		a04s_log("M5 RESULT %s quad: %s", mode, u ? "PASS" : "FAIL");
 	}
+	/* M6a run 7: texture sampling, from a plain blit up to QuartzCore's downsample with chosen
+	 * inputs (A04S_M6_SAMPLING=1) */
+	int samp_bad = 0;
+	if (getenv("A04S_M6_SAMPLING") && getenv("A04S_M6_SAMPLING")[0] == '1') {
+		STEP("sampling");
+		samp_bad = a04s_m6_sampling(dev, q, core, m5, mode);
+	}
 	/* M6a: CoreAnimation's Metal renderer on this device, in this process. Not on softpipe by
 	 * default: CoreAnimation's layer contents are IOSurfaces, which only the GPU can import. */
 	int ca_bad = 0;
@@ -432,7 +442,7 @@ child(const char *mode)
 		ca_bad = a04s_ca_scenes(dev, mode, getenv("A04S_CA_SCENES"));
 	}
 	STEP("done");
-	return c && t && u && !ca_bad ? 0 : 1;
+	return c && t && u && !ca_bad && !samp_bad ? 0 : 1;
 }
 
 /* ---- the parent ----------------------------------------------------------------------------- */
