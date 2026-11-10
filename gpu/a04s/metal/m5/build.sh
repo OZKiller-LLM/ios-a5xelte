@@ -68,4 +68,4 @@ echo "== libA04sMetalDevice.dylib: rwa_ calls not in libhakiosair (must be none)
 comm -23 <(xcrun --sdk iphoneos nm -u "$B/libA04sMetalDevice.dylib" | grep '^_rwa_' | sort) \
 	<(xcrun --sdk iphoneos nm -gU "$B/libhakiosair.dylib" | awk '{print $3}' | grep '^_rwa_' | sort)
 ls -la "$OUT" "$OUT/metal" "$B"
-(cd "$OUT" && find . -type f ! -name SHA256SUMS -exec shasum -a 256 {} \; | sort -k2 > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS && cat SHA256SUMS)
+(cd "$OUT" && find . -type f ! -name 'SHA256SUMS*' -exec shasum -a 256 {} \; | sort -k2 > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS && cat SHA256SUMS)
