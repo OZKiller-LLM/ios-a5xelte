@@ -944,8 +944,7 @@ bg_air_slice(NSData *d)
    t->_linOff = offset;
    t->_linBpr = bpr;
    // A04s (M6a run 12): the whole descriptor once per texture, to find what tells Metal which way these rows run
-   BG_TRACE("linear texture %p from buffer %p offset %lu, rows of %lu bytes, image %lu: %s
-", t, self, (unsigned long)offset,
+   BG_TRACE("linear texture %p from buffer %p offset %lu, rows of %lu bytes, image %lu: %s\n", t, self, (unsigned long)offset,
             (unsigned long)bpr, (unsigned long)bpi, [[d description] UTF8String] ?: "-");
    return t;
 }
