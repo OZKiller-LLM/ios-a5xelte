@@ -24,7 +24,9 @@
  * Environment (autorun.env): A04S_M6_SAMPLING=1 runs the M6a run 7 sampling tests and run 8's
  * QuartzCore/m5 shader matrix, =2 the matrix alone, =3 run 9's fold/delta comparison alone,
  * (a04s_m6_sampling.m) before the CoreAnimation scenes; A04S_M5_ONLY=softpipe|gpu runs one of the two; A04S_METAL_TIMEOUT
- * (seconds, default 150) limits each child and four times that the whole probe.
+ * (seconds, default 150) limits each child and four times that the whole probe. A04S_CA_SCENES (a list
+ * such as 0,5) picks the CoreAnimation scenes; unset, all seven run. Scene 5 is also compared with its
+ * CPU reference blurred here, since -renderInContext: ignores layer filters (a04s_ca_scenes.m).
  *
  * REMOVAL: with A04S_METAL_REMOVE=1 it only deletes what M4 and M5 installed --
  * /System/Library/Extensions/A04sMetal.bundle, /private/var/a04s/metal/,

@@ -19,6 +19,9 @@
 #import <QuartzCore/QuartzCore.h>
 #import <CoreGraphics/CoreGraphics.h>
 
+#include <math.h>
+#include <stdlib.h>
+
 #include "a04s_metal_log.h"
 
 #define W 256
@@ -154,6 +157,87 @@ save(const char *mode, const char *what, int n, const uint8_t *px)
 	}
 }
 
+/*
+ * A04s (M6a run 10): -[CALayer renderInContext:] does not apply layer filters, so scene 5's CPU reference is
+ * the stripes unblurred and the plain comparison always DIFFERS. Run 9's output matched, offline, the reference
+ * blurred by a Gaussian of sigma 5.5 normalised at the image's edges (mean error 1.0, at most 2.4, no shift).
+ * This repeats that check on the phone: the reference blurred (separable, normalised where the kernel leaves
+ * the image) for sigma 3..9 in steps of 0.5, against the output's unpremultiplied colour wherever its alpha is
+ * at least 128. Returns the smallest mean difference per channel and its sigma; -1 if nothing could be compared.
+ */
+static double
+blur_check(const uint8_t *out, const uint8_t *ref, double *sigma_out, unsigned *pixels_out)
+{
+	float *t = malloc(sizeof(float) * W * H * 3), *a = malloc(sizeof(float) * W * H * 3);
+	double best = -1;
+	if (!t || !a) {
+		free(t);
+		free(a);
+		return -1;
+	}
+	for (int si = 0; si <= 12; si++) {
+		const double sig = 3 + 0.5 * si;
+		const int R = (int)ceil(3 * sig);
+		float k[64];
+		for (int i = -R; i <= R; i++)
+			k[i + R] = expf(-(float)(i * i) / (float)(2 * sig * sig));
+		for (int y = 0; y < H; y++)   /* rows: reference (opaque, so unpremultiplied) into t */
+			for (int x = 0; x < W; x++) {
+				float s0 = 0, s1 = 0, s2 = 0, n = 0;
+				for (int i = -R; i <= R; i++) {
+					const int xx = x + i;
+					if (xx < 0 || xx >= W)
+						continue;
+					const uint8_t *p = ref + 4 * (y * W + xx);
+					s0 += k[i + R] * p[0];
+					s1 += k[i + R] * p[1];
+					s2 += k[i + R] * p[2];
+					n += k[i + R];
+				}
+				float *o = t + 3 * (y * W + x);
+				o[0] = s0 / n;
+				o[1] = s1 / n;
+				o[2] = s2 / n;
+			}
+		for (int y = 0; y < H; y++)   /* columns: t into a */
+			for (int x = 0; x < W; x++) {
+				float s0 = 0, s1 = 0, s2 = 0, n = 0;
+				for (int i = -R; i <= R; i++) {
+					const int yy = y + i;
+					if (yy < 0 || yy >= H)
+						continue;
+					const float *p = t + 3 * (yy * W + x);
+					s0 += k[i + R] * p[0];
+					s1 += k[i + R] * p[1];
+					s2 += k[i + R] * p[2];
+					n += k[i + R];
+				}
+				float *o = a + 3 * (y * W + x);
+				o[0] = s0 / n;
+				o[1] = s1 / n;
+				o[2] = s2 / n;
+			}
+		double sum = 0;
+		unsigned px = 0;
+		for (int i = 0; i < W * H; i++) {
+			const unsigned al = out[4 * i + 3];
+			if (al < 128)
+				continue;
+			for (int c = 0; c < 3; c++)
+				sum += fabs(out[4 * i + c] * 255.0 / al - a[3 * i + c]);
+			px++;
+		}
+		if (px && (best < 0 || sum / (3.0 * px) < best)) {
+			best = sum / (3.0 * px);
+			*sigma_out = sig;
+			*pixels_out = px;
+		}
+	}
+	free(t);
+	free(a);
+	return best;
+}
+
 /* One frame of `r`, waited for; seconds taken. */
 static double
 frame(CARenderer *r, id<MTLCommandQueue> q)
@@ -230,6 +314,21 @@ a04s_ca_scenes(id<MTLDevice> d, const char *mode, const char *only)
 				 "more than 32, %u non-zero bytes", n, first, second, sum / (W * H * 4), far, W * H * 4, nonzero);
 			a04s_log("M6 RESULT %s ca scene %d: %s (diff %.2f)", mode, n,
 				 !nonzero ? "NOTHING DRAWN" : sum / (W * H * 4) < 8 ? "MATCH" : "DIFFERS", sum / (W * H * 4));
+			if (n == 5 && nonzero) {
+				double sig = 0;
+				unsigned px = 0;
+				const double bd = blur_check(out, ref, &sig, &px);
+				const uint8_t *o = out;
+				a04s_log("  ca scene 5: the CPU reference ignores layer filters; against it blurred: best sigma %.1f, "
+					 "mean diff %.2f on %u pixels; edge alpha left %u right %u top %u bottom %u, centre %u",
+					 sig, bd, px, o[4 * (H / 2 * W) + 3], o[4 * (H / 2 * W + W - 1) + 3], o[4 * (W / 2) + 3],
+					 o[4 * ((H - 1) * W + W / 2) + 3], o[4 * (H / 2 * W + W / 2) + 3]);
+				a04s_log("M6 RESULT %s ca scene 5 blurred reference: %s (diff %.2f, sigma %.1f)", mode,
+					 bd < 0 ? "NOT COMPARED" : bd < 4 ? "MATCH" : "DIFFERS", bd, sig);
+			}
+			if (n == 6 && nonzero)
+				a04s_log("  ca scene 6: the CPU reference draws no backdrop (blur and saturation under the panel); "
+					 "the panel is checked offline from the .bgra files");
 			save(mode, "scene", n, out);
 			save(mode, "ref", n, ref);
 			if (!nonzero)

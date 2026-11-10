@@ -263,6 +263,12 @@ a04s_cpu_now(void)
     * in a probe, and already right when a client such as backboardd gets this device later (M6). */
    setenv("CI_USE_MTL_DAG_FOR_CIKL_SRC", "0", 0);
    setenv("CA_USE_CGTEXTUREDATA", "0", 0);
+   /* A04s (M6a run 9): on Panfrost the cb-delta path (an unsized constant buffer at an offset that is
+    * not 16-aligned, read through a delta table in constant buffer 15) draws nothing, while the copying
+    * path draws right (r9-*-nodelta). The table pushes Panfrost's system-value buffer to a 17th slot,
+    * past PAN_MAX_CONST_BUFFERS (16); that is the likely cause, not yet proven. Off by default for every
+    * client of this device; RWA_CB_DELTA=1 turns it back on. libhakiosair reads it at each pipeline. */
+   setenv("RWA_CB_DELTA", "0", 0);
    a04s_log("A04sMTLDevice ready: %s, registryID %#llx, shader cache %s (%s)", rwa_device_name([self rwa]),
             (unsigned long long)_a04sRegistry, rwa_shader_cache_sync([self rwa]) ? "on" : "OFF",
             getenv("MESA_SHADER_CACHE_DIR") ? getenv("MESA_SHADER_CACHE_DIR") : "no MESA_SHADER_CACHE_DIR");
