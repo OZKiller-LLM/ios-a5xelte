@@ -1139,10 +1139,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..e7260cc
+index 0000000..b166bf7
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
-@@ -0,0 +1,2422 @@
+@@ -0,0 +1,3010 @@
 +/*
 + * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
 + *
@@ -1233,6 +1233,9 @@ index 0000000..e7260cc
 +#include <kern/clock.h>
 +#include <kern/thread.h>
 +#include <kern/locks.h>
++#include <kern/kalloc.h>
++#include <kern/sched_prim.h>
++#include <sys/errno.h>
 +#include <mach/mach_time.h>
 +#include <pexpert/pexpert.h>
 +#include <pexpert/arm64/board_config.h>
@@ -1601,6 +1604,7 @@ index 0000000..e7260cc
 +static LCK_GRP_DECLARE(a04s_gpu_grp, "a04s_gpu");
 +static LCK_MTX_DECLARE(a04s_gpu_mtx, &a04s_gpu_grp);
 +static uint32_t present_busy;
++static uint32_t sched_hw_busy;  /* v64: job slots the scheduler has on the GPU (bit per slot); with a04s_gpu_mtx */
 +
 +static inline uint32_t
 +io_rd(vm_offset_t base, uint32_t off)
@@ -2576,6 +2580,11 @@ index 0000000..e7260cc
 +		present_busy++;         /* a user job is running: this frame takes the CPU copy */
 +		return false;
 +	}
++	if (sched_hw_busy != 0) {
++		lck_mtx_unlock(&a04s_gpu_mtx);
++		present_busy++;         /* v64: the scheduler has user jobs on the slots */
++		return false;
++	}
 +	blit_setup(SLOT_VA((unsigned)s) + off, w, h, stride, blit.variant);
 +	struct frag_result r = { 0 };
 +	bool ok = frag_job(PANEL_VA, panel.w, panel.h, panel.stride, SH_CLEAR, gpu_affinity, &r,
@@ -2827,6 +2836,32 @@ index 0000000..e7260cc
 +	}
 +}
 +
++/*
++ * v64: page-table changes while the scheduler has jobs on the GPU. UPDATE re-reads the whole address
++ * space and is for an idle one; with jobs running, lock the user range and FLUSH_PT, which flushes the
++ * MMU's caches for that range and unlocks it. 0x40000000 | 29 is the naturally aligned 1 GiB user range
++ * (the size field is log2(bytes) - 1). With a04s_gpu_mtx held.
++ */
++#define AS_LOCKADDR_LO          0x10u
++#define AS_LOCKADDR_HI          0x14u
++#define AS_CMD_LOCK             2u
++#define AS_CMD_FLUSH_PT         4u
++static bool
++user_as_flush_locked(void)
++{
++	if (!gpu_wait(AS1 + AS_STATUS, 1u, 0, 100000)) {
++		return false;
++	}
++	gpu_wr(AS1 + AS_LOCKADDR_LO, (uint32_t)USER_VA_BASE | 29u);
++	gpu_wr(AS1 + AS_LOCKADDR_HI, 0);
++	gpu_wr(AS1 + AS_COMMAND, AS_CMD_LOCK);
++	if (!gpu_wait(AS1 + AS_STATUS, 1u, 0, 100000)) {
++		return false;
++	}
++	gpu_wr(AS1 + AS_COMMAND, AS_CMD_FLUSH_PT);
++	return gpu_wait(AS1 + AS_STATUS, 1u, 0, 100000);
++}
++
 +/* AS1 PTEs for n 4 KiB pages at va (pages NULL: unmap), every page checked first. With the lock. */
 +static bool
 +user_set_locked(uint64_t va, const uint64_t *pages, unsigned n)
@@ -2857,7 +2892,7 @@ index 0000000..e7260cc
 +		l3[(a >> 12) & 0x1ffu] = pages != NULL ? (pages[i] | 0x2c1) : 0;
 +	}
 +	__asm__ volatile ("dsb sy" ::: "memory");
-+	return user_as_update();
++	return sched_hw_busy != 0 ? user_as_flush_locked() : user_as_update();        /* v64 */
 +}
 +
 +/*
@@ -2953,6 +2988,533 @@ index 0000000..e7260cc
 +	return st ? st : 0xfffffffdu;
 +}
 +
++/*
++ * v64 (7c-7a): the GPU scheduler (port/7c-7-design.md). Every user job goes through one kernel thread
++ * that owns the two job slots: JS0 (fragment) and JS1 (vertex, tiler, compute) each have a software
++ * queue, in submit order, and a queue's first job starts once every fence it depends on is signalled.
++ * Both slots run at once, one chain each (JS_*_NEXT is not chained behind a running job yet). While
++ * jobs are on the GPU the thread polls JOB/MMU/GPU_IRQ_RAWSTAT about every 100 us, sleeping in between
++ * (assert_wait_timeout, not delay()) and holding no client lock; with nothing queued it sleeps until a
++ * submit wakes it. A job still running after 500 ms, or any MMU or GPU fault, ends every job on the GPU
++ * through user_recover_locked() and fails their fences (the fault can't be pinned on one slot); if the
++ * recovery fails, AS1 is out of service and everything queued fails. The thermal limit is checked as
++ * each job starts.
++ *
++ * Fences are refcounted and signalled once, with a status: 0 clean, else the slot's status,
++ * 0xffffffff timeout, 0xfffffffe the thermal limit, 0xfffffffd a fault with no slot status,
++ * 0xfffffffc refused (AS1 down, scheduler off, no memory). Jobs only ever depend on fences of jobs
++ * queued before them, so the oldest unfinished job can always start: no deadlock.
++ *
++ * The old synchronous Submit (selector 4) queues a job and waits for its fence. HeroGPU's syncobjs,
++ * BO references and the Panfrost-shaped selectors sit on top (iokit/Kernel/arm/HeroGPU.cpp). Lock
++ * order: a04s_gpu_mtx, then sched_mtx; retire callbacks run with neither. Boot-arg a04sgpu_sched=0
++ * puts back v63's path (one job at a time under the GPU lock).
++ */
++#define SCHED_POLL_US           100u
++#define SCHED_IDLE_POLL_US      1000u
++#define SCHED_TIMEOUT_US        500000u
++#define SCHED_LOG_MAX           40u
++#define FENCE_OK                0u
++#define FENCE_TIMEOUT           0xffffffffu
++#define FENCE_HOT               0xfffffffeu
++#define FENCE_FAULT             0xfffffffdu
++#define FENCE_REFUSED           0xfffffffcu
++#define A04S_NO_DEADLINE        (~0ull)
++
++struct a04s_fence {
++	uint32_t refs;
++	uint32_t done;                  /* set once, with sched_mtx, after status and us */
++	uint32_t status;
++	uint32_t pad;
++	uint64_t us;
++};
++
++struct a04s_job {
++	struct a04s_job *next;
++	struct a04s_fence *fence;       /* one reference */
++	struct a04s_fence **deps;       /* one reference each */
++	unsigned ndeps;
++	unsigned js;
++	uint64_t jc;
++	uint64_t start;
++	void (*retire)(void *ctx);
++	void *ctx;
++	int pid;
++};
++
++extern int proc_selfpid(void);
++static LCK_MTX_DECLARE(sched_mtx, &a04s_gpu_grp);
++static struct {
++	struct a04s_job *head, *tail;
++	uint32_t len;
++} sched_q[2];
++static struct a04s_job *sched_run[2];          /* with a04s_gpu_mtx and sched_mtx */
++static int sched_mode = -1;                     /* a04sgpu_sched: 1 on (the default), 0 v63's path */
++static uint32_t sched_thread_on;                /* 0 not yet, 1 running, 2 couldn't start */
++static uint32_t sched_wake, fence_wake;         /* wait events */
++static struct {
++	uint32_t queued, done, failed, timeouts, faults, recovers, hot, refused, waits, maxq, logged;
++	uint32_t max_us, last_status, last_fault, last_addr;
++	int last_pid;
++	uint64_t total_us;
++} sst;
++
++bool a04s_gpu_sched_on(void);
++bool
++a04s_gpu_sched_on(void)
++{
++	if (sched_mode < 0) {
++		int on = 1;
++		(void)PE_parse_boot_argn("a04sgpu_sched", &on, sizeof(on));
++		sched_mode = on != 0 ? 1 : 0;
++	}
++	return sched_mode == 1;
++}
++
++struct a04s_fence *a04s_fence_create(bool signaled);
++struct a04s_fence *
++a04s_fence_create(bool signaled)
++{
++	struct a04s_fence *f = kalloc_data(sizeof(struct a04s_fence), Z_WAITOK | Z_ZERO);
++	if (f != NULL) {
++		f->refs = 1;
++		f->done = signaled ? 1u : 0u;
++	}
++	return f;
++}
++
++void a04s_fence_retain(struct a04s_fence *f);
++void
++a04s_fence_retain(struct a04s_fence *f)
++{
++	if (f != NULL) {
++		__atomic_add_fetch(&f->refs, 1u, __ATOMIC_RELAXED);
++	}
++}
++
++void a04s_fence_release(struct a04s_fence *f);
++void
++a04s_fence_release(struct a04s_fence *f)
++{
++	if (f != NULL && __atomic_sub_fetch(&f->refs, 1u, __ATOMIC_ACQ_REL) == 0) {
++		kfree_data(f, sizeof(struct a04s_fence));
++	}
++}
++
++/* A relative timeout in ns as an absolute deadline: 0 or less is now, INT64_MAX is forever (A04S_NO_DEADLINE). */
++uint64_t a04s_gpu_deadline(int64_t ns);
++uint64_t
++a04s_gpu_deadline(int64_t ns)
++{
++	if (ns == 0x7fffffffffffffffLL) {
++		return A04S_NO_DEADLINE;
++	}
++	uint64_t abs = 0;
++	if (ns > 0) {
++		nanoseconds_to_absolutetime((uint64_t)ns, &abs);
++	}
++	uint64_t d = mach_absolute_time() + abs;
++	return d == A04S_NO_DEADLINE ? d - 1u : d;
++}
++
++/*
++ * Wait until all (or any) of n fences are signalled, or the absolute deadline (A04S_NO_DEADLINE: none).
++ * NULL entries count as not signalled. 0, ETIMEDOUT or EINTR (the thread was aborted). *first: the
++ * first signalled index. Interruptible, so a dying process gets out.
++ */
++int a04s_fence_wait(struct a04s_fence *const *f, unsigned n, bool all, uint64_t deadline, unsigned *first);
++int
++a04s_fence_wait(struct a04s_fence *const *f, unsigned n, bool all, uint64_t deadline, unsigned *first)
++{
++	int ret = 0;
++	lck_mtx_lock(&sched_mtx);
++	for (;;) {
++		unsigned done = 0, k1 = n;
++		for (unsigned i = 0; i < n; i++) {
++			if (f[i] != NULL && __atomic_load_n(&f[i]->done, __ATOMIC_ACQUIRE) != 0) {
++				done++;
++				if (k1 == n) {
++					k1 = i;
++				}
++			}
++		}
++		if (n == 0 || (all ? done == n : done != 0)) {
++			if (first != NULL) {
++				*first = k1 == n ? 0 : k1;
++			}
++			break;
++		}
++		if (deadline != A04S_NO_DEADLINE && mach_absolute_time() >= deadline) {
++			ret = ETIMEDOUT;
++			break;
++		}
++		sst.waits++;
++		wait_result_t wr = deadline == A04S_NO_DEADLINE ?
++		    lck_mtx_sleep(&sched_mtx, LCK_SLEEP_DEFAULT, (event_t)&fence_wake, THREAD_ABORTSAFE) :
++		    lck_mtx_sleep_deadline(&sched_mtx, LCK_SLEEP_DEFAULT, (event_t)&fence_wake, THREAD_ABORTSAFE, deadline);
++		if (wr == THREAD_INTERRUPTED) {
++			ret = EINTR;
++			break;
++		}
++	}
++	lck_mtx_unlock(&sched_mtx);
++	return ret;
++}
++
++/* With sched_mtx held. */
++static void
++fence_signal_locked(struct a04s_fence *f, uint32_t status, uint64_t us)
++{
++	f->status = status;
++	f->us = us;
++	__atomic_store_n(&f->done, 1u, __ATOMIC_RELEASE);
++	thread_wakeup((event_t)&fence_wake);
++}
++
++/* A job has ended (or was refused): signal its fence, put it on the retire list. With sched_mtx. */
++static void
++sched_end_locked(struct a04s_job *j, uint32_t status, uint64_t us, struct a04s_job **retire)
++{
++	fence_signal_locked(j->fence, status, us);
++	if (status == FENCE_OK) {
++		sst.done++;
++		sst.total_us += us;
++		if (us > sst.max_us) {
++			sst.max_us = (uint32_t)us;
++		}
++	} else {
++		sst.failed++;
++		sst.last_status = status;
++		sst.last_pid = j->pid;
++	}
++	j->next = *retire;
++	*retire = j;
++}
++
++/* Fail every queued job (AS1 is out of service). With sched_mtx. */
++static void
++sched_fail_queued_locked(struct a04s_job **retire)
++{
++	for (unsigned js = 0; js < 2u; js++) {
++		while (sched_q[js].head != NULL) {
++			struct a04s_job *j = sched_q[js].head;
++			sched_q[js].head = j->next;
++			sched_q[js].len--;
++			sst.refused++;
++			sched_end_locked(j, FENCE_REFUSED, 0, retire);
++		}
++		sched_q[js].tail = NULL;
++	}
++}
++
++/* Retire callbacks and frees, with no lock held. */
++static void
++sched_retire(struct a04s_job *list)
++{
++	while (list != NULL) {
++		struct a04s_job *j = list;
++		list = j->next;
++		if (j->retire != NULL) {
++			j->retire(j->ctx);
++		}
++		for (unsigned i = 0; i < j->ndeps; i++) {
++			a04s_fence_release(j->deps[i]);
++		}
++		if (j->deps != NULL) {
++			kfree_type(struct a04s_fence *, j->ndeps, j->deps);
++		}
++		a04s_fence_release(j->fence);
++		kfree_type(struct a04s_job, j);
++	}
++}
++
++/*
++ * A fault, or a job past its time: hard-stop every slot in use, recover AS1 (user_recover_locked(), per
++ * slot) and fail those jobs. With a04s_gpu_mtx and sched_mtx.
++ */
++static void
++sched_recover_locked(bool fault, uint32_t mirq, struct a04s_job **retire)
++{
++	uint32_t asf = (mirq & AS1_FAULT_BITS) ? io_rd(gpu_va, AS1 + AS_FAULTSTATUS) : 0;
++	uint32_t asa = (mirq & AS1_FAULT_BITS) ? io_rd(gpu_va, AS1 + AS_FAULTADDR_LO) : 0;
++	uint32_t st[2] = { 0, 0 };
++	for (unsigned js = 0; js < 2u; js++) {
++		if (sched_run[js] != NULL) {
++			st[js] = io_rd(gpu_va, JS(js) + JS_STATUS);
++			gpu_wr(JS(js) + JS_COMMAND, JS_HARD_STOP);
++		}
++	}
++	for (unsigned js = 0; js < 2u; js++) {
++		struct a04s_job *j = sched_run[js];
++		if (j == NULL) {
++			continue;
++		}
++		uint64_t us = us_since(j->start);
++		bool late = us > SCHED_TIMEOUT_US;
++		(void)user_recover_locked(JS(js));
++		sched_run[js] = NULL;
++		sched_hw_busy &= ~(1u << js);
++		uj.jobs++;
++		sst.recovers++;
++		if (fault) {
++			uj.faults++;
++			sst.faults++;
++		} else if (late) {
++			sst.timeouts++;
++		}
++		uint32_t status = !fault && late ? FENCE_TIMEOUT :
++		    (st[js] != 0 && (st[js] & 0xffu) != JS_ACTIVE) ? st[js] : FENCE_FAULT;
++		sst.last_fault = asf;
++		sst.last_addr = asa;
++		if (sst.logged < SCHED_LOG_MAX) {
++			sst.logged++;
++			kprintf("A04S GPU SCHED %s: JS%u pid %d jc %llx status %x fault %x@%x after %llu us\n",
++			    fault ? "FAULT" : late ? "TIMEOUT" : "STOPPED", js, j->pid, j->jc, st[js], asf, asa, us);
++		}
++		sched_end_locked(j, status, us, retire);
++	}
++	gpu_wr(JOB_IRQ_CLEAR, 0xffffffffu);
++	gpu_wr(MMU_IRQ_CLEAR, 0xffffffffu);
++	gpu_wr(GPU_IRQ_CLEAR, 0xffffffffu);
++	if (uj.broken || !user_ready) {
++		sched_fail_queued_locked(retire);
++	}
++}
++
++/* The slots' state: finished jobs end, a fault or a late job means recovery. With both locks. */
++static void
++sched_poll_locked(struct a04s_job **retire)
++{
++	if (sched_hw_busy == 0) {
++		return;
++	}
++	uint32_t jirq = io_rd(gpu_va, JOB_IRQ_RAWSTAT);
++	uint32_t mirq = io_rd(gpu_va, MMU_IRQ_RAWSTAT);
++	uint32_t girq = io_rd(gpu_va, GPU_IRQ_RAWSTAT);
++	bool fault = mirq != 0 || (girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT)) != 0;
++	bool stuck = false;
++	if (!fault) {
++		for (unsigned js = 0; js < 2u; js++) {
++			struct a04s_job *j = sched_run[js];
++			if (j == NULL) {
++				continue;
++			}
++			uint32_t done = 1u << js, failed = 1u << (16u + js);
++			uint64_t us = us_since(j->start);
++			if (jirq & (done | failed)) {
++				uint32_t st = 0;
++				if (jirq & failed) {
++					st = io_rd(gpu_va, JS(js) + JS_STATUS);
++					if (st == 0) {
++						st = FENCE_FAULT;
++					}
++				}
++				gpu_wr(JOB_IRQ_CLEAR, done | failed);
++				if ((io_rd(gpu_va, JS(js) + JS_STATUS) & 0xffu) == JS_ACTIVE) {
++					stuck = true;          /* failed but still active: recover below */
++					continue;
++				}
++				sched_run[js] = NULL;
++				sched_hw_busy &= ~(1u << js);
++				uj.jobs++;
++				sched_end_locked(j, st, us, retire);
++			} else if (us > SCHED_TIMEOUT_US) {
++				stuck = true;
++			}
++		}
++	}
++	if (fault || stuck) {
++		sched_recover_locked(fault, mirq, retire);
++	}
++}
++
++/* Start each idle slot's first queued job whose fences are all signalled. With both locks. */
++static void
++sched_start_locked(struct a04s_job **retire)
++{
++	for (unsigned js = 0; js < 2u; js++) {
++		while (sched_run[js] == NULL && sched_q[js].head != NULL) {
++			struct a04s_job *j = sched_q[js].head;
++			bool ready = true;
++			for (unsigned i = 0; i < j->ndeps && ready; i++) {
++				ready = j->deps[i] == NULL || __atomic_load_n(&j->deps[i]->done, __ATOMIC_ACQUIRE) != 0;
++			}
++			if (!ready) {
++				break;
++			}
++			sched_q[js].head = j->next;
++			if (sched_q[js].head == NULL) {
++				sched_q[js].tail = NULL;
++			}
++			sched_q[js].len--;
++			j->next = NULL;
++			if (!user_ready || uj.broken) {
++				sst.refused++;
++				sched_end_locked(j, FENCE_REFUSED, 0, retire);
++				continue;
++			}
++			if (!a04s_gpu_allowed()) {
++				user_hot++;
++				sst.hot++;
++				sched_end_locked(j, FENCE_HOT, 0, retire);
++				continue;
++			}
++			uint32_t slot = JS(js);
++			gpu_wr(JOB_IRQ_CLEAR, (1u << js) | (1u << (16u + js)));
++			if (sched_hw_busy == 0) {
++				gpu_wr(MMU_IRQ_CLEAR, 0xffffffffu);
++				gpu_wr(GPU_IRQ_CLEAR, 0xffffffffu);
++			}
++			gpu_wr(slot + JS_HEAD_NEXT_LO, (uint32_t)j->jc);
++			gpu_wr(slot + JS_HEAD_NEXT_HI, (uint32_t)(j->jc >> 32));
++			gpu_wr(slot + JS_AFFINITY_NEXT_LO, user_affinity);
++			gpu_wr(slot + JS_AFFINITY_NEXT_HI, 0);
++			/* As user_run_locked(): thread priority 8, clean and invalidate the caches at start and end, AS1. */
++			gpu_wr(slot + JS_CONFIG_NEXT, (8u << 16) | (3u << 8) | (3u << 12) | 1u);
++			j->start = mach_absolute_time();
++			gpu_wr(slot + JS_COMMAND_NEXT, 1);                    /* START */
++			sched_run[js] = j;
++			sched_hw_busy |= 1u << js;
++		}
++	}
++}
++
++static void
++sched_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		struct a04s_job *retire = NULL;
++		lck_mtx_lock(&a04s_gpu_mtx);
++		lck_mtx_lock(&sched_mtx);
++		sched_poll_locked(&retire);
++		sched_start_locked(&retire);
++		if (retire == NULL) {
++			if (sched_hw_busy != 0) {
++				assert_wait_timeout((event_t)&sched_wake, THREAD_UNINT, SCHED_POLL_US, NSEC_PER_USEC);
++			} else if (sched_q[0].head != NULL || sched_q[1].head != NULL) {
++				assert_wait_timeout((event_t)&sched_wake, THREAD_UNINT, SCHED_IDLE_POLL_US, NSEC_PER_USEC);
++			} else {
++				assert_wait((event_t)&sched_wake, THREAD_UNINT);
++			}
++		}
++		lck_mtx_unlock(&sched_mtx);
++		lck_mtx_unlock(&a04s_gpu_mtx);
++		if (retire != NULL) {
++			sched_retire(retire);           /* then look again at once: dependents may be ready */
++			continue;
++		}
++		(void)thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++static bool
++sched_thread_up(void)
++{
++	if (__atomic_load_n(&sched_thread_on, __ATOMIC_ACQUIRE) == 1u) {
++		return true;
++	}
++	lck_mtx_lock(&sched_mtx);
++	if (sched_thread_on == 0) {
++		thread_t t;
++		if (kernel_thread_start(sched_thread, NULL, &t) == KERN_SUCCESS) {
++			thread_deallocate(t);
++			__atomic_store_n(&sched_thread_on, 1u, __ATOMIC_RELEASE);
++			kprintf("A04S GPU SCHED: thread started\n");
++		} else {
++			sched_thread_on = 2;
++			kprintf("A04S GPU SCHED: NO THREAD\n");
++		}
++	}
++	bool on = sched_thread_on == 1u;
++	lck_mtx_unlock(&sched_mtx);
++	return on;
++}
++
++/*
++ * Queue the chain at user GPU VA jc on slot js (0 fragment, 1 the rest), to start once every non-NULL
++ * fence in deps is signalled. retire(ctx) runs when the job has ended (no lock held), or before this
++ * returns if the job is refused. Returns the job's fence, one reference for the caller, already
++ * signalled with 0xfffffffc if refused; NULL only if even that couldn't be allocated.
++ */
++struct a04s_fence *a04s_gpu_queue(unsigned js, uint64_t jc, struct a04s_fence *const *deps, unsigned ndeps,
++    void (*retire)(void *ctx), void *ctx);
++struct a04s_fence *
++a04s_gpu_queue(unsigned js, uint64_t jc, struct a04s_fence *const *deps, unsigned ndeps,
++    void (*retire)(void *ctx), void *ctx)
++{
++	unsigned nd = 0;
++	for (unsigned i = 0; i < ndeps; i++) {
++		if (deps[i] != NULL && __atomic_load_n(&deps[i]->done, __ATOMIC_ACQUIRE) == 0) {
++			nd++;
++		}
++	}
++	struct a04s_fence *f = a04s_fence_create(false);
++	struct a04s_job *j = kalloc_type(struct a04s_job, Z_WAITOK | Z_ZERO);
++	struct a04s_fence **dv = nd != 0 ? kalloc_type(struct a04s_fence *, nd, Z_WAITOK | Z_ZERO) : NULL;
++	bool ok = f != NULL && j != NULL && (nd == 0 || dv != NULL) && js <= 1u && jc >= USER_VA_BASE &&
++	    jc < USER_VA_END && a04s_gpu_sched_on() && sched_thread_up();
++	if (!ok) {
++		if (dv != NULL) {
++			kfree_type(struct a04s_fence *, nd, dv);
++		}
++		if (j != NULL) {
++			kfree_type(struct a04s_job, j);
++		}
++		if (retire != NULL) {
++			retire(ctx);
++		}
++		lck_mtx_lock(&sched_mtx);
++		sst.refused++;
++		if (f != NULL) {
++			fence_signal_locked(f, FENCE_REFUSED, 0);
++		}
++		lck_mtx_unlock(&sched_mtx);
++		return f;
++	}
++	unsigned k = 0;
++	for (unsigned i = 0; i < ndeps && k < nd; i++) {
++		if (deps[i] != NULL && __atomic_load_n(&deps[i]->done, __ATOMIC_ACQUIRE) == 0) {
++			a04s_fence_retain(deps[i]);
++			dv[k++] = deps[i];
++		}
++	}
++	/* A dep signalled between the two passes leaves NULL entries at the end: they count as signalled. */
++	j->deps = dv;
++	j->ndeps = nd;
++	a04s_fence_retain(f);                  /* the job's; the caller keeps the other */
++	j->fence = f;
++	j->js = js;
++	j->jc = jc;
++	j->retire = retire;
++	j->ctx = ctx;
++	j->pid = proc_selfpid();
++	lck_mtx_lock(&sched_mtx);
++	if (sched_q[js].tail != NULL) {
++		sched_q[js].tail->next = j;
++	} else {
++		sched_q[js].head = j;
++	}
++	sched_q[js].tail = j;
++	sched_q[js].len++;
++	sst.queued++;
++	if (sched_q[js].len > sst.maxq) {
++		sst.maxq = sched_q[js].len;
++	}
++	thread_wakeup((event_t)&sched_wake);
++	lck_mtx_unlock(&sched_mtx);
++	return f;
++}
++
++/* Nothing queued or on the slots (for the cores-off check at the last close). With a04s_gpu_mtx. */
++static bool
++sched_idle_locked(void)
++{
++	lck_mtx_lock(&sched_mtx);
++	bool idle = sched_hw_busy == 0 && sched_q[0].head == NULL && sched_q[1].head == NULL;
++	lck_mtx_unlock(&sched_mtx);
++	return idle;
++}
++
 +/* For 7c-5b's user client: bring AS1 up (the boot tests must have passed). */
 +bool a04s_gpu_user_up(void);
 +bool
@@ -2996,7 +3558,7 @@ index 0000000..e7260cc
 +		user_clients--;
 +	}
 +	if (user_clients == 0 && user_chunks == 0 && user_ready && !uj.broken &&
-+	    !__atomic_load_n(&present_ready, __ATOMIC_ACQUIRE)) {
++	    !__atomic_load_n(&present_ready, __ATOMIC_ACQUIRE) && sched_idle_locked()) {
 +		gpu_cores_off();
 +		user_ready = false;
 +	}
@@ -3065,6 +3627,22 @@ index 0000000..e7260cc
 +		lck_mtx_unlock(&a04s_gpu_mtx);
 +		return 0xfffffffeu;
 +	}
++	if (a04s_gpu_sched_on()) {
++		/* v64: through the scheduler, waiting for the job's fence (no lock held meanwhile). */
++		struct a04s_fence *f = a04s_gpu_queue(js, jc, NULL, 0, NULL, NULL);
++		if (f == NULL) {
++			return 0xffffffffu;
++		}
++		uint32_t status = 0xffffffffu;
++		if (a04s_fence_wait(&f, 1, true, A04S_NO_DEADLINE, NULL) == 0) {
++			status = f->status;
++			if (us != NULL) {
++				*us = f->us;
++			}
++		}
++		a04s_fence_release(f);
++		return status;
++	}
 +	uint32_t fault = 0, faddr = 0, st = 0xffffffffu;
 +	uint64_t t = 0;
 +	lck_mtx_lock(&a04s_gpu_mtx);
@@ -3110,7 +3688,10 @@ index 0000000..e7260cc
 +		pages[i] = UTEST_PA + i * 0x1000ull;
 +	}
 +	lck_mtx_lock(&a04s_gpu_mtx);
-+	if (!user_up_locked()) {
++	if (sched_hw_busy != 0) {
++		uj.why = "SCHED BUSY";           /* v64: user_run_locked() would share the slots with the scheduler */
++	}
++	if (sched_hw_busy != 0 || !user_up_locked()) {
 +		lck_mtx_unlock(&a04s_gpu_mtx);
 +		uj.state = "FAIL";
 +		kprintf("A04S GPU USER FAIL %s\n", uj.why);
@@ -3526,6 +4107,13 @@ index 0000000..e7260cc
 +	    uj.recover_fails, uj.wv2_status, uj.as0_ok ? "OK" : "-", uj.as0.js_status, uj.as0.mirq, uj.jobs, uj.faults,
 +	    present_busy, __atomic_load_n(&user_clients, __ATOMIC_RELAXED), __atomic_load_n(&user_opens, __ATOMIC_RELAXED),
 +	    __atomic_load_n(&user_chunks, __ATOMIC_RELAXED), __atomic_load_n(&user_hot, __ATOMIC_RELAXED));
++	/* v64: the scheduler (a snapshot, no lock). */
++	kprintf("GPUSCHED %s THREAD %u Q %u/%u RUN %x QUEUED %u DONE %u FAIL %u TMO %u FAULT %u REC %u HOT %u REF %u "
++	    "MAXQ %u US AVG %u MAX %u WAITS %u LAST %x PID %d ASF %x@%x\n", sched_mode == 0 ? "OFF" : "ON",
++	    sched_thread_on, sched_q[0].len, sched_q[1].len, sched_hw_busy, sst.queued, sst.done, sst.failed,
++	    sst.timeouts, sst.faults, sst.recovers, sst.hot, sst.refused, sst.maxq,
++	    sst.done ? (uint32_t)(sst.total_us / sst.done) : 0, sst.max_us, sst.waits, sst.last_status, sst.last_pid,
++	    sst.last_fault, sst.last_addr);
 +	for (unsigned i = 0; i < 2u; i++) {
 +		uint32_t n = __atomic_load_n(&gpu_notes[i].len, __ATOMIC_ACQUIRE);
 +		if (n != 0) {
@@ -7811,10 +8399,18 @@ index 0000000..e3b8eb3
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 diff --git a/iokit/Kernel/arm/HeroGPU.cpp b/iokit/Kernel/arm/HeroGPU.cpp
-index 3ba3cb8..9afb1a3 100644
+index 3ba3cb8..08ef1dc 100644
 --- a/iokit/Kernel/arm/HeroGPU.cpp
 +++ b/iokit/Kernel/arm/HeroGPU.cpp
-@@ -28,7 +28,7 @@
+@@ -16,6 +16,7 @@
+  *   6 SurfaceBO   [IOSurface id]    -> [handle, gpu_va, size, bytes per row, width,
+  *                                       height, pixel format, offset, planes]
+  *   7 SyncBO      [handle]          clean+invalidate an imported surface's CPU caches
++ *   8-15 (A04s, v64): the Panfrost-shaped asynchronous selectors, below
+  *
+  * Buffers are wired kernel buffers mapped noncached on the GPU side; the
+  * Mali is not IO-coherent, so the CPU sees them write-combined only (their
+@@ -28,7 +29,7 @@
   */
  #include <pexpert/arm64/board_config.h>
  
@@ -7823,7 +8419,7 @@ index 3ba3cb8..9afb1a3 100644
  #include <IOKit/IOService.h>
  #include <IOKit/IOUserClient.h>
  #include <IOKit/IOKitKeys.h>
-@@ -39,6 +39,40 @@
+@@ -39,6 +40,51 @@
  #include <sys/proc.h>
  #include "SweetSurface.h"
  
@@ -7838,6 +8434,8 @@ index 3ba3cb8..9afb1a3 100644
 + * gone, powers the cores off (unless sweetfb_gpu=1 uses them). No IOAcceleratorES on this phone
 + * yet (heroaccel=1 adds it), so QuartzCore and Metal see nothing new.
 + */
++#include <sys/errno.h>
++struct a04s_fence;
 +extern "C" {
 +bool a04s_gpu_user_open(void);
 +void a04s_gpu_user_close(void);
@@ -7846,6 +8444,15 @@ index 3ba3cb8..9afb1a3 100644
 +bool a04s_gpu_user_map(uint64_t va, const uint64_t *pages, unsigned n);
 +void a04s_gpu_user_unmap(uint64_t va, unsigned n);
 +uint32_t a04s_gpu_user_submit(unsigned js, uint64_t jc, uint64_t *us);
++/* v64 (7c-7a): the scheduler and its fences (bsd/dev/a04s_gpu.c). */
++bool a04s_gpu_sched_on(void);
++struct a04s_fence *a04s_fence_create(bool signaled);
++void a04s_fence_retain(struct a04s_fence *f);
++void a04s_fence_release(struct a04s_fence *f);
++uint64_t a04s_gpu_deadline(int64_t ns);
++int a04s_fence_wait(struct a04s_fence *const *f, unsigned n, bool all, uint64_t deadline, unsigned *first);
++struct a04s_fence *a04s_gpu_queue(unsigned js, uint64_t jc, struct a04s_fence *const *deps, unsigned ndeps,
++    void (*retire)(void *ctx), void *ctx);
 +}
 +#define herolte_gpu_up          a04s_gpu_user_open
 +#define herolte_gpu_down        a04s_gpu_user_close
@@ -7864,7 +8471,7 @@ index 3ba3cb8..9afb1a3 100644
  extern "C" {
  bool herolte_gpu_up(void);
  uint32_t herolte_gpu_reg(uint32_t off);
-@@ -47,6 +81,16 @@ bool herolte_gpu_map(uint64_t va, const uint64_t *pages, unsigned n);
+@@ -47,6 +93,16 @@ bool herolte_gpu_map(uint64_t va, const uint64_t *pages, unsigned n);
  void herolte_gpu_unmap(uint64_t va, unsigned n);
  uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
  }
@@ -7881,7 +8488,23 @@ index 3ba3cb8..9afb1a3 100644
  
  enum {
  	kHeroGPUGetParam = 0,
-@@ -107,10 +151,17 @@ herogpu_param(uint64_t param)
+@@ -57,6 +113,15 @@ enum {
+ 	kHeroGPULog      = 5,
+ 	kHeroGPUSurfaceBO = 6,
+ 	kHeroGPUSyncBO   = 7,
++	/* v64 (A04s, 7c-7a) */
++	kHeroGPUPanSubmit      = 8,
++	kHeroGPUPanWaitBO      = 9,
++	kHeroGPUPanMadvise     = 10,
++	kHeroGPUSyncobjCreate  = 11,
++	kHeroGPUSyncobjDestroy = 12,
++	kHeroGPUSyncobjWait    = 13,
++	kHeroGPUSyncobjReset   = 14,
++	kHeroGPUSyncobjSignal  = 15,
+ };
+ 
+ #define HEROGPU_MAX_BOS         4096
+@@ -107,21 +172,31 @@ herogpu_param(uint64_t param)
  		return id & 0xffff;
  	case 38:        /* NR_CORE_GROUPS: one L2 */
  		return 1;
@@ -7899,7 +8522,21 @@ index 3ba3cb8..9afb1a3 100644
  	}
  	uint32_t reg = herogpu_param_reg(param);
  	return reg == ~0u ? 0 : herolte_gpu_reg(reg);
-@@ -198,6 +249,37 @@ herogpu_bo_import_surface(struct herogpu_bo *bo, uint32_t id)
+ }
+ 
++struct a04s_fence;
+ struct herogpu_bo {
+ 	IOBufferMemoryDescriptor *mem;          /* own buffer, or NULL for an imported surface */
+ 	SweetSurface             *surface;      /* imported IOSurface (retained), or NULL */
+ 	IOMemoryMap              *umap;
+ 	uint64_t                  va;
+ 	uint32_t                  pages;
++	uint32_t                  refs;         /* v64: the handle, plus one per queued job that lists it */
++	struct a04s_fence        *last;         /* v64 (A04s): the last job that listed it; with the client lock */
+ };
+ 
+ static bool
+@@ -198,6 +273,37 @@ herogpu_bo_import_surface(struct herogpu_bo *bo, uint32_t id)
  	return true;
  }
  
@@ -7937,7 +8574,7 @@ index 3ba3cb8..9afb1a3 100644
  /* Allocate, zero, clean and GPU-map a buffer. */
  static bool
  herogpu_bo_create(struct herogpu_bo *bo, uint64_t size)
-@@ -237,6 +319,9 @@ herogpu_bo_create(struct herogpu_bo *bo, uint64_t size)
+@@ -237,6 +343,9 @@ herogpu_bo_create(struct herogpu_bo *bo, uint64_t size)
  		OSSafeReleaseNULL(bo->mem);
  		bo->va = 0;
  	}
@@ -7947,7 +8584,7 @@ index 3ba3cb8..9afb1a3 100644
  	return ok;
  }
  
-@@ -247,6 +332,9 @@ herogpu_bo_free(struct herogpu_bo *bo)
+@@ -247,12 +356,209 @@ herogpu_bo_free(struct herogpu_bo *bo)
  		return;
  	}
  	herolte_gpu_unmap(bo->va, bo->pages);
@@ -7957,15 +8594,250 @@ index 3ba3cb8..9afb1a3 100644
  	OSSafeReleaseNULL(bo->umap);
  	OSSafeReleaseNULL(bo->mem);
  	OSSafeReleaseNULL(bo->surface);
-@@ -280,6 +368,7 @@ class HeroGPUUserClient : public IOUserClient {
++#if defined(ARM64_BOARD_CONFIG_A04S)
++	a04s_fence_release(bo->last);          /* v64 */
++#endif
+ 	bzero(bo, sizeof(*bo));
+ }
+ 
++/*
++ * v64: BOs live on the heap with a count: the client's handle holds one, and each queued job that
++ * lists the BO holds one until it ends, so a BO a job still uses stays GPU-mapped after FreeBO or the
++ * client's exit. The last reference unmaps and frees it (from the scheduler thread, no lock held).
++ */
++static struct herogpu_bo *
++herogpu_bo_new(void)
++{
++	struct herogpu_bo *bo = IOMallocType(struct herogpu_bo);
++	if (bo != NULL) {
++		bzero(bo, sizeof(*bo));
++		bo->refs = 1;
++	}
++	return bo;
++}
++
++static void
++herogpu_bo_put(struct herogpu_bo *bo)
++{
++	if (bo != NULL && __atomic_sub_fetch(&bo->refs, 1u, __ATOMIC_ACQ_REL) == 0) {
++		herogpu_bo_free(bo);
++		IOFreeType(bo, struct herogpu_bo);
++	}
++}
++
++#if defined(ARM64_BOARD_CONFIG_A04S)
++/*
++ * v64 (7c-7a): the Panfrost-shaped selectors on top of a04s_gpu.c's scheduler (port/7c-7-design.md).
++ * Structure inputs are the Linux structs of Mesa 25.0.7's panfrost_drm.h and drm.h with their arrays
++ * inline after the header, in this order; no pointer field is followed, and the size must be exact.
++ * Over 4096 bytes IOKit passes the input as a descriptor, which is read the same way. Outputs are
++ * scalars. Timeouts are RELATIVE nanoseconds (INT64_MAX forever, 0 a single look).
++ *
++ *    8 PanSubmit      drm_panfrost_submit + u32 bo_handles[] + u32 in_syncs[]   queues, returns at once
++ *    9 PanWaitBO      drm_panfrost_wait_bo                      kIOReturnTimeout if not idle in time
++ *   10 PanMadvise     drm_panfrost_madvise                      -> [retained = 1]
++ *   11 SyncobjCreate  drm_syncobj_create (flags: SIGNALED)      -> [handle]
++ *   12 SyncobjDestroy drm_syncobj_destroy
++ *   13 SyncobjWait    drm_syncobj_wait + u32 handles[]          -> [first_signaled]
++ *   14 SyncobjReset   drm_syncobj_array + u32 handles[]
++ *   15 SyncobjSignal  drm_syncobj_array + u32 handles[]
++ *
++ * A submit holds every BO it lists until the job ends, and also waits for the previous job that listed
++ * any of them (Linux panfrost's implicit sync, every BO a writer); WAIT_BO waits for that last job.
++ * PANFROST_JD_REQ_FS picks JS0, else JS1. A syncobj with no fence: as an in_sync it is ignored; a wait
++ * on it fails unless WAIT_FOR_SUBMIT (or WAIT_AVAILABLE), which waits for a submit to give it one.
++ * At most 1024 BOs and 32 in_syncs a submit, 4096 syncobjs a client; larger calls are refused, never
++ * cut. a04sgpu_sched=0 refuses 8-15.
++ */
++#define HEROGPU_MAX_SUBMIT_BOS  1024u
++#define HEROGPU_MAX_IN_SYNCS    32u
++#define HEROGPU_MAX_SYNCOBJS    4096u
++#define HEROGPU_MAX_STRUCT      (64u * 1024u)
++#define HEROGPU_REQ_FS          (1u << 0)       /* PANFROST_JD_REQ_FS */
++#define HEROGPU_SYNC_SIGNALED   (1u << 0)       /* DRM_SYNCOBJ_CREATE_SIGNALED */
++#define HEROGPU_WAIT_ALL        (1u << 0)       /* DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL */
++#define HEROGPU_WAIT_FOR_SUBMIT (1u << 1)       /* ..._WAIT_FOR_SUBMIT */
++#define HEROGPU_WAIT_AVAILABLE  (1u << 2)       /* ..._WAIT_AVAILABLE */
++#define HEROGPU_WAIT_DEADLINE   (1u << 3)       /* ..._WAIT_DEADLINE: a hint, ignored */
++#define HEROGPU_SUBMIT_SLICE_NS 2000000LL       /* waiting for a submit: look again every 2 ms */
++
++struct herogpu_pan_submit {
++	uint64_t jc;
++	uint64_t in_syncs;              /* ignored: the handles follow inline */
++	uint32_t in_sync_count;
++	uint32_t out_sync;
++	uint64_t bo_handles;            /* ignored */
++	uint32_t bo_handle_count;
++	uint32_t requirements;
++};
++struct herogpu_pan_wait_bo {
++	uint32_t handle;
++	uint32_t pad;
++	int64_t timeout_ns;
++};
++struct herogpu_pan_madvise {
++	uint32_t handle;
++	uint32_t madv;
++	uint32_t retained;
++};
++struct herogpu_syncobj_create {
++	uint32_t handle;
++	uint32_t flags;
++};
++struct herogpu_syncobj_destroy {
++	uint32_t handle;
++	uint32_t pad;
++};
++struct herogpu_syncobj_wait {
++	uint64_t handles;               /* ignored */
++	int64_t timeout_nsec;
++	uint32_t count_handles;
++	uint32_t flags;
++	uint32_t first_signaled;
++	uint32_t pad;
++	uint64_t deadline_nsec;         /* ignored */
++};
++struct herogpu_syncobj_array {
++	uint64_t handles;               /* ignored */
++	uint32_t count_handles;
++	uint32_t pad;
++};
++static_assert(sizeof(struct herogpu_pan_submit) == 40, "drm_panfrost_submit");
++static_assert(sizeof(struct herogpu_pan_wait_bo) == 16, "drm_panfrost_wait_bo");
++static_assert(sizeof(struct herogpu_pan_madvise) == 12, "drm_panfrost_madvise");
++static_assert(sizeof(struct herogpu_syncobj_create) == 8, "drm_syncobj_create");
++static_assert(sizeof(struct herogpu_syncobj_destroy) == 8, "drm_syncobj_destroy");
++static_assert(sizeof(struct herogpu_syncobj_wait) == 40, "drm_syncobj_wait");
++static_assert(sizeof(struct herogpu_syncobj_array) == 16, "drm_syncobj_array");
++
++struct herogpu_syncobj {
++	struct a04s_fence *fence;       /* NULL: none yet (or reset) */
++	uint32_t used;
++	uint32_t pad;
++};
++
++/* What a queued job holds: its BOs. */
++struct herogpu_job_ctx {
++	struct herogpu_bo **bos;
++	uint32_t n;
++	uint32_t pad;
++};
++
++static void
++herogpu_job_retire(void *arg)
++{
++	struct herogpu_job_ctx *ctx = (struct herogpu_job_ctx *)arg;
++	for (uint32_t i = 0; i < ctx->n; i++) {
++		herogpu_bo_put(ctx->bos[i]);
++	}
++	if (ctx->bos != NULL) {
++		IODelete(ctx->bos, struct herogpu_bo *, ctx->n);
++	}
++	IOFreeType(ctx, struct herogpu_job_ctx);
++}
++
++static IOReturn
++herogpu_wait_ret(int err)
++{
++	return err == 0 ? kIOReturnSuccess : err == ETIMEDOUT ? kIOReturnTimeout : kIOReturnAborted;
++}
++
++static inline uint32_t
++herogpu_u32(const uint8_t *p)
++{
++	uint32_t v;
++	memcpy(&v, p, sizeof(v));
++	return v;
++}
++
++/*
++ * The structure input, inline or (over 4096 bytes) by descriptor. *owned: a copy to free with
++ * IOFreeData(*owned, *size). NULL if missing or larger than HEROGPU_MAX_STRUCT.
++ */
++static const uint8_t *
++herogpu_struct_in(IOExternalMethodArguments *args, uint32_t *size, void **owned)
++{
++	*owned = NULL;
++	*size = 0;
++	if (args->structureInputDescriptor != NULL) {
++		IOMemoryDescriptor *md = args->structureInputDescriptor;
++		IOByteCount len = md->getLength();
++		if (len == 0 || len > HEROGPU_MAX_STRUCT) {
++			return NULL;
++		}
++		void *buf = IOMallocData(len);
++		if (buf == NULL) {
++			return NULL;
++		}
++		IOByteCount got = 0;
++		if (md->prepare() == kIOReturnSuccess) {
++			got = md->readBytes(0, buf, len);
++			md->complete();
++		}
++		if (got != len) {
++			IOFreeData(buf, len);
++			return NULL;
++		}
++		*owned = buf;
++		*size = (uint32_t)len;
++		return (const uint8_t *)buf;
++	}
++	if (args->structureInput == NULL || args->structureInputSize == 0 ||
++	    args->structureInputSize > HEROGPU_MAX_STRUCT) {
++		return NULL;
++	}
++	*size = args->structureInputSize;
++	return (const uint8_t *)args->structureInput;
++}
++#endif /* ARM64_BOARD_CONFIG_A04S */
++
+ class HeroGPU : public IOService {
+ 	OSDeclareDefaultStructors(HeroGPU);
+ 
+@@ -279,7 +585,41 @@ class HeroGPUUserClient : public IOUserClient {
+ 
  	task_t             fTask;
  	IOLock            *fLock;
- 	struct herogpu_bo *fBOs;          /* handle = index + 1 */
-+	bool               fUp;           /* the GPU side was opened for this client */
+-	struct herogpu_bo *fBOs;          /* handle = index + 1 */
++	struct herogpu_bo **fBOs;        /* handle = index + 1; v64: each BO refcounted */
++	bool               fUp;          /* the GPU side was opened for this client */
++#if defined(ARM64_BOARD_CONFIG_A04S)
++	struct herogpu_syncobj *fSync;   /* v64: handle = index + 1; allocated on first use */
++#endif
++
++	struct herogpu_bo *
++	bo(uint64_t handle) const
++	{
++		return handle != 0 && handle <= HEROGPU_MAX_BOS ? fBOs[handle - 1] : NULL;
++	}
++	unsigned
++	freeSlot(void) const
++	{
++		unsigned i = 0;
++		while (i < HEROGPU_MAX_BOS && fBOs[i] != NULL) {
++			i++;
++		}
++		return i;
++	}
++#if defined(ARM64_BOARD_CONFIG_A04S)
++	struct herogpu_syncobj *
++	sync(uint64_t handle) const
++	{
++		return fSync != NULL && handle != 0 && handle <= HEROGPU_MAX_SYNCOBJS && fSync[handle - 1].used ?
++		       &fSync[handle - 1] : NULL;
++	}
++	IOReturn panSubmit(const uint8_t *in, uint32_t size);
++	IOReturn panWaitBO(const uint8_t *in, uint32_t size);
++	IOReturn panMadvise(const uint8_t *in, uint32_t size);
++	IOReturn syncCreate(const uint8_t *in, uint32_t size, uint64_t *handle);
++	IOReturn syncDestroy(const uint8_t *in, uint32_t size);
++	IOReturn syncWait(const uint8_t *in, uint32_t size, uint64_t *first);
++	IOReturn syncSet(const uint8_t *in, uint32_t size, bool signal);
++#endif
  
  public:
  	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
-@@ -300,14 +389,29 @@ HeroGPU::start(IOService *provider)
+@@ -300,14 +640,29 @@ HeroGPU::start(IOService *provider)
  		return false;
  	}
  	setProperty(kIOUserClientClassKey, "HeroGPUUserClient");
@@ -7997,28 +8869,486 @@ index 3ba3cb8..9afb1a3 100644
  			es->registerService();
  			IOLog("HEROGPU: IOAcceleratorES registered\n");
  		}
-@@ -331,7 +435,8 @@ HeroGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
+@@ -330,8 +685,9 @@ HeroGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
+ 	}
  	fTask = owningTask;
  	fLock = IOLockAlloc();
- 	fBOs = (struct herogpu_bo *)IOMallocZeroData(HEROGPU_MAX_BOS * sizeof(*fBOs));
+-	fBOs = (struct herogpu_bo *)IOMallocZeroData(HEROGPU_MAX_BOS * sizeof(*fBOs));
 -	return fLock != NULL && fBOs != NULL && herolte_gpu_up();
++	fBOs = IONewZero(struct herogpu_bo *, HEROGPU_MAX_BOS);
 +	fUp = fLock != NULL && fBOs != NULL && herolte_gpu_up();
 +	return fUp;
  }
  
  IOReturn
-@@ -351,6 +456,10 @@ HeroGPUUserClient::free(void)
- 		IOFreeData(fBOs, HEROGPU_MAX_BOS * sizeof(*fBOs));
+@@ -346,11 +702,25 @@ HeroGPUUserClient::free(void)
+ {
+ 	if (fBOs != NULL) {
+ 		for (unsigned i = 0; i < HEROGPU_MAX_BOS; i++) {
+-			herogpu_bo_free(&fBOs[i]);
++			herogpu_bo_put(fBOs[i]);     /* a BO a queued job holds goes when that job ends */
++			fBOs[i] = NULL;
+ 		}
+-		IOFreeData(fBOs, HEROGPU_MAX_BOS * sizeof(*fBOs));
++		IODelete(fBOs, struct herogpu_bo *, HEROGPU_MAX_BOS);
  		fBOs = NULL;
  	}
++#if defined(ARM64_BOARD_CONFIG_A04S)
++	if (fSync != NULL) {
++		for (unsigned i = 0; i < HEROGPU_MAX_SYNCOBJS; i++) {
++			a04s_fence_release(fSync[i].fence);
++		}
++		IODelete(fSync, struct herogpu_syncobj, HEROGPU_MAX_SYNCOBJS);
++		fSync = NULL;
++	}
++#endif
 +	if (fUp) {
-+		herolte_gpu_down();     /* after every buffer, so their GPU VA is back */
++		herolte_gpu_down();     /* after every buffer, so their GPU VA is back (unless a job still holds one) */
 +		fUp = false;
 +	}
  	if (fLock != NULL) {
  		IOLockFree(fLock);
  		fLock = NULL;
-@@ -464,13 +573,17 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+@@ -358,6 +728,297 @@ HeroGPUUserClient::free(void)
+ 	IOUserClient::free();
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_A04S)
++/* v64: 8 PanSubmit. With fLock held. */
++IOReturn
++HeroGPUUserClient::panSubmit(const uint8_t *in, uint32_t size)
++{
++	struct herogpu_pan_submit s;
++	if (size < sizeof(s)) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(&s, in, sizeof(s));
++	if (s.bo_handle_count > HEROGPU_MAX_SUBMIT_BOS || s.in_sync_count > HEROGPU_MAX_IN_SYNCS ||
++	    size != sizeof(s) + 4u * (s.bo_handle_count + s.in_sync_count)) {
++		return kIOReturnBadArgument;
++	}
++	const uint8_t *bh = in + sizeof(s), *ih = bh + 4u * s.bo_handle_count;
++	for (uint32_t i = 0; i < s.bo_handle_count; i++) {
++		if (bo(herogpu_u32(bh + 4u * i)) == NULL) {
++			return kIOReturnBadArgument;
++		}
++	}
++	for (uint32_t i = 0; i < s.in_sync_count; i++) {
++		if (sync(herogpu_u32(ih + 4u * i)) == NULL) {
++			return kIOReturnBadArgument;
++		}
++	}
++	if (s.out_sync != 0 && sync(s.out_sync) == NULL) {
++		return kIOReturnBadArgument;
++	}
++	uint32_t nd = s.in_sync_count + s.bo_handle_count;
++	struct a04s_fence **deps = nd != 0 ? IONewZero(struct a04s_fence *, nd) : NULL;
++	struct herogpu_bo **bos = s.bo_handle_count != 0 ? IONewZero(struct herogpu_bo *, s.bo_handle_count) : NULL;
++	struct herogpu_job_ctx *ctx = IOMallocType(struct herogpu_job_ctx);
++	if ((nd != 0 && deps == NULL) || (s.bo_handle_count != 0 && bos == NULL) || ctx == NULL) {
++		if (deps != NULL) {
++			IODelete(deps, struct a04s_fence *, nd);
++		}
++		if (bos != NULL) {
++			IODelete(bos, struct herogpu_bo *, s.bo_handle_count);
++		}
++		if (ctx != NULL) {
++			IOFreeType(ctx, struct herogpu_job_ctx);
++		}
++		return kIOReturnNoMemory;
++	}
++	uint32_t k = 0;
++	for (uint32_t i = 0; i < s.in_sync_count; i++) {
++		deps[k++] = sync(herogpu_u32(ih + 4u * i))->fence;       /* NULL (no fence yet) is skipped */
++	}
++	for (uint32_t i = 0; i < s.bo_handle_count; i++) {
++		struct herogpu_bo *b = bo(herogpu_u32(bh + 4u * i));
++		deps[k++] = b->last;                                       /* implicit sync */
++		__atomic_add_fetch(&b->refs, 1u, __ATOMIC_RELAXED);        /* the job's */
++		bos[i] = b;
++	}
++	ctx->bos = bos;
++	ctx->n = s.bo_handle_count;
++	/* a04s_gpu_queue() takes its own references on deps before it returns (we hold fLock meanwhile). */
++	struct a04s_fence *f = a04s_gpu_queue((s.requirements & HEROGPU_REQ_FS) ? 0 : 1, s.jc, deps, nd,
++	    herogpu_job_retire, ctx);
++	if (deps != NULL) {
++		IODelete(deps, struct a04s_fence *, nd);
++	}
++	if (f == NULL) {
++		return kIOReturnNoMemory;                     /* ctx was retired */
++	}
++	for (uint32_t i = 0; i < s.bo_handle_count; i++) {
++		struct herogpu_bo *b = bo(herogpu_u32(bh + 4u * i));
++		if (b->last != f) {
++			a04s_fence_retain(f);
++			a04s_fence_release(b->last);
++			b->last = f;
++		}
++	}
++	if (s.out_sync != 0) {
++		struct herogpu_syncobj *so = sync(s.out_sync);
++		a04s_fence_retain(f);
++		a04s_fence_release(so->fence);
++		so->fence = f;
++	}
++	a04s_fence_release(f);
++	return kIOReturnSuccess;
++}
++
++/* v64: 9 PanWaitBO. Drops fLock while waiting. */
++IOReturn
++HeroGPUUserClient::panWaitBO(const uint8_t *in, uint32_t size)
++{
++	struct herogpu_pan_wait_bo w;
++	if (size != sizeof(w)) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(&w, in, sizeof(w));
++	struct herogpu_bo *b = bo(w.handle);
++	if (b == NULL) {
++		return kIOReturnBadArgument;
++	}
++	struct a04s_fence *f = b->last;
++	if (f == NULL) {
++		return kIOReturnSuccess;
++	}
++	a04s_fence_retain(f);
++	uint64_t deadline = a04s_gpu_deadline(w.timeout_ns);
++	IOLockUnlock(fLock);
++	int err = a04s_fence_wait(&f, 1, true, deadline, NULL);
++	IOLockLock(fLock);
++	a04s_fence_release(f);
++	return herogpu_wait_ret(err);
++}
++
++/* v64: 10 PanMadvise. Nothing is ever purged here: retained is always 1. */
++IOReturn
++HeroGPUUserClient::panMadvise(const uint8_t *in, uint32_t size)
++{
++	struct herogpu_pan_madvise m;
++	if (size != sizeof(m)) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(&m, in, sizeof(m));
++	return bo(m.handle) != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
++}
++
++/* v64: 11 SyncobjCreate. */
++IOReturn
++HeroGPUUserClient::syncCreate(const uint8_t *in, uint32_t size, uint64_t *handle)
++{
++	struct herogpu_syncobj_create c;
++	if (size != sizeof(c)) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(&c, in, sizeof(c));
++	if (c.flags & ~HEROGPU_SYNC_SIGNALED) {
++		return kIOReturnBadArgument;
++	}
++	if (fSync == NULL) {
++		fSync = IONewZero(struct herogpu_syncobj, HEROGPU_MAX_SYNCOBJS);
++		if (fSync == NULL) {
++			return kIOReturnNoMemory;
++		}
++	}
++	unsigned i = 0;
++	while (i < HEROGPU_MAX_SYNCOBJS && fSync[i].used) {
++		i++;
++	}
++	if (i == HEROGPU_MAX_SYNCOBJS) {
++		return kIOReturnNoResources;
++	}
++	struct a04s_fence *f = NULL;
++	if (c.flags & HEROGPU_SYNC_SIGNALED) {
++		f = a04s_fence_create(true);
++		if (f == NULL) {
++			return kIOReturnNoMemory;
++		}
++	}
++	fSync[i].fence = f;
++	fSync[i].used = 1;
++	*handle = i + 1;
++	return kIOReturnSuccess;
++}
++
++/* v64: 12 SyncobjDestroy. */
++IOReturn
++HeroGPUUserClient::syncDestroy(const uint8_t *in, uint32_t size)
++{
++	struct herogpu_syncobj_destroy d;
++	if (size != sizeof(d)) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(&d, in, sizeof(d));
++	struct herogpu_syncobj *so = sync(d.handle);
++	if (so == NULL) {
++		return kIOReturnBadArgument;
++	}
++	a04s_fence_release(so->fence);
++	so->fence = NULL;
++	so->used = 0;
++	return kIOReturnSuccess;
++}
++
++/*
++ * v64: 13 SyncobjWait. Drops fLock while waiting. With WAIT_FOR_SUBMIT (or WAIT_AVAILABLE) a syncobj
++ * with no fence yet is waited for: the handles are looked at again every 2 ms.
++ */
++IOReturn
++HeroGPUUserClient::syncWait(const uint8_t *in, uint32_t size, uint64_t *first)
++{
++	struct herogpu_syncobj_wait w;
++	if (size < sizeof(w)) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(&w, in, sizeof(w));
++	if (w.count_handles == 0 || w.count_handles > HEROGPU_MAX_SYNCOBJS ||
++	    size != sizeof(w) + 4u * w.count_handles ||
++	    (w.flags & ~(HEROGPU_WAIT_ALL | HEROGPU_WAIT_FOR_SUBMIT | HEROGPU_WAIT_AVAILABLE | HEROGPU_WAIT_DEADLINE))) {
++		return kIOReturnBadArgument;
++	}
++	const uint8_t *hs = in + sizeof(w);
++	uint32_t n = w.count_handles;
++	bool all = (w.flags & HEROGPU_WAIT_ALL) != 0;
++	bool forSubmit = (w.flags & (HEROGPU_WAIT_FOR_SUBMIT | HEROGPU_WAIT_AVAILABLE)) != 0;
++	struct a04s_fence **fs = IONewZero(struct a04s_fence *, n);
++	if (fs == NULL) {
++		return kIOReturnNoMemory;
++	}
++	uint64_t deadline = a04s_gpu_deadline(w.timeout_nsec);
++	IOReturn ret = kIOReturnSuccess;
++	for (;;) {
++		bool missing = false;
++		for (uint32_t i = 0; i < n; i++) {
++			struct herogpu_syncobj *so = sync(herogpu_u32(hs + 4u * i));
++			if (so == NULL) {
++				ret = kIOReturnBadArgument;    /* bad, or destroyed while we waited */
++				break;
++			}
++			fs[i] = so->fence;
++			a04s_fence_retain(fs[i]);
++			if (fs[i] == NULL) {
++				missing = true;
++			}
++		}
++		if (ret == kIOReturnSuccess && missing && !forSubmit) {
++			ret = kIOReturnBadArgument;            /* Linux: -EINVAL without WAIT_FOR_SUBMIT */
++		}
++		int err = ETIMEDOUT;
++		uint64_t until = deadline;
++		unsigned firstIdx = 0;
++		if (ret == kIOReturnSuccess) {
++			if (missing) {
++				uint64_t slice = a04s_gpu_deadline(HEROGPU_SUBMIT_SLICE_NS);
++				if (slice < until) {
++					until = slice;
++				}
++			}
++			IOLockUnlock(fLock);
++			err = a04s_fence_wait(fs, n, all, until, &firstIdx);
++			IOLockLock(fLock);
++		}
++		for (uint32_t i = 0; i < n; i++) {
++			a04s_fence_release(fs[i]);
++			fs[i] = NULL;
++		}
++		if (ret != kIOReturnSuccess) {
++			break;
++		}
++		if (err == 0) {
++			*first = firstIdx;
++			break;
++		}
++		if (err != ETIMEDOUT || until == deadline) {
++			ret = herogpu_wait_ret(err);
++			break;
++		}
++		/* the 2 ms look-again for WAIT_FOR_SUBMIT: go round */
++	}
++	IODelete(fs, struct a04s_fence *, n);
++	return ret;
++}
++
++/* v64: 14 SyncobjReset (signal false) and 15 SyncobjSignal (true). */
++IOReturn
++HeroGPUUserClient::syncSet(const uint8_t *in, uint32_t size, bool signal)
++{
++	struct herogpu_syncobj_array a;
++	if (size < sizeof(a)) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(&a, in, sizeof(a));
++	if (a.count_handles == 0 || a.count_handles > HEROGPU_MAX_SYNCOBJS || size != sizeof(a) + 4u * a.count_handles) {
++		return kIOReturnBadArgument;
++	}
++	const uint8_t *hs = in + sizeof(a);
++	for (uint32_t i = 0; i < a.count_handles; i++) {
++		if (sync(herogpu_u32(hs + 4u * i)) == NULL) {
++			return kIOReturnBadArgument;
++		}
++	}
++	for (uint32_t i = 0; i < a.count_handles; i++) {
++		struct herogpu_syncobj *so = sync(herogpu_u32(hs + 4u * i));
++		struct a04s_fence *f = NULL;
++		if (signal) {
++			f = a04s_fence_create(true);
++			if (f == NULL) {
++				return kIOReturnNoMemory;
++			}
++		}
++		a04s_fence_release(so->fence);
++		so->fence = f;
++	}
++	return kIOReturnSuccess;
++}
++#endif /* ARM64_BOARD_CONFIG_A04S */
++
+ IOReturn
+ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -368,6 +1029,19 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ 	IOReturn ret = kIOReturnSuccess;
+ 	uint64_t in0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
+ 	uint64_t in1 = args->scalarInputCount > 1 ? args->scalarInput[1] : 0;
++#if defined(ARM64_BOARD_CONFIG_A04S)
++	/* v64: 8-15 take a structure input, inline or by descriptor. */
++	const uint8_t *sIn = NULL;
++	uint32_t sInSize = 0;
++	void *sInOwned = NULL;
++	if (selector >= kHeroGPUPanSubmit && selector <= kHeroGPUSyncobjSignal) {
++		if (!a04s_gpu_sched_on()) {
++			ret = kIOReturnUnsupported;
++		} else if ((sIn = herogpu_struct_in(args, &sInSize, &sInOwned)) == NULL) {
++			ret = kIOReturnBadArgument;
++		}
++	}
++#endif
+ 
+ 	IOLockLock(fLock);
+ 	switch (selector) {
+@@ -376,44 +1050,49 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ 		outCount = 1;
+ 		break;
+ 	case kHeroGPUCreateBO: {
+-		unsigned i = 0;
+-		while (i < HEROGPU_MAX_BOS && herogpu_bo_used(&fBOs[i])) {
+-			i++;
+-		}
++		unsigned i = freeSlot();
++		struct herogpu_bo *b = i < HEROGPU_MAX_BOS ? herogpu_bo_new() : NULL;
+ 		if (i == HEROGPU_MAX_BOS) {
+ 			ret = kIOReturnNoResources;
+-		} else if (!herogpu_bo_create(&fBOs[i], in0)) {
++		} else if (b == NULL) {
++			ret = kIOReturnNoMemory;
++		} else if (!herogpu_bo_create(b, in0)) {
++			IOFreeType(b, struct herogpu_bo);
+ 			ret = kIOReturnNoMemory;
+ 		} else {
++			fBOs[i] = b;
+ 			out[0] = i + 1;
+-			out[1] = fBOs[i].va;
+-			out[2] = (uint64_t)fBOs[i].pages * 0x1000;
++			out[1] = b->va;
++			out[2] = (uint64_t)b->pages * 0x1000;
+ 			outCount = 3;
+ 		}
+ 		break;
+ 	}
+-	case kHeroGPUFreeBO:
+-		if (in0 == 0 || in0 > HEROGPU_MAX_BOS || !herogpu_bo_used(&fBOs[in0 - 1])) {
++	case kHeroGPUFreeBO: {
++		struct herogpu_bo *b = bo(in0);
++		if (b == NULL) {
+ 			ret = kIOReturnBadArgument;
+ 		} else {
+-			herogpu_bo_free(&fBOs[in0 - 1]);
++			fBOs[in0 - 1] = NULL;
++			herogpu_bo_put(b);          /* v64: unmapped now, or when the last job that lists it ends */
+ 		}
+ 		break;
++	}
+ 	case kHeroGPUMapBO: {
+-		struct herogpu_bo *bo = in0 && in0 <= HEROGPU_MAX_BOS ? &fBOs[in0 - 1] : NULL;
+-		if (bo == NULL || !herogpu_bo_used(bo)) {
++		struct herogpu_bo *b = bo(in0);
++		if (b == NULL) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+-		if (bo->umap == NULL) {
++		if (b->umap == NULL) {
+ 			/* A surface keeps the cache mode its other mappings use. */
+-			bo->umap = herogpu_bo_memory(bo)->createMappingInTask(fTask, 0,
+-			    kIOMapAnywhere | (bo->surface ? bo->surface->mapCache : kIOMapWriteCombineCache));
++			b->umap = herogpu_bo_memory(b)->createMappingInTask(fTask, 0,
++			    kIOMapAnywhere | (b->surface ? b->surface->mapCache : kIOMapWriteCombineCache));
+ 		}
+-		if (bo->umap == NULL) {
++		if (b->umap == NULL) {
+ 			ret = kIOReturnNoMemory;
+ 		} else {
+-			out[0] = bo->umap->getAddress();
++			out[0] = b->umap->getAddress();
+ 			outCount = 1;
+ 		}
+ 		break;
+@@ -422,7 +1101,8 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ 		/*
+ 		 * Not under the client's lock: the call lasts as long as the job,
+ 		 * and gpu/mesa/herodrm.c queues jobs so that its other calls (log,
+-		 * cache sync) go on meanwhile. The GPU has its own mutex.
++		 * cache sync) go on meanwhile. The GPU has its own mutex. (v64, A04s:
++		 * the job goes through the scheduler and this waits for its fence.)
+ 		 */
+ 		IOLockUnlock(fLock);
+ 		out[0] = herolte_gpu_submit(in1 ? 1 : 0, in0, &out[1]);
+@@ -430,19 +1110,21 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ 		outCount = 2;
+ 		break;
+ 	case kHeroGPUSurfaceBO: {
+-		unsigned i = 0;
+-		while (i < HEROGPU_MAX_BOS && herogpu_bo_used(&fBOs[i])) {
+-			i++;
+-		}
++		unsigned i = freeSlot();
++		struct herogpu_bo *b = i < HEROGPU_MAX_BOS ? herogpu_bo_new() : NULL;
+ 		if (i == HEROGPU_MAX_BOS) {
+ 			ret = kIOReturnNoResources;
+-		} else if (!herogpu_bo_import_surface(&fBOs[i], (uint32_t)in0)) {
++		} else if (b == NULL) {
++			ret = kIOReturnNoMemory;
++		} else if (!herogpu_bo_import_surface(b, (uint32_t)in0)) {
++			IOFreeType(b, struct herogpu_bo);
+ 			ret = kIOReturnNotFound;
+ 		} else {
+-			SweetSurface *s = fBOs[i].surface;
++			SweetSurface *s = b->surface;
++			fBOs[i] = b;
+ 			out[0] = i + 1;
+-			out[1] = fBOs[i].va;
+-			out[2] = (uint64_t)fBOs[i].pages * 0x1000;
++			out[1] = b->va;
++			out[2] = (uint64_t)b->pages * 0x1000;
+ 			out[3] = s->bytesPerRow;
+ 			out[4] = s->width;
+ 			out[5] = s->height;
+@@ -454,30 +1136,78 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ 		break;
+ 	}
+ 	case kHeroGPUSyncBO: {
+-		struct herogpu_bo *bo = in0 && in0 <= HEROGPU_MAX_BOS ? &fBOs[in0 - 1] : NULL;
+-		if (bo == NULL || !herogpu_bo_used(bo)) {
++		struct herogpu_bo *b = bo(in0);
++		if (b == NULL) {
+ 			ret = kIOReturnBadArgument;
+-		} else if (bo->surface != NULL) {
+-			herogpu_surface_sync(bo->surface);
++		} else if (b->surface != NULL) {
++			herogpu_surface_sync(b->surface);
+ 		}
+ 		break;
  	}
  	case kHeroGPULog:
  		/* Test programs have no console here: their lines go to the
@@ -8036,8 +9366,59 @@ index 3ba3cb8..9afb1a3 100644
 +			    args->structureInputSize < 1024u ? args->structureInputSize : 1024u);
  		}
  		break;
++#if defined(ARM64_BOARD_CONFIG_A04S)
++	case kHeroGPUPanSubmit:
++		if (ret == kIOReturnSuccess) {
++			ret = panSubmit(sIn, sInSize);
++		}
++		break;
++	case kHeroGPUPanWaitBO:
++		if (ret == kIOReturnSuccess) {
++			ret = panWaitBO(sIn, sInSize);
++		}
++		break;
++	case kHeroGPUPanMadvise:
++		if (ret == kIOReturnSuccess && (ret = panMadvise(sIn, sInSize)) == kIOReturnSuccess) {
++			out[0] = 1;                     /* retained */
++			outCount = 1;
++		}
++		break;
++	case kHeroGPUSyncobjCreate:
++		if (ret == kIOReturnSuccess && (ret = syncCreate(sIn, sInSize, &out[0])) == kIOReturnSuccess) {
++			outCount = 1;
++		}
++		break;
++	case kHeroGPUSyncobjDestroy:
++		if (ret == kIOReturnSuccess) {
++			ret = syncDestroy(sIn, sInSize);
++		}
++		break;
++	case kHeroGPUSyncobjWait:
++		if (ret == kIOReturnSuccess && (ret = syncWait(sIn, sInSize, &out[0])) == kIOReturnSuccess) {
++			outCount = 1;
++		}
++		break;
++	case kHeroGPUSyncobjReset:
++	case kHeroGPUSyncobjSignal:
++		if (ret == kIOReturnSuccess) {
++			ret = syncSet(sIn, sInSize, selector == kHeroGPUSyncobjSignal);
++		}
++		break;
++#endif
  	default:
-@@ -499,9 +612,10 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ 		ret = kIOReturnUnsupported;
+ 		break;
+ 	}
+ 	IOLockUnlock(fLock);
++#if defined(ARM64_BOARD_CONFIG_A04S)
++	if (sInOwned != NULL) {
++		IOFreeData(sInOwned, sInSize);
++	}
++#endif
+ 
+ 	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+ 		args->scalarOutput[i] = i < outCount ? out[i] : 0;
+@@ -499,9 +1229,10 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
  static void
  herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  {
@@ -8049,7 +9430,7 @@ index 3ba3cb8..9afb1a3 100644
  		return;
  	}
  	IOLog("HEROGPU SELFTEST: GPU_ID %#llx rev %#llx shaders %#llx tiler features %#llx "
-@@ -511,6 +625,8 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+@@ -511,6 +1242,8 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  	bzero(&bo, sizeof(bo));
  	if (!herogpu_bo_create(&bo, 0x10000)) {
  		IOLog("HEROGPU SELFTEST: buffer failed\n");
@@ -8058,7 +9439,7 @@ index 3ba3cb8..9afb1a3 100644
  		return;
  	}
  	/* Through a write-combined kernel mapping, as a client would. */
-@@ -519,7 +635,9 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+@@ -519,7 +1252,9 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  	volatile uint8_t *job = map ? (volatile uint8_t *)map->getVirtualAddress() : NULL;
  	if (job == NULL) {
  		IOLog("HEROGPU SELFTEST: mapping failed\n");
@@ -8068,7 +9449,7 @@ index 3ba3cb8..9afb1a3 100644
  		return;
  	}
  	job[16] = 1 | (2 << 1);                         /* 64-bit, WRITE_VALUE */
-@@ -531,9 +649,13 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+@@ -531,9 +1266,13 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  	__asm__ volatile ("dsb sy" ::: "memory");
  	uint64_t us = 0;
  	uint32_t status = herolte_gpu_submit(1, bo.va, &us);
