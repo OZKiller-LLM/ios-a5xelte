@@ -22,7 +22,7 @@
  * Metal device's own lines (bgmtl) go to stderr only. Exit 0 once both runs were tried.
  *
  * Environment (autorun.env): A04S_M6_SAMPLING=1 runs the M6a run 7 sampling tests and run 8's
- * QuartzCore/m5 shader matrix, =2 the matrix alone,
+ * QuartzCore/m5 shader matrix, =2 the matrix alone, =3 run 9's fold/delta comparison alone,
  * (a04s_m6_sampling.m) before the CoreAnimation scenes; A04S_M5_ONLY=softpipe|gpu runs one of the two; A04S_METAL_TIMEOUT
  * (seconds, default 150) limits each child and four times that the whole probe.
  *
@@ -431,7 +431,7 @@ child(const char *mode)
 	/* M6a run 7: texture sampling, from a plain blit up to QuartzCore's downsample with chosen
 	 * inputs (A04S_M6_SAMPLING=1) */
 	int samp_bad = 0;
-	if (getenv("A04S_M6_SAMPLING") && (getenv("A04S_M6_SAMPLING")[0] == '1' || getenv("A04S_M6_SAMPLING")[0] == '2')) {
+	if (getenv("A04S_M6_SAMPLING") && (getenv("A04S_M6_SAMPLING")[0] == '1' || getenv("A04S_M6_SAMPLING")[0] == '2' || getenv("A04S_M6_SAMPLING")[0] == '3')) {
 		STEP("sampling");
 		samp_bad = a04s_m6_sampling(dev, q, core, m5, mode);
 	}

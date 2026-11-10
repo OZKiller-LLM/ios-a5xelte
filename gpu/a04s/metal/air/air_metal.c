@@ -6788,9 +6788,8 @@ static void
 add_cb_deltas(nir_shader *nir, struct air_shader_info *info, unsigned ubo_base)
 {
    const unsigned CB_DELTA_SLOT = 15 - ubo_base;
-   static int on = -1;
-   if (on < 0)
-      on = !(getenv("RWA_CB_DELTA") && getenv("RWA_CB_DELTA")[0] == '0');
+   /* A04s (M6a run 9): read at every pipeline, not once per process, so one probe can compare both paths */
+   const int on = !(getenv("RWA_CB_DELTA") && getenv("RWA_CB_DELTA")[0] == '0');
    unsigned mask = 0;
    for (unsigned i = 0; i < info->num_resources; i++) {
       const struct air_resource *r = &info->resources[i];
@@ -6831,6 +6830,9 @@ add_cb_deltas(nir_shader *nir, struct air_shader_info *info, unsigned ubo_base)
       }
       nir_metadata_preserve(impl, nir_metadata_control_flow);
    }
+   if (getenv("BGMTL_TRACE"))
+      fprintf(stderr, "rwa: %s reads constant buffers 0x%x through the delta slot %u\n",
+              info->entry_point ? info->entry_point : "a stage", mask, CB_DELTA_SLOT + ubo_base);
    nir->info.num_ubos = MAX2(nir->info.num_ubos, CB_DELTA_SLOT + 1);
    info->cb_delta_mask = mask;
    info->cb_delta_ubo = CB_DELTA_SLOT + 1;
@@ -7193,6 +7195,17 @@ rwa_render_create(struct rwa_device *device,
       }
    }
 
+   /* A04s (M6a run 9): fold constants before sizing. Apple's compiler indexes a constant pointer with a 64-bit
+    * constant, so the frontend's offsets are ishl(u2u32(i64 const), n): nir_src_is_const fails on them, and NIR's
+    * upper-bound analysis returns its maximum for any u2u32 of a 64-bit value. Every unsized constant pointer read
+    * that way (QuartzCore's mvp_matrix in downsample_blur_vert_lph) was left unsized and went through the delta
+    * slot, and on the G52 such a vertex stage drew nothing at all (run 8). Folded, the offsets are constants and
+    * the pointer gets the exact size it reads. RWA_FOLD_SIZES=0 turns it off (read at every pipeline). */
+   if (!(getenv("RWA_FOLD_SIZES") && getenv("RWA_FOLD_SIZES")[0] == '0')) {
+      NIR_PASS(_, fs, nir_opt_constant_folding);
+      if (!render->generated_vertex)
+         NIR_PASS(_, vs, nir_opt_constant_folding);
+   }
    size_unsized_constants(fs, &render->finfo);
    add_cb_deltas(fs, &render->finfo, device->ubo_base);
    if (!render->generated_vertex) {

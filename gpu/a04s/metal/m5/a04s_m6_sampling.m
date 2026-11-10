@@ -472,17 +472,35 @@ test_mix(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLLibrary> m5, const char
 	id<MTLBuffer> ib = [[dev newBufferWithBytes:idx length:sizeof(idx) options:MTLResourceStorageModeShared] autorelease];
 	id<MTLSamplerState> smp = sampler(dev, MTLSamplerMinMagFilterLinear);
 
-	static const struct {
+	/* fold / delta: RWA_FOLD_SIZES and RWA_CB_DELTA while this case's pipeline is made (-1: as the environment has them) */
+	struct mix_case {
 		const char *name, *vs, *fs;
 		bool qc_vs, qc_fs, attrs;
-	} cases[] = {
-		{ "mix-qc-qc", "downsample_blur_vert_lph", "downsample_4_frag_lph", true, true, true },
-		{ "mix-qcvs-m5fs", "downsample_blur_vert_lph", "ds_q_fs", true, false, true },
-		{ "mix-m5vs-qcfs", "ds_q_quad_vs", "downsample_4_frag_lph", false, true, false },
-		{ "mix-m5attr-m5fs", "ds_q_attr_vs", "ds_q_fs", false, false, true },
-		{ "mix-m5vs-m5fs", "ds_q_quad_vs", "ds_q_fs", false, false, false },
+		int fold, delta;
 	};
-	for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+	static const struct mix_case run8[] = {
+		{ "mix-qc-qc", "downsample_blur_vert_lph", "downsample_4_frag_lph", true, true, true, -1, -1 },
+		{ "mix-qcvs-m5fs", "downsample_blur_vert_lph", "ds_q_fs", true, false, true, -1, -1 },
+		{ "mix-m5vs-qcfs", "ds_q_quad_vs", "downsample_4_frag_lph", false, true, false, -1, -1 },
+		{ "mix-m5attr-m5fs", "ds_q_attr_vs", "ds_q_fs", false, false, true, -1, -1 },
+		{ "mix-m5vs-m5fs", "ds_q_quad_vs", "ds_q_fs", false, false, false, -1, -1 },
+	};
+	/* run 9 (A04S_M6_SAMPLING=3): run 8's two failing pairs as run 8 made them (unsized mvp_matrix through the delta
+	 * slot), with the delta slot off (the copying path), and with libhakiosair's fix (constants folded before sizing) */
+	static const struct mix_case run9[] = {
+		{ "r9-qc-qc-old", "downsample_blur_vert_lph", "downsample_4_frag_lph", true, true, true, 0, 1 },
+		{ "r9-qc-qc-nodelta", "downsample_blur_vert_lph", "downsample_4_frag_lph", true, true, true, 0, 0 },
+		{ "r9-qc-qc-fold", "downsample_blur_vert_lph", "downsample_4_frag_lph", true, true, true, 1, 1 },
+		{ "r9-m5attr-old", "ds_q_attr_vs", "ds_q_fs", false, false, true, 0, 1 },
+		{ "r9-m5attr-nodelta", "ds_q_attr_vs", "ds_q_fs", false, false, true, 0, 0 },
+		{ "r9-m5attr-fold", "ds_q_attr_vs", "ds_q_fs", false, false, true, 1, 1 },
+		{ "r9-m5vs-m5fs", "ds_q_quad_vs", "ds_q_fs", false, false, false, -1, -1 },
+	};
+	const char *sel = getenv("A04S_M6_SAMPLING");
+	const bool r9 = sel && sel[0] == '3';
+	const struct mix_case *cases = r9 ? run9 : run8;
+	const unsigned ncases = r9 ? sizeof(run9) / sizeof(run9[0]) : sizeof(run8) / sizeof(run8[0]);
+	for (unsigned c = 0; c < ncases; c++) {
 		const char *name = cases[c].name;
 		id<MTLLibrary> vl = cases[c].qc_vs ? qc : m5, fl = cases[c].qc_fs ? qc : m5;
 		if (!vl || !fl) {
@@ -497,9 +515,19 @@ test_mix(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLLibrary> m5, const char
 			pd.vertexDescriptor = vd;
 		NSError *err = nil;
 		double t0 = a04s_now();
+		/* libhakiosair reads both at pipeline creation; restored right after */
+		if (cases[c].fold >= 0)
+			setenv("RWA_FOLD_SIZES", cases[c].fold ? "1" : "0", 1);
+		if (cases[c].delta >= 0)
+			setenv("RWA_CB_DELTA", cases[c].delta ? "1" : "0", 1);
 		id<MTLRenderPipelineState> ps = pd.vertexFunction && pd.fragmentFunction
 			? [[dev newRenderPipelineStateWithDescriptor:pd error:&err] autorelease] : nil;
-		a04s_log("  sample: pipeline %s + %s: %s in %.1f s%s%s", cases[c].vs, cases[c].fs, ps ? "made" : "nil",
+		if (cases[c].fold >= 0)
+			unsetenv("RWA_FOLD_SIZES");
+		if (cases[c].delta >= 0)
+			unsetenv("RWA_CB_DELTA");
+		a04s_log("  sample: %s: pipeline %s + %s (fold %d, delta %d): %s in %.1f s%s%s", name, cases[c].vs, cases[c].fs,
+			 cases[c].fold, cases[c].delta, ps ? "made" : "nil",
 			 a04s_now() - t0, err ? ", error: " : "", err ? err.localizedDescription.UTF8String : "");
 		id<MTLTexture> src = tex2d(dev, MTLPixelFormatBGRA8Unorm, 258, 258, MTLStorageModePrivate,
 					   MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
@@ -562,13 +590,13 @@ test_mix(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLLibrary> m5, const char
 	}
 }
 
-/* A04S_M6_SAMPLING=1: run 7's ladder and run 8's matrix; =2: the matrix alone */
+/* A04S_M6_SAMPLING=1: run 7's ladder and run 8's matrix; =2: run 8's matrix alone; =3: run 9's comparison alone */
 int
 a04s_m6_sampling(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLLibrary> core, id<MTLLibrary> m5, const char *mode)
 {
 	g_bad = 0;
 	const char *sel = getenv("A04S_M6_SAMPLING");
-	bool matrix_only = sel && sel[0] == '2';
+	bool matrix_only = sel && (sel[0] == '2' || sel[0] == '3');
 	@autoreleasepool {
 		if (!matrix_only) {
 			test_blit(dev, q, core, mode);
