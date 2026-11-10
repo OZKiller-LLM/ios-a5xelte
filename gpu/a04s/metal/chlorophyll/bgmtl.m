@@ -938,12 +938,15 @@ bg_air_slice(NSData *d)
 - (NSUInteger)protectionOptions { return 0; }
 - (id)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi
 {
-   (void)bpi;
    BGMTLTexture *t = [[BGMTLTexture alloc] initWithBGDevice:_owner descriptor:d];
    if (!t) return nil;
    t->_linSrc = [self retain];
    t->_linOff = offset;
    t->_linBpr = bpr;
+   // A04s (M6a run 12): the whole descriptor once per texture, to find what tells Metal which way these rows run
+   BG_TRACE("linear texture %p from buffer %p offset %lu, rows of %lu bytes, image %lu: %s
+", t, self, (unsigned long)offset,
+            (unsigned long)bpr, (unsigned long)bpi, [[d description] UTF8String] ?: "-");
    return t;
 }
 @end
@@ -1768,12 +1771,15 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    return [self rwaTexture];
 }
 
-// A04s (M6a run 11): the rows of a CPU-drawn texture (no-copy or linear), written into _tex. Run 10 drew CoreAnimation's
-// image and text layers upside down, with the image's texture coordinate v = 1 at the top of its quad. With BGMTL_TRACE the
-// first refresh of each texture logs where its rows come from and the first pixel of its first and last rows, which shows
-// which way the memory runs. BGMTL_FLIP_CPU_TEXTURES=1 (read at each refresh) writes the rows in reverse order: a test.
-// Called with bg_lock held.
-- (void)a04sWriteCPURows:(const uint8_t *)src bytesPerRow:(size_t)bpr what:(const char *)what
+// A04s (M6a runs 11-12): the rows of a CPU-drawn texture (no-copy or linear), written into _tex. Run 10 drew CoreAnimation's
+// image and text layers upside down: CoreAnimation gives the image's top v = 1 with an identity texture matrix, while the
+// buffer under its linear texture holds the image top row first (run 11's trace: a CGImage gradient and CoreAnimation's
+// own text bitmap, both). Run 11 drew both scenes with the rows reversed and both matched the CPU reference (diff 0.12 and
+// 0.25, no channel off by more than 32). So a linear texture's rows are reversed by default. No no-copy texture was seen,
+// so those stay as stored. BGMTL_FLIP_CPU_TEXTURES (read at each refresh): 0 = neither reversed, 1 = both reversed.
+// With BGMTL_TRACE the first refresh of each texture logs where its rows come from and the first pixel of its first and
+// last rows. Called with bg_lock held.
+- (void)a04sWriteCPURows:(const uint8_t *)src bytesPerRow:(size_t)bpr what:(const char *)what flipByDefault:(BOOL)flipDefault
 {
    const unsigned w = _shape.width, h = _shape.height ? _shape.height : 1;
    if (!_cpuTraced && bg_trace()) {
@@ -1783,8 +1789,9 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
              w, h, _shape.pixel_format, bpr, src[0], src[1], src[2], src[3], z[0], z[1], z[2], z[3]);
    }
    const char *fl = getenv("BGMTL_FLIP_CPU_TEXTURES");
+   const BOOL flip = fl && fl[0] == '0' ? NO : fl && fl[0] == '1' ? YES : flipDefault;
    uint8_t *tmp = NULL;
-   if (fl && fl[0] == '1' && h > 1 && (tmp = malloc(bpr * h))) {
+   if (flip && h > 1 && (tmp = malloc(bpr * h))) {
       for (unsigned y = 0; y < h; y++)
          memcpy(tmp + bpr * y, src + bpr * (h - 1 - y), bpr);
       src = tmp;
@@ -1800,12 +1807,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 {
    if (_ncBytes && _tex) {
       bg_lock();
-      [self a04sWriteCPURows:(const uint8_t *)_ncBytes bytesPerRow:_ncLength / (_shape.height ? _shape.height : 1) what:"no-copy"];
+      [self a04sWriteCPURows:(const uint8_t *)_ncBytes bytesPerRow:_ncLength / (_shape.height ? _shape.height : 1) what:"no-copy" flipByDefault:NO];
       bg_unlock();
    }
    if (_linSrc && _tex) {
       bg_lock();
-      [self a04sWriteCPURows:(const uint8_t *)[(BGMTLBuffer *)_linSrc contents] + _linOff bytesPerRow:_linBpr what:"linear"];
+      [self a04sWriteCPURows:(const uint8_t *)[(BGMTLBuffer *)_linSrc contents] + _linOff bytesPerRow:_linBpr what:"linear" flipByDefault:YES];
       bg_unlock();
    }
    return _tex;

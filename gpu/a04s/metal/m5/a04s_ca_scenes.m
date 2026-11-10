@@ -19,8 +19,11 @@
 #import <QuartzCore/QuartzCore.h>
 #import <CoreGraphics/CoreGraphics.h>
 
+#include <dirent.h>
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 #include "a04s_metal_log.h"
 
@@ -255,14 +258,61 @@ frame(CARenderer *r, id<MTLCommandQueue> q)
 }
 
 /*
+ * A04s (M6a run 12): scene 6's panel, checked without a reference. The CPU reference draws no backdrop, but the
+ * stripes behind the panel are vertical, so a correct blurred backdrop is vertical too: inside the panel each column
+ * barely changes from row to row, while neighbouring columns differ. Run 11's panel was sheared (bands at 45 degrees),
+ * which makes the row-to-row change as large as the column-to-column one. Returns the two mean changes per channel
+ * over the panel's inner 160 x 160 (the panel is 32..224; 16 px stay clear of its edges).
+ */
+static void
+panel_structure(const uint8_t *out, double *dx_out, double *dy_out)
+{
+	double dx = 0, dy = 0;
+	unsigned n = 0;
+	for (int y = 48; y < 208; y++)
+		for (int x = 48; x < 208; x++, n++)
+			for (int c = 0; c < 3; c++) {
+				const uint8_t *p = out + 4 * (y * W + x) + c;
+				dx += abs((int)p[4] - (int)p[0]);
+				dy += abs((int)p[4 * W] - (int)p[0]);
+			}
+	*dx_out = dx / (n * 3.0);
+	*dy_out = dy / (n * 3.0);
+}
+
+/* the device's pass pictures from an earlier run, which a run that writes fewer would leave mixed in with its own */
+static void
+remove_old_pass_pictures(void)
+{
+	DIR *dir = opendir("/private/var/a04s");
+	struct dirent *e;
+	unsigned gone = 0, kept = 0;
+	if (!dir)
+		return;
+	while ((e = readdir(dir))) {
+		if (strncmp(e->d_name, "m6-pass-", 8))
+			continue;
+		char path[300];
+		snprintf(path, sizeof(path), "/private/var/a04s/%s", e->d_name);
+		if (unlink(path) == 0)
+			gone++;
+		else
+			kept++;
+	}
+	closedir(dir);
+	a04s_log("  ca: removed %u old m6-pass-* pictures%s", gone, kept ? " (some could not be removed)" : "");
+}
+
+/*
  * Returns how many scenes drew nothing or were refused. `only`: a comma list of scene numbers, or NULL for all.
  *
- * A04s (M6a run 11), two lists in the environment:
- * - A04S_CA_FLIP_SCENES: each of these scenes is drawn a second time with BGMTL_FLIP_CPU_TEXTURES=1, which makes the
- *   device write CPU-drawn textures' rows in reverse order (run 10 drew scenes 1 and 2 upside down). Its files are
- *   m6-<mode>-scene-flipN.bgra.
+ * A04s (M6a runs 11-12), two lists in the environment:
+ * - A04S_CA_FLIP_SCENES: each of these scenes is drawn a second time with BGMTL_FLIP_CPU_TEXTURES=0, which makes the
+ *   device write CPU-drawn textures' rows as they lie in memory. Since run 12 the device reverses a linear texture's rows
+ *   by default (run 11: scenes 1 and 2 match only that way), so this is the old, upside-down drawing, kept to compare.
+ *   Its files are m6-<mode>-scene-flipN.bgra.
  * - A04S_PASS_STATS_SCENES: A04S_PASS_STATS is set only while these scenes draw, so the 24 pass pictures the device
- *   writes are theirs.
+ *   writes are theirs. Older pass pictures are removed first.
  */
 int
 a04s_ca_scenes(id<MTLDevice> d, const char *mode, const char *only)
@@ -271,6 +321,8 @@ a04s_ca_scenes(id<MTLDevice> d, const char *mode, const char *only)
 	id<MTLCommandQueue> q = [[d newCommandQueue] autorelease];
 	const char *flips = getenv("A04S_CA_FLIP_SCENES"), *stats = getenv("A04S_PASS_STATS_SCENES");
 	const int stats_was = getenv("A04S_PASS_STATS") != NULL;
+	if (stats && *stats)
+		remove_old_pass_pictures();
 	for (int n = 0; n < 7; n++)
 	for (int flip = 0; flip < 2; flip++) {
 		@autoreleasepool {
@@ -280,9 +332,9 @@ a04s_ca_scenes(id<MTLDevice> d, const char *mode, const char *only)
 				continue;
 			if (flip && !(flips && strstr(flips, tag)))
 				continue;
-			const char *fl = flip ? " (CPU textures flipped)" : "";
+			const char *fl = flip ? " (CPU texture rows as stored)" : "";
 			if (flip)
-				setenv("BGMTL_FLIP_CPU_TEXTURES", "1", 1);
+				setenv("BGMTL_FLIP_CPU_TEXTURES", "0", 1);
 			else
 				unsetenv("BGMTL_FLIP_CPU_TEXTURES");
 			if (stats) {
@@ -354,9 +406,16 @@ a04s_ca_scenes(id<MTLDevice> d, const char *mode, const char *only)
 				a04s_log("M6 RESULT %s ca scene 5 blurred reference: %s (diff %.2f, sigma %.1f)", mode,
 					 bd < 0 ? "NOT COMPARED" : bd < 4 ? "MATCH" : "DIFFERS", bd, sig);
 			}
-			if (n == 6 && nonzero && !flip)
-				a04s_log("  ca scene 6: the CPU reference draws no backdrop (blur and saturation under the panel); "
-					 "the panel is checked offline from the .bgra files");
+			if (n == 6 && nonzero && !flip) {
+				double dx = 0, dy = 0;
+				panel_structure(out, &dx, &dy);
+				const uint8_t *c = out + 4 * (128 * W + 128);
+				a04s_log("  ca scene 6: the CPU reference draws no backdrop (blur and saturation under the panel), so "
+					 "the panel is checked for its shape: mean change per channel to the next column %.2f, to the "
+					 "next row %.2f; centre BGRA %u %u %u %u", dx, dy, c[0], c[1], c[2], c[3]);
+				a04s_log("M6 RESULT %s ca scene 6 panel: %s (column change %.2f, row change %.2f)", mode,
+					 dx < 1 ? "FLAT (no stripes behind the panel)" : dy < dx / 4 ? "VERTICAL" : "SHEARED", dx, dy);
+			}
 			save(mode, flip ? "scene-flip" : "scene", n, out);
 			if (!flip)
 				save(mode, "ref", n, ref);

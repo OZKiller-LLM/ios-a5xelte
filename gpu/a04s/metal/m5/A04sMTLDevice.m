@@ -35,11 +35,11 @@ static const struct { uint64_t a; uint32_t b; const char *name; } a04s_target_in
  * (-[MTLLibrary newFunctionWithDescriptor:error:] with constantValues). Metal specialises through
  * the device's compiler, which this device does not have, so here the library's two specialising
  * calls are taken over for libraries of this device: the function comes back unspecialised, with
- * the values kept beside it (an associated object), and the pipeline hands them to libhakiosair
- * (rwa_set_function_constants), whose translator folds them. Libraries of any other device are
- * left to Metal. */
+ * the values kept beside it (since run 12 in a proxy of its own: see A04sSpecialisedFunction), and
+ * the pipeline hands them to libhakiosair (rwa_set_function_constants), whose translator folds
+ * them. Libraries of any other device are left to Metal. */
 
-static char a04s_fc_key;
+static char a04s_fc_key;   /* only with A04S_FC_PROXY=0 */
 
 /* bytes of one MTLDataType value; 0 for a type a function constant cannot have */
 static unsigned
@@ -107,6 +107,45 @@ a04s_base_function(id lib, NSString *name)
 static id (*a04s_orig_nfd)(id, SEL, id, NSError **);
 static id (*a04s_orig_nfncv)(id, SEL, id, id, NSError **);
 
+/* A04s (M6a run 12): one object per specialisation.
+ *
+ * Until run 11 the constants were an associated object on the function -newFunctionWithName: returned. Metal's library
+ * keeps one function object per name and hands that same object back each time, so every specialisation of, say,
+ * fixed_frag_lph_cpf was one object, and each new specialisation replaced the values of all the earlier ones.
+ * CoreAnimation keeps its specialised functions and builds further pipelines from them later. Those pipelines got
+ * whatever values came last. Run 11's scene 6 shows it: the tint over the backdrop panel (a plain colour, src-over)
+ * was built from the solid-colour function after the textured, saturating composite had been specialised. So it
+ * compiled as that composite, sampled the backdrop through texture coordinates CoreAnimation never meant to be read
+ * (the composite's corners, in another vertex order) and drew bands at 45 degrees over the panel.
+ *
+ * So each specialisation is now its own object: a proxy that forwards everything to the library's function and carries
+ * its own values. The device reaches a function only through messages (bitcodeData, name, functionConstantsDictionary),
+ * and the proxy forwards those. Pipelines whose functions have no constants still get the plain function. */
+@interface A04sSpecialisedFunction : NSProxy {
+@public
+   id _fn;
+   NSData *_k;
+}
+@end
+
+@implementation A04sSpecialisedFunction
+- (id)forwardingTargetForSelector:(SEL)s { (void)s; return _fn; }
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)s { return [_fn methodSignatureForSelector:s]; }
+- (void)forwardInvocation:(NSInvocation *)inv { [inv invokeWithTarget:_fn]; }
+- (BOOL)respondsToSelector:(SEL)s { return [_fn respondsToSelector:s]; }
+- (BOOL)isKindOfClass:(Class)c { return [_fn isKindOfClass:c]; }
+- (BOOL)isMemberOfClass:(Class)c { return [_fn isMemberOfClass:c]; }
+- (BOOL)conformsToProtocol:(Protocol *)p { return [_fn conformsToProtocol:p]; }
+- (NSString *)description { return [_fn description]; }
+- (NSString *)debugDescription { return [_fn debugDescription]; }
+- (void)dealloc
+{
+   [_fn release];
+   [_k release];
+   [super dealloc];
+}
+@end
+
 static id
 a04s_specialise(id lib, NSString *name, id cv, NSError **error)
 {
@@ -118,12 +157,20 @@ a04s_specialise(id lib, NSString *name, id cv, NSError **error)
                                   userInfo:@{ NSLocalizedDescriptionKey : [NSString stringWithFormat:@"no function %@", name] }];
       return nil;
    }
-   if (cv) {
-      NSData *k = a04s_constants_for(fn, cv, name);
-      if (k)
-         objc_setAssociatedObject(fn, &a04s_fc_key, k, OBJC_ASSOCIATION_RETAIN);
+   NSData *k = cv ? a04s_constants_for(fn, cv, name) : nil;
+   if (!k)
+      return fn;
+   /* A04S_FC_PROXY=0: the run 11 way (values on the shared object), should something reach into a proxy's internals */
+   const char *px = getenv("A04S_FC_PROXY");
+   if (px && px[0] == '0') {
+      objc_setAssociatedObject(fn, &a04s_fc_key, k, OBJC_ASSOCIATION_RETAIN);
+      return fn;
    }
-   return fn;
+   /* the caller owns what this returns (new...), and the proxy takes over the reference to fn */
+   A04sSpecialisedFunction *p = [A04sSpecialisedFunction alloc];
+   p->_fn = fn;
+   p->_k = [k retain];
+   return p;
 }
 
 static id
@@ -146,7 +193,9 @@ a04s_nfncv(id lib, SEL cmd, NSString *name, MTLFunctionConstantValues *cv, NSErr
 static void
 a04s_apply_constants(struct rwa_device *rwa, unsigned stage, id fn)
 {
-   NSData *k = fn ? objc_getAssociatedObject(fn, &a04s_fc_key) : nil;
+   NSData *k = !fn ? nil
+             : object_getClass(fn) == [A04sSpecialisedFunction class] ? ((A04sSpecialisedFunction *)fn)->_k
+                                                                   : objc_getAssociatedObject(fn, &a04s_fc_key);
    rwa_set_function_constants(rwa, stage, k.bytes, (unsigned)(k.length / sizeof(struct rwa_constant)));
 }
 
