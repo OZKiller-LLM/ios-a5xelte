@@ -404,15 +404,179 @@ test_qc_downsample(id<MTLDevice> dev, id<MTLCommandQueue> q, const char *mode)
 	}
 }
 
+/* ---- run 8: QuartzCore's halves swapped one at a time with m5's look-alikes --------------------------
+ *
+ * Run 7: m5's ds_like_fs samples a texture in slot 3 with buffers 1 and 6 correctly, and QuartzCore's
+ * own pair writes nothing, from a CPU-filled source and from a GPU-cleared one alike. Here every case
+ * samples the same private 258x258 source the GPU cleared to the colour (border included, so any
+ * coordinate that is a number reads the colour) into a 68x68 target cleared to a SENTINEL, so the
+ * target says which of three things happened:
+ *   colour    the pair works
+ *   sentinel  nothing was drawn there (no primitive reached those pixels, or every fragment was killed)
+ *   zero      fragments ran and wrote zero (the texture read zero, or the weights did)
+ *
+ *   mix-qc-qc           QuartzCore's vertex + QuartzCore's fragment (run 7's qc-ds-gpu, with the sentinel)
+ *   mix-qcvs-m5fs       QuartzCore's vertex + m5's ds_q_fs
+ *   mix-m5vs-qcfs       m5's ds_q_quad_vs (no attributes) + QuartzCore's fragment
+ *   mix-m5attr-m5fs     m5's ds_q_attr_vs (QuartzCore's vertex interface) + m5's ds_q_fs
+ *   mix-m5vs-m5fs       m5's ds_q_quad_vs + ds_q_fs: the control, with the 258 source and the 68 target
+ */
+static const uint8_t SENT_BGRA[4] = { 0x30, 0x20, 0x10, 0x40 };   /* clear (r .0625, g .125, b .1875, a .25) */
+
+static bool
+near4(const uint8_t *p, const uint8_t *w)
+{
+	for (int c = 0; c < 4; c++)
+		if (abs((int)p[c] - (int)w[c]) > 3)
+			return false;
+	return true;
+}
+
+static void
+test_mix(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLLibrary> m5, const char *mode)
+{
+	id<MTLLibrary> qc = qc_library(dev);
+	if (!qc)
+		a04s_log("  sample: QuartzCore's library did not load; only the m5 pairs run");
+
+	MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+	const MTLVertexFormat fmts[4] = { MTLVertexFormatFloat4, MTLVertexFormatFloat2, MTLVertexFormatFloat2, MTLVertexFormatHalf4 };
+	const NSUInteger offs[4] = { 0, 16, 24, 32 };
+	for (int i = 0; i < 4; i++) {
+		vd.attributes[i].format = fmts[i];
+		vd.attributes[i].offset = offs[i];
+		vd.attributes[i].bufferIndex = 1;
+	}
+	vd.layouts[1].stride = 48;
+	vd.layouts[1].stepFunction = MTLVertexStepFunctionPerVertex;
+	vd.layouts[1].stepRate = 1;
+
+	struct vtx { float pos[4]; float tc0[2]; float tc1[2]; __fp16 col[4]; float pad[2]; } v[4] = {
+		{ { -1, -1, 0, 1 }, { -3, -3 }, { 0, 0 }, { 0, 0, 0, 0 }, { 0, 0 } },
+		{ { 65, -1, 0, 1 }, { 261, -3 }, { 0, 0 }, { 0, 0, 0, 0 }, { 0, 0 } },
+		{ { 65, 65, 0, 1 }, { 261, 261 }, { 0, 0 }, { 0, 0, 0, 0 }, { 0, 0 } },
+		{ { -1, 65, 0, 1 }, { -3, 261 }, { 0, 0 }, { 0, 0, 0, 0 }, { 0, 0 } },
+	};
+	const uint16_t idx[6] = { 0, 1, 2, 2, 3, 0 };
+	const float mvp[16] = { 2.0f / 68, 0, 0, 0, 0, -2.0f / 68, 0, 0, 0, 0, 0, 0, -64.0f / 68, 64.0f / 68, 0, 1 };
+	const float texmat[4] = { 1.0f / 258, 1.0f / 258, 0, 0 };
+	struct { float off[8]; float unused[8]; __fp16 w[4]; __fp16 unused2[4]; } u;
+	memset(&u, 0, sizeof(u));
+	const float d = 0.5f / 258;
+	const float o[8] = { -d, -d, d, -d, -d, d, d, d };
+	memcpy(u.off, o, sizeof(o));
+	for (int k = 0; k < 4; k++)
+		u.w[k] = (__fp16)0.25f;
+	const __fp16 edr = (__fp16)1.0f;
+	id<MTLBuffer> vb = [[dev newBufferWithBytes:v length:sizeof(v) options:MTLResourceStorageModeShared] autorelease];
+	id<MTLBuffer> ib = [[dev newBufferWithBytes:idx length:sizeof(idx) options:MTLResourceStorageModeShared] autorelease];
+	id<MTLSamplerState> smp = sampler(dev, MTLSamplerMinMagFilterLinear);
+
+	static const struct {
+		const char *name, *vs, *fs;
+		bool qc_vs, qc_fs, attrs;
+	} cases[] = {
+		{ "mix-qc-qc", "downsample_blur_vert_lph", "downsample_4_frag_lph", true, true, true },
+		{ "mix-qcvs-m5fs", "downsample_blur_vert_lph", "ds_q_fs", true, false, true },
+		{ "mix-m5vs-qcfs", "ds_q_quad_vs", "downsample_4_frag_lph", false, true, false },
+		{ "mix-m5attr-m5fs", "ds_q_attr_vs", "ds_q_fs", false, false, true },
+		{ "mix-m5vs-m5fs", "ds_q_quad_vs", "ds_q_fs", false, false, false },
+	};
+	for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+		const char *name = cases[c].name;
+		id<MTLLibrary> vl = cases[c].qc_vs ? qc : m5, fl = cases[c].qc_fs ? qc : m5;
+		if (!vl || !fl) {
+			result(mode, name, false, "QuartzCore's library did not load");
+			continue;
+		}
+		MTLRenderPipelineDescriptor *pd = [[[MTLRenderPipelineDescriptor alloc] init] autorelease];
+		pd.vertexFunction = [[vl newFunctionWithName:@(cases[c].vs)] autorelease];
+		pd.fragmentFunction = [[fl newFunctionWithName:@(cases[c].fs)] autorelease];
+		pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+		if (cases[c].attrs)
+			pd.vertexDescriptor = vd;
+		NSError *err = nil;
+		double t0 = a04s_now();
+		id<MTLRenderPipelineState> ps = pd.vertexFunction && pd.fragmentFunction
+			? [[dev newRenderPipelineStateWithDescriptor:pd error:&err] autorelease] : nil;
+		a04s_log("  sample: pipeline %s + %s: %s in %.1f s%s%s", cases[c].vs, cases[c].fs, ps ? "made" : "nil",
+			 a04s_now() - t0, err ? ", error: " : "", err ? err.localizedDescription.UTF8String : "");
+		id<MTLTexture> src = tex2d(dev, MTLPixelFormatBGRA8Unorm, 258, 258, MTLStorageModePrivate,
+					   MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+		id<MTLTexture> dst = tex2d(dev, MTLPixelFormatBGRA8Unorm, 68, 68, MTLStorageModeShared,
+					   MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+		if (!ps || !src || !dst || !smp) {
+			result(mode, name, false, "setup: pipeline %d textures %d %d sampler %d", !!ps, !!src, !!dst, !!smp);
+			continue;
+		}
+		id<MTLCommandBuffer> cb = [q commandBuffer];
+		id<MTLRenderCommandEncoder> e0 = [cb renderCommandEncoderWithDescriptor:pass(src, MTLLoadActionClear,
+							MTLClearColorMake(0.25, 0.5, 0.75, 1))];
+		[e0 endEncoding];
+		id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass(dst, MTLLoadActionClear,
+							MTLClearColorMake(0.0625, 0.125, 0.1875, 0.25))];
+		[enc setRenderPipelineState:ps];
+		[enc setViewport:(MTLViewport){ 0, 0, 68, 68, 0, 1 }];
+		[enc setScissorRect:(MTLScissorRect){ 0, 0, 68, 68 }];
+		/* every binding either half might read, whichever pair this is */
+		[enc setVertexBuffer:vb offset:0 atIndex:1];
+		[enc setVertexBytes:mvp length:sizeof(mvp) atIndex:2];
+		[enc setVertexBytes:texmat length:sizeof(texmat) atIndex:3];
+		[enc setFragmentTexture:src atIndex:3];
+		[enc setFragmentSamplerState:smp atIndex:0];
+		[enc setFragmentBytes:&u length:sizeof(u) atIndex:1];
+		[enc setFragmentBytes:&edr length:sizeof(edr) atIndex:6];
+		if (cases[c].attrs)
+			[enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:6 indexType:MTLIndexTypeUInt16 indexBuffer:ib indexBufferOffset:0];
+		else
+			[enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+		[enc endEncoding];
+		run(cb, name);
+		static uint8_t px[68 * 68 * 4];
+		[dst getBytes:px bytesPerRow:68 * 4 fromRegion:MTLRegionMake2D(0, 0, 68, 68) mipmapLevel:0];
+		/* the inner 60x60, inside both quads: how many are the colour, the sentinel, zero, other */
+		unsigned ncol = 0, nsent = 0, nzero = 0, nother = 0;
+		static const uint8_t ZERO[4] = { 0, 0, 0, 0 };
+		for (unsigned y = 4; y < 64; y++)
+			for (unsigned x = 4; x < 64; x++) {
+				const uint8_t *p = px + 4 * (y * 68 + x);
+				if (near4(p, COL_BGRA)) ncol++;
+				else if (near4(p, SENT_BGRA)) nsent++;
+				else if (near4(p, ZERO)) nzero++;
+				else nother++;
+			}
+		const uint8_t *a = px + 4 * (34 * 68 + 34), *b = px + 4 * (1 * 68 + 1);
+		const char *verdict = ncol == 3600 ? "colour" : nsent == 3600 ? "SENTINEL: nothing drawn" :
+				      nzero == 3600 ? "ZERO: fragments wrote zero" : "MIXED";
+		result(mode, name, ncol == 3600 && cb.status == MTLCommandBufferStatusCompleted,
+		       "%s; inner 3600: %u colour, %u sentinel, %u zero, %u other; (34,34) %02x%02x%02x%02x want %02x%02x%02x%02x; (1,1) %02x%02x%02x%02x",
+		       verdict, ncol, nsent, nzero, nother, a[0], a[1], a[2], a[3], COL_BGRA[0], COL_BGRA[1], COL_BGRA[2], COL_BGRA[3],
+		       b[0], b[1], b[2], b[3]);
+		char path[128];
+		snprintf(path, sizeof(path), "/private/var/a04s/m6-%s-%s-68x68.bgra", mode, name);
+		FILE *f = fopen(path, "wb");
+		if (f) {
+			fwrite(px, 1, sizeof(px), f);
+			fclose(f);
+		}
+	}
+}
+
+/* A04S_M6_SAMPLING=1: run 7's ladder and run 8's matrix; =2: the matrix alone */
 int
 a04s_m6_sampling(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLLibrary> core, id<MTLLibrary> m5, const char *mode)
 {
 	g_bad = 0;
+	const char *sel = getenv("A04S_M6_SAMPLING");
+	bool matrix_only = sel && sel[0] == '2';
 	@autoreleasepool {
-		test_blit(dev, q, core, mode);
-		test_blit_gpu(dev, q, core, mode);
-		test_ds_like(dev, q, m5, mode);
-		test_qc_downsample(dev, q, mode);
+		if (!matrix_only) {
+			test_blit(dev, q, core, mode);
+			test_blit_gpu(dev, q, core, mode);
+			test_ds_like(dev, q, m5, mode);
+			test_qc_downsample(dev, q, mode);
+		}
+		test_mix(dev, q, m5, mode);
 	}
 	return g_bad;
 }

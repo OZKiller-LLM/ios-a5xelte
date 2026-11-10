@@ -65,3 +65,49 @@ fragment half4 ds_like_fs(DsOut in [[stage_in]],
         acc += src.sample(smp, in.uv + taps.offset[k], level(0)) * taps.weight[k];
     return half4(acc.rgb * scale, acc.a);
 }
+
+// M6a run 8: the interface of QuartzCore's downsample_blur_vert_lph + downsample_4_frag_lph,
+// written here from its reflected shape (names, attribute and buffer indices) so each half can be
+// paired with QuartzCore's other half on the phone. The varying is named texcoord0 so that it
+// links with QuartzCore's fragment function as theirs does.
+struct DsQOut {
+    float4 position [[position]];
+    float2 texcoord0;
+};
+
+vertex DsQOut ds_q_quad_vs(uint vid [[vertex_id]])
+{
+    const float2 corners[4] = { float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1) };
+    DsQOut o;
+    o.position = float4(corners[vid], 0.0f, 1.0f);
+    o.texcoord0 = corners[vid] * float2(0.5f, -0.5f) + 0.5f;
+    return o;
+}
+
+struct DsQIn {
+    float4 position [[attribute(0)]];
+    float2 texcoord0 [[attribute(1)]];
+    half4 color [[attribute(3)]];
+};
+
+vertex DsQOut ds_q_attr_vs(DsQIn in [[stage_in]],
+                           constant float4x4 *mvp_matrix [[buffer(2)]],
+                           constant float4 &texmat0 [[buffer(3)]])
+{
+    DsQOut o;
+    o.position = mvp_matrix[0] * in.position;
+    o.texcoord0 = in.texcoord0 * texmat0.xy + texmat0.zw;
+    return o;
+}
+
+fragment half4 ds_q_fs(DsQOut in [[stage_in]],
+                       texture2d<half> src [[texture(3)]],
+                       sampler smp [[sampler(0)]],
+                       constant DsTaps &taps [[buffer(1)]],
+                       constant half &scale [[buffer(6)]])
+{
+    half4 acc = half4(0.0h);
+    for (int k = 0; k < 4; k++)
+        acc += src.sample(smp, in.texcoord0 + taps.offset[k], level(0)) * taps.weight[k];
+    return half4(acc.rgb * scale, acc.a);
+}
