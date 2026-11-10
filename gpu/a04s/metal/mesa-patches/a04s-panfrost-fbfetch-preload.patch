@@ -1,0 +1,36 @@
+A04s (Metal track M6a): preload the colour targets a fragment shader reads.
+
+CoreAnimation's Metal renderer keeps a layer's clip and mask in a second colour attachment and reads both
+attachments back in the shader (framebuffer fetch, [[color(n)]]): a draw with colour mask 0 on one target
+copies it into the other, and a later draw reads that copy. libhakiosair flushes before each fetching draw
+(texture_barrier), so such a draw starts a batch. Panfrost preloads a target's tile only when the batch
+draws to it or has it in batch->read, and batch->read is set for depth and stencil only. A target that is
+read but not written (colour mask 0) was not preloaded, the fetch read an empty tile, and on the A04s the
+rounded clip's corners came out transparent and a shape mask hid its layer (run 10, scenes 3 and 4).
+Mesa 25.0.7. Ours, under Mesa's licence for the file it changes (MIT).
+
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.c
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.c
+@@ -2885,6 +2885,22 @@
+    if (dirty & PAN_DIRTY_ZS)
+       panfrost_set_batch_masks_zs(batch);
+ 
++   /* A04s (Metal track M6a): a fragment shader that reads a colour target
++    * (framebuffer fetch, LD_TILE) needs that target's tile preloaded even
++    * when this draw does not write it (colour mask 0). batch->read is never
++    * set for colour otherwise, so such a target was preloaded only if some
++    * draw of the batch also wrote it, and the fetch read an empty tile. */
++   {
++      const struct panfrost_compiled_shader *fs = ctx->prog[PIPE_SHADER_FRAGMENT];
++
++      if (fs && fs->info.fs.outputs_read) {
++         u_foreach_bit(i, fs->info.fs.outputs_read & BITFIELD_MASK(batch->key.nr_cbufs)) {
++            if (batch->key.cbufs[i])
++               batch->read |= PIPE_CLEAR_COLOR0 << i;
++         }
++      }
++   }
++
+ #if PAN_ARCH >= 9
+    if ((dirty & (PAN_DIRTY_ZS | PAN_DIRTY_RASTERIZER)) ||
+        (ctx->dirty_shader[PIPE_SHADER_FRAGMENT] & PAN_DIRTY_STAGE_SHADER))

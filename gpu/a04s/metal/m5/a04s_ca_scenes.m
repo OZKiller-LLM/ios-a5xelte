@@ -254,19 +254,44 @@ frame(CARenderer *r, id<MTLCommandQueue> q)
 	return a04s_now() - t0;
 }
 
-/* Returns how many scenes drew nothing or were refused. `only`: a comma list of scene numbers, or NULL for all. */
+/*
+ * Returns how many scenes drew nothing or were refused. `only`: a comma list of scene numbers, or NULL for all.
+ *
+ * A04s (M6a run 11), two lists in the environment:
+ * - A04S_CA_FLIP_SCENES: each of these scenes is drawn a second time with BGMTL_FLIP_CPU_TEXTURES=1, which makes the
+ *   device write CPU-drawn textures' rows in reverse order (run 10 drew scenes 1 and 2 upside down). Its files are
+ *   m6-<mode>-scene-flipN.bgra.
+ * - A04S_PASS_STATS_SCENES: A04S_PASS_STATS is set only while these scenes draw, so the 24 pass pictures the device
+ *   writes are theirs.
+ */
 int
 a04s_ca_scenes(id<MTLDevice> d, const char *mode, const char *only)
 {
 	int bad = 0, done = 0;
 	id<MTLCommandQueue> q = [[d newCommandQueue] autorelease];
-	for (int n = 0; n < 7; n++) {
+	const char *flips = getenv("A04S_CA_FLIP_SCENES"), *stats = getenv("A04S_PASS_STATS_SCENES");
+	const int stats_was = getenv("A04S_PASS_STATS") != NULL;
+	for (int n = 0; n < 7; n++)
+	for (int flip = 0; flip < 2; flip++) {
 		@autoreleasepool {
 			char tag[8];
 			snprintf(tag, sizeof(tag), "%d", n);
 			if (only && !strstr(only, tag))
 				continue;
-			a04s_log("  ca scene %d: start", n);
+			if (flip && !(flips && strstr(flips, tag)))
+				continue;
+			const char *fl = flip ? " (CPU textures flipped)" : "";
+			if (flip)
+				setenv("BGMTL_FLIP_CPU_TEXTURES", "1", 1);
+			else
+				unsetenv("BGMTL_FLIP_CPU_TEXTURES");
+			if (stats) {
+				if (strstr(stats, tag))
+					setenv("A04S_PASS_STATS", "1", 1);
+				else
+					unsetenv("A04S_PASS_STATS");
+			}
+			a04s_log("  ca scene %d%s: start", n, fl);
 			CALayer *scene = make_scene(n);
 
 			/* the reference: CoreAnimation's CPU path into a bitmap, BGRA as the texture */
@@ -310,11 +335,14 @@ a04s_ca_scenes(id<MTLDevice> d, const char *mode, const char *only)
 				if (out[i])
 					nonzero++;
 			}
-			a04s_log("  ca scene %d: first frame %.2f s, second %.3f s; mean abs diff %.2f, %u of %d channels off by "
-				 "more than 32, %u non-zero bytes", n, first, second, sum / (W * H * 4), far, W * H * 4, nonzero);
-			a04s_log("M6 RESULT %s ca scene %d: %s (diff %.2f)", mode, n,
-				 !nonzero ? "NOTHING DRAWN" : sum / (W * H * 4) < 8 ? "MATCH" : "DIFFERS", sum / (W * H * 4));
-			if (n == 5 && nonzero) {
+			a04s_log("  ca scene %d%s: first frame %.2f s, second %.3f s; mean abs diff %.2f, %u of %d channels off by "
+				 "more than 32, %u non-zero bytes", n, fl, first, second, sum / (W * H * 4), far, W * H * 4, nonzero);
+			/* A04s (M6a run 11): MATCH needs few far-off channels as well as a small mean. Run 10's scene 3 had square
+			 * corners where the rounded clip belonged and still averaged 2.19 (5447 channels off by more than 32). */
+			a04s_log("M6 RESULT %s ca scene %d%s: %s (diff %.2f, %u channels off by more than 32)", mode, n, fl,
+				 !nonzero ? "NOTHING DRAWN" : sum / (W * H * 4) < 8 && far < W * H * 4 / 400 ? "MATCH" : "DIFFERS",
+				 sum / (W * H * 4), far);
+			if (n == 5 && nonzero && !flip) {
 				double sig = 0;
 				unsigned px = 0;
 				const double bd = blur_check(out, ref, &sig, &px);
@@ -326,17 +354,25 @@ a04s_ca_scenes(id<MTLDevice> d, const char *mode, const char *only)
 				a04s_log("M6 RESULT %s ca scene 5 blurred reference: %s (diff %.2f, sigma %.1f)", mode,
 					 bd < 0 ? "NOT COMPARED" : bd < 4 ? "MATCH" : "DIFFERS", bd, sig);
 			}
-			if (n == 6 && nonzero)
+			if (n == 6 && nonzero && !flip)
 				a04s_log("  ca scene 6: the CPU reference draws no backdrop (blur and saturation under the panel); "
 					 "the panel is checked offline from the .bgra files");
-			save(mode, "scene", n, out);
-			save(mode, "ref", n, ref);
+			save(mode, flip ? "scene-flip" : "scene", n, out);
+			if (!flip)
+				save(mode, "ref", n, ref);
 			if (!nonzero)
 				bad++;
 			done++;
 			free(out);
 			free(ref);
 		}
+	}
+	unsetenv("BGMTL_FLIP_CPU_TEXTURES");
+	if (stats) {
+		if (stats_was)
+			setenv("A04S_PASS_STATS", "1", 1);
+		else
+			unsetenv("A04S_PASS_STATS");
 	}
 	a04s_log("  ca: %d scenes rendered, %d with nothing drawn or refused", done, bad);
 	return bad;

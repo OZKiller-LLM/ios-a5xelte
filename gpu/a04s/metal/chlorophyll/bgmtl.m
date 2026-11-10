@@ -353,6 +353,7 @@ bg_install_fallback(Class c)
    const void *_ncBytes; // newTextureWithBytesNoCopy: the caller's memory, refreshed from at each use like _linSrc
    NSUInteger _ncLength;
    void (^_ncDealloc)(void *, NSUInteger);
+   BOOL _cpuTraced;      // A04s (M6a run 11): the first refresh of a no-copy or linear texture was logged
 }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
@@ -1606,6 +1607,8 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 - (void)copyFromBuffer:(id)buf sourceOffset:(NSUInteger)so sourceBytesPerRow:(NSUInteger)bpr sourceBytesPerImage:(NSUInteger)bpi sourceSize:(MTLSize)size
              toTexture:(id)dst destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dorg
 {
+   BG_TRACE("blit buffer -> texture %p: %lux%lu at %lu,%lu, rows of %lu bytes from offset %lu\n", dst, (unsigned long)size.width,
+            (unsigned long)size.height, (unsigned long)dorg.x, (unsigned long)dorg.y, (unsigned long)bpr, (unsigned long)so);   // A04s (M6a run 11)
    BGWork *w = [[[BGWork alloc] init] autorelease];
    w->kind = BG_WORK_BUF2TEX; w->src = [buf retain]; w->dst = [dst retain]; w->src_off = so; w->t_bpr = bpr; w->t_bpi = bpi;
    w->t_dslice = ds; w->t_dlevel = dl; w->t_dorg[0] = dorg.x; w->t_dorg[1] = dorg.y; w->t_dorg[2] = dorg.z;
@@ -1765,24 +1768,44 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    return [self rwaTexture];
 }
 
+// A04s (M6a run 11): the rows of a CPU-drawn texture (no-copy or linear), written into _tex. Run 10 drew CoreAnimation's
+// image and text layers upside down, with the image's texture coordinate v = 1 at the top of its quad. With BGMTL_TRACE the
+// first refresh of each texture logs where its rows come from and the first pixel of its first and last rows, which shows
+// which way the memory runs. BGMTL_FLIP_CPU_TEXTURES=1 (read at each refresh) writes the rows in reverse order: a test.
+// Called with bg_lock held.
+- (void)a04sWriteCPURows:(const uint8_t *)src bytesPerRow:(size_t)bpr what:(const char *)what
+{
+   const unsigned w = _shape.width, h = _shape.height ? _shape.height : 1;
+   if (!_cpuTraced && bg_trace()) {
+      const uint8_t *z = src + bpr * (h - 1);
+      _cpuTraced = YES;
+      BG_LOG("%s texture %p %ux%u fmt %u: rows of %zu bytes; first row px0 %u %u %u %u, last row px0 %u %u %u %u\n", what, self,
+             w, h, _shape.pixel_format, bpr, src[0], src[1], src[2], src[3], z[0], z[1], z[2], z[3]);
+   }
+   const char *fl = getenv("BGMTL_FLIP_CPU_TEXTURES");
+   uint8_t *tmp = NULL;
+   if (fl && fl[0] == '1' && h > 1 && (tmp = malloc(bpr * h))) {
+      for (unsigned y = 0; y < h; y++)
+         memcpy(tmp + bpr * y, src + bpr * (h - 1 - y), bpr);
+      src = tmp;
+   }
+   char why[256] = { 0 };
+   const unsigned o[3] = { 0, 0, 0 }, sz[3] = { w, h, 1 };
+   if (rwa_texture_write(_tex, 0, 0, o, sz, src, (unsigned)bpr, why, sizeof(why)) != 0)
+      BG_LOG("%s texture refresh: %s\n", what, why);
+   free(tmp);
+}
+
 - (struct rwa_texture *)rwaTexture
 {
    if (_ncBytes && _tex) {
       bg_lock();
-      char why[256] = { 0 };
-      const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _shape.width, _shape.height, 1 };
-      if (rwa_texture_write(_tex, 0, 0, o, sz, (const uint8_t *)_ncBytes, (unsigned)(_ncLength / (_shape.height ? _shape.height : 1)),
-                            why, sizeof(why)) != 0)
-         BG_LOG("no-copy texture refresh: %s\n", why);
+      [self a04sWriteCPURows:(const uint8_t *)_ncBytes bytesPerRow:_ncLength / (_shape.height ? _shape.height : 1) what:"no-copy"];
       bg_unlock();
    }
    if (_linSrc && _tex) {
       bg_lock();
-      char why[256] = { 0 };
-      const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _shape.width, _shape.height, 1 };
-      if (rwa_texture_write(_tex, 0, 0, o, sz, (const uint8_t *)[(BGMTLBuffer *)_linSrc contents] + _linOff, (unsigned)_linBpr,
-                            why, sizeof(why)) != 0)
-         BG_LOG("linear texture refresh: %s\n", why);
+      [self a04sWriteCPURows:(const uint8_t *)[(BGMTLBuffer *)_linSrc contents] + _linOff bytesPerRow:_linBpr what:"linear"];
       bg_unlock();
    }
    return _tex;
