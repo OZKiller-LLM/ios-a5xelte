@@ -8,7 +8,10 @@
  * descriptor on /dev/null (Mesa dups and closes it); every call is ours.
  * BO mmap goes through herodrm_mmap() (Mesa's pan_kmod_bo_mmap is patched
  * to call it on Apple): MMAP_BO hands out handle << 32 as the offset.
- * Submit is synchronous in the kernel, so syncobjs are always signaled.
+ * Kernels up to v63: Submit is synchronous in the kernel, so syncobjs are
+ * always signaled. From v64 (A04s 7c-7a) the kernel has a scheduler, and
+ * submits, BO waits and syncobjs go to it (selectors 8-15; see "the kernel's
+ * scheduler" below). HERO_SCHED=0 keeps the synchronous path.
  *
  * Environment: HERODRM_HEAP_MB caps the tiler heap BO (default 32; the
  * kernel buffers are wired, Mesa asks for 128 MiB), HERODRM_DEBUG=1 logs
@@ -51,7 +54,19 @@ kern_return_t IOConnectCallMethod(io_connect_t connection, uint32_t selector,
 
 #define EXPORT __attribute__((visibility("default")))
 
-enum { SEL_PARAM, SEL_CREATE, SEL_FREE, SEL_MAP, SEL_SUBMIT, SEL_LOG, SEL_SURFACE_BO, SEL_SYNC_BO };
+enum { SEL_PARAM, SEL_CREATE, SEL_FREE, SEL_MAP, SEL_SUBMIT, SEL_LOG, SEL_SURFACE_BO, SEL_SYNC_BO,
+       /* v64 (A04s 7c-7a): a structure input (the Linux struct, then its u32 arrays), scalar outputs */
+       SEL_PAN_SUBMIT, SEL_PAN_WAIT_BO, SEL_PAN_MADVISE, SEL_SYNCOBJ_CREATE, SEL_SYNCOBJ_DESTROY,
+       SEL_SYNCOBJ_WAIT, SEL_SYNCOBJ_RESET, SEL_SYNCOBJ_SIGNAL };
+
+#define KR_BAD_ARGUMENT 0xe00002c2u     /* kIOReturnBadArgument */
+#define KR_UNSUPPORTED  0xe00002c7u     /* kIOReturnUnsupported: no scheduler (v63, or a04sgpu_sched=0) */
+#define KR_TIMEOUT      0xe00002d6u     /* kIOReturnTimeout */
+#define KR_ABORTED      0xe00002ebu     /* kIOReturnAborted: the waiting thread was interrupted */
+
+static int sched = -1;                  /* the kernel's scheduler: -1 not asked yet, 0 no, 1 yes */
+static unsigned max_submit_bos = 1024;  /* v64's limit per submit (HERODRM_MAX_SUBMIT_BOS for a later kernel) */
+static void sched_probe(void);
 
 #define MAX_BOS 4096
 
@@ -73,7 +88,9 @@ static uint64_t submits, faults;
  * kernel zeroes, cleans and maps every new buffer). */
 static struct {
    uint64_t start_ns, submits, gpu_us, submit_ns, creates, create_bytes, create_ns, frees;
+   uint64_t fences_made, fence_ns, waits, wait_ns;  /* v64: kernel syncobjs made (and the calls' time), syncobj waits */
 } st;
+static unsigned fences_live;            /* v64: kernel syncobjs this process holds now */
 
 EXPORT void herodrm_log(const char *fmt, ...);
 
@@ -99,6 +116,10 @@ stats_tick(uint64_t t)
                100.0 * st.gpu_us * 1e3 / wall, st.submit_ns / 1e6,
                (unsigned long long)st.creates, st.create_bytes / 1048576.0, st.create_ns / 1e6,
                (unsigned long long)st.frees);
+   if (sched == 1)
+      herodrm_log("stats (scheduler): %llu fences made in %.1f ms, %u live | %llu syncobj waits, %.1f ms waiting",
+                  (unsigned long long)st.fences_made, st.fence_ns / 1e6, fences_live,
+                  (unsigned long long)st.waits, st.wait_ns / 1e6);
    memset(&st, 0, sizeof(st));
    st.start_ns = t;
 }
@@ -162,6 +183,7 @@ connect_gpu(void)
       return -1;
    }
    DBG("connected");
+   sched_probe();
    return 0;
 }
 
@@ -460,10 +482,348 @@ bo_wait(uint32_t handle)
    pthread_mutex_unlock(&qlock);
 }
 
+/*
+ * ---- The kernel's scheduler (v64, A04s 7c-7a; this side is 7c-7d) ----
+ *
+ * Selectors 8-15 take the Linux struct from Mesa 25.0.7 with its u32 arrays
+ * inline after it (exact size) and answer in scalars. A submit returns at
+ * once; the kernel holds every BO it lists until the job ends, and orders jobs
+ * by the BOs they share (all count as written, as on Linux). Translated here:
+ *
+ * - timeouts: Mesa gives SyncobjWait an absolute CLOCK_MONOTONIC time, the
+ *   kernel takes a relative one (INT64_MAX is forever both ways). WAIT_BO only
+ *   ever gets 0 or INT64_MAX from Mesa, which mean the same either way.
+ * - errno: a WAIT_BO timeout is ETIMEDOUT (Mesa asserts ETIMEDOUT or EBUSY),
+ *   a SyncobjWait timeout ETIME, as on Linux.
+ * - sync files: Mesa makes each pipe fence by exporting its context's syncobj
+ *   to a sync file and importing that into a new syncobj, and the kernel has
+ *   neither sync files nor transfer. So Mesa's syncobj handles are ours: each
+ *   points at a `kfence`, a kernel syncobj holding one job's fence, shared by
+ *   reference. A submit with an out_sync makes a new kernel syncobj for the job
+ *   and points the handle at it; export, import and transfer copy references.
+ *   A sync file is a /dev/null descriptor that stands for one kfence.
+ * - waits drop the lock: other threads keep submitting meanwhile.
+ */
+#define MAX_IN_SYNCS 32
+#define MAX_USYNC 4096
+#define MAX_SYNCFILE 256
+
+struct kfence {
+   uint32_t ksync;      /* the kernel's syncobj, holding the job's fence */
+   uint32_t refs;
+};
+static struct kfence signaled_fence;     /* "already signaled": no kernel object (SIGNALED creates, Signal) */
+#define SIGNALED (&signaled_fence)
+
+static struct kfence *usync[MAX_USYNC + 1];  /* Mesa's syncobj handle n: NULL = no fence yet */
+static bool usync_used[MAX_USYNC + 1];
+static struct { int fd; struct kfence *f; } syncfiles[MAX_SYNCFILE];
+static unsigned syncfile_next;
+
+static uint32_t
+scall(uint32_t sel, const void *in, size_t size, uint64_t *out, uint32_t nout)
+{
+   uint32_t n = nout;
+   return IOConnectCallMethod(conn, sel, NULL, 0, in, size, out, out ? &n : NULL, NULL, NULL);
+}
+
+static void
+sched_probe(void)
+{
+   const char *e = getenv("HERO_SCHED"), *m = getenv("HERODRM_MAX_SUBMIT_BOS");
+   if (m && atoi(m) > 0)
+      max_submit_bos = (unsigned)atoi(m);
+   uint32_t kr = 0;
+   if (e && *e == '0') {
+      sched = 0;
+   } else {
+      /* a syncobj made and destroyed: v63, and v64 with a04sgpu_sched=0, answer kIOReturnUnsupported */
+      struct { uint32_t handle, flags; } c = { 0, 0 };
+      uint64_t h = 0;
+      kr = scall(SEL_SYNCOBJ_CREATE, &c, sizeof(c), &h, 1);
+      sched = kr == 0;
+      if (sched) {
+         struct { uint32_t handle, pad; } d = { (uint32_t)h, 0 };
+         scall(SEL_SYNCOBJ_DESTROY, &d, sizeof(d), NULL, 0);
+      }
+   }
+   herodrm_log("submits: %s", sched ? "the kernel's scheduler (selectors 8-15)"
+               : e && *e == '0' ? "synchronous (HERO_SCHED=0)"
+               : kr == KR_UNSUPPORTED ? "synchronous (the kernel has no scheduler)"
+                                      : "synchronous (the scheduler probe failed)");
+   if (!sched && kr && kr != KR_UNSUPPORTED)
+      herodrm_log("scheduler probe: SyncobjCreate returned 0x%x", kr);
+}
+
+static int64_t
+relative_ns(int64_t absolute)
+{
+   if (absolute == INT64_MAX)
+      return INT64_MAX;
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);    /* Mesa's os_time_get_nano: timespec_get(TIME_MONOTONIC) */
+   int64_t now = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+   return absolute > now ? absolute - now : 0;
+}
+
+static struct kfence *
+fence_ref(struct kfence *f)
+{
+   if (f && f != SIGNALED)
+      f->refs++;
+   return f;
+}
+
+static void
+fence_unref(struct kfence *f)
+{
+   if (!f || f == SIGNALED || --f->refs)
+      return;
+   struct { uint32_t handle, pad; } d = { f->ksync, 0 };
+   scall(SEL_SYNCOBJ_DESTROY, &d, sizeof(d), NULL, 0);
+   fences_live--;
+   free(f);
+}
+
+/* a kernel syncobj with no fence yet, for one job's out_sync */
+static struct kfence *
+fence_new(void)
+{
+   struct { uint32_t handle, flags; } c = { 0, 0 };
+   uint64_t h = 0;
+   uint64_t t0 = now_ns();
+   uint32_t kr = scall(SEL_SYNCOBJ_CREATE, &c, sizeof(c), &h, 1);
+   st.fence_ns += now_ns() - t0;
+   struct kfence *f = kr == 0 ? malloc(sizeof(*f)) : NULL;
+   if (!f) {
+      static unsigned told;
+      if (told++ < 8)
+         herodrm_log("SyncobjCreate failed: 0x%x (%u live)", kr, fences_live);
+      if (kr == 0) {
+         struct { uint32_t handle, pad; } d = { (uint32_t)h, 0 };
+         scall(SEL_SYNCOBJ_DESTROY, &d, sizeof(d), NULL, 0);
+      }
+      return NULL;
+   }
+   *f = (struct kfence){ .ksync = (uint32_t)h, .refs = 1 };
+   fences_live++;
+   st.fences_made++;
+   return f;
+}
+
+static bool
+usync_valid(uint32_t handle)
+{
+   return handle && handle <= MAX_USYNC && usync_used[handle];
+}
+
+/* points Mesa's handle at f (a reference the caller gives up) */
+static void
+usync_set(uint32_t handle, struct kfence *f)
+{
+   struct kfence *old = usync[handle];
+   usync[handle] = f;
+   fence_unref(old);
+}
+
+/* WAIT_BO and selector 7's wait; called without the lock. 0, or the kernel's return. */
+static uint32_t
+sched_wait_bo_call(uint32_t handle, int64_t timeout_ns)
+{
+   struct { uint32_t handle, pad; int64_t timeout_ns; } w = { handle, 0, timeout_ns };
+   uint32_t kr;
+   do
+      kr = scall(SEL_PAN_WAIT_BO, &w, sizeof(w), NULL, 0);
+   while (kr == KR_ABORTED);
+   return kr;
+}
+
+/* DRM_IOCTL_PANFROST_WAIT_BO; called with the lock held, which it drops while it waits */
+static int
+sched_wait_bo(struct drm_panfrost_wait_bo *w)
+{
+   int64_t t = w->timeout_ns;
+   if (t != 0 && t != INT64_MAX)
+      t = relative_ns(t);     /* Linux takes it as absolute */
+   pthread_mutex_unlock(&lock);
+   uint32_t kr = sched_wait_bo_call(w->handle, t);
+   pthread_mutex_lock(&lock);
+   if (kr == 0)
+      return 0;
+   if (kr == KR_TIMEOUT)
+      return fail(ETIMEDOUT);
+   herodrm_log("WAIT_BO %u: 0x%x", w->handle, kr);
+   return fail(EINVAL);
+}
+
+static int
+sched_madvise(struct drm_panfrost_madvise *m)
+{
+   uint64_t retained = 1;
+   uint32_t kr = scall(SEL_PAN_MADVISE, m, 12, &retained, 1);
+   m->retained = kr ? 1 : (uint32_t)retained;
+   return 0;
+}
+
+/* DRM_IOCTL_PANFROST_SUBMIT; called with the lock held */
+static int
+sched_submit(struct drm_panfrost_submit *s)
+{
+   if (s->bo_handle_count > max_submit_bos || s->in_sync_count > MAX_IN_SYNCS) {
+      herodrm_log("SUBMIT refused: %u BOs (the kernel takes %u), %u in_syncs (%u)", s->bo_handle_count,
+                  max_submit_bos, s->in_sync_count, MAX_IN_SYNCS);
+      return fail(EINVAL);
+   }
+   if (s->out_sync && !usync_valid(s->out_sync))
+      return fail(EINVAL);
+   uint8_t stack[4096], *buf = stack;
+   size_t most = 40 + 4u * (s->bo_handle_count + s->in_sync_count);
+   if (most > sizeof(stack) && !(buf = malloc(most)))
+      return fail(ENOMEM);
+
+   struct drm_panfrost_submit k = { .jc = s->jc, .bo_handle_count = s->bo_handle_count,
+                                    .requirements = s->requirements };
+   _Static_assert(sizeof(k) == 40, "drm_panfrost_submit is 40 bytes");
+   uint32_t *bo = (uint32_t *)(buf + 40), *in = bo + s->bo_handle_count;
+   if (s->bo_handle_count)
+      memcpy(bo, (const void *)(uintptr_t)s->bo_handles, 4u * s->bo_handle_count);
+   const uint32_t *ins = (const uint32_t *)(uintptr_t)s->in_syncs;
+   for (uint32_t i = 0; i < s->in_sync_count; i++) {
+      if (!usync_valid(ins[i])) {
+         if (buf != stack)
+            free(buf);
+         return fail(EINVAL);
+      }
+      struct kfence *f = usync[ins[i]];
+      if (f && f != SIGNALED)
+         in[k.in_sync_count++] = f->ksync;     /* signaled, or no fence: nothing to wait for */
+   }
+   struct kfence *done = NULL;
+   if (s->out_sync && !(done = fence_new())) {
+      if (buf != stack)
+         free(buf);
+      return fail(ENOMEM);
+   }
+   k.out_sync = done ? done->ksync : 0;
+   memcpy(buf, &k, 40);
+   size_t size = 40 + 4u * (k.bo_handle_count + k.in_sync_count);
+
+   /* this thread's write-combined writes of the chain land before another core starts the job */
+   __asm__ volatile ("dsb sy" ::: "memory");
+   uint64_t t0 = now_ns();
+   uint32_t kr = scall(SEL_PAN_SUBMIT, buf, size, NULL, 0);
+   uint64_t t1 = now_ns();
+   if (buf != stack)
+      free(buf);
+   submits++;
+   st.submits++;
+   st.submit_ns += t1 - t0;
+   stats_tick(t1);
+   if (kr) {
+      faults++;
+      if (faults <= 16 || debug > 0)
+         herodrm_log("SUBMIT #%llu jc 0x%llx (%s, %u BOs, %u in_syncs): 0x%x", (unsigned long long)submits,
+                     (unsigned long long)s->jc, s->requirements & PANFROST_JD_REQ_FS ? "fragment" : "vertex/tiler",
+                     k.bo_handle_count, k.in_sync_count, kr);
+      fence_unref(done);
+      return fail(kr == KR_BAD_ARGUMENT ? EINVAL : EIO);
+   }
+   DBG("SUBMIT #%llu jc 0x%llx req 0x%x: %u BOs, %u in_syncs, out %u", (unsigned long long)submits,
+       (unsigned long long)s->jc, s->requirements, k.bo_handle_count, k.in_sync_count, k.out_sync);
+   if (done)
+      usync_set(s->out_sync, done);
+   return 0;
+}
+
+/* drmSyncobjWait with the scheduler: takes and drops the lock itself */
+static int
+sched_syncobj_wait(const uint32_t *handles, unsigned count, int64_t timeout, unsigned flags, uint32_t *first)
+{
+   const bool all = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL;
+   if (!count || count > MAX_USYNC)
+      return fail(EINVAL);
+   struct kfence **held = calloc(count, sizeof(*held));
+   uint32_t *index = calloc(count, sizeof(*index));
+   uint8_t *buf = malloc(40 + 4u * count);
+   unsigned n = 0;
+   int r = 0;
+   if (!held || !index || !buf) {
+      r = fail(ENOMEM);
+      goto out;
+   }
+   pthread_mutex_lock(&lock);
+   for (unsigned i = 0; i < count; i++) {
+      if (!usync_valid(handles[i]) || !usync[handles[i]]) {
+         /* no fence: Linux says EINVAL without WAIT_FOR_SUBMIT, and Mesa's JM path never waits for a submit */
+         if (usync_valid(handles[i]) && debug > 0)
+            herodrm_log("SyncobjWait: syncobj %u has no fence (flags 0x%x)", handles[i], flags);
+         pthread_mutex_unlock(&lock);
+         r = fail(EINVAL);
+         goto out;
+      }
+      struct kfence *f = usync[handles[i]];
+      if (f == SIGNALED) {
+         if (!all) {
+            if (first)
+               *first = i;
+            pthread_mutex_unlock(&lock);
+            goto out;           /* r = 0 */
+         }
+         continue;
+      }
+      held[n] = fence_ref(f);
+      index[n] = i;
+      ((uint32_t *)(buf + 40))[n++] = f->ksync;
+   }
+   pthread_mutex_unlock(&lock);
+   if (!n) {
+      if (first)
+         *first = 0;
+      goto out;
+   }
+
+   struct { uint64_t handles; int64_t timeout_nsec; uint32_t count_handles, flags, first_signaled, pad;
+            uint64_t deadline_nsec; } w = { 0, 0, n, flags, 0, 0, 0 };
+   _Static_assert(sizeof(w) == 40, "drm_syncobj_wait is 40 bytes");
+   uint64_t got = 0, t0 = now_ns();
+   uint32_t kr;
+   do {
+      w.timeout_nsec = relative_ns(timeout);
+      memcpy(buf, &w, 40);
+      kr = scall(SEL_SYNCOBJ_WAIT, buf, 40 + 4u * n, &got, 1);
+   } while (kr == KR_ABORTED);
+   pthread_mutex_lock(&lock);
+   st.waits++;
+   st.wait_ns += now_ns() - t0;
+   pthread_mutex_unlock(&lock);
+   if (kr == 0) {
+      if (first)
+         *first = all || got >= n ? 0 : index[got];
+   } else if (kr == KR_TIMEOUT) {
+      r = fail(ETIME);
+   } else {
+      herodrm_log("SyncobjWait (%u syncobjs, flags 0x%x): 0x%x", n, flags, kr);
+      r = fail(EINVAL);
+   }
+out:
+   if (n) {
+      pthread_mutex_lock(&lock);
+      for (unsigned i = 0; i < n; i++)
+         fence_unref(held[i]);
+      pthread_mutex_unlock(&lock);
+   }
+   free(held);
+   free(index);
+   free(buf);
+   return r;
+}
+
 static int
 submit(struct drm_panfrost_submit *s)
 {
    static bool asked;
+   if (sched == 1)
+      return sched_submit(s);
    uint64_t js = (s->requirements & PANFROST_JD_REQ_FS) ? 0 : 1;
 
    if (!asked) {
@@ -538,6 +898,10 @@ drmIoctl(int fd, unsigned long request, void *arg)
       break;
    }
    case DRM_IOCTL_PANFROST_WAIT_BO:
+      if (sched == 1) {
+         r = sched_wait_bo(arg);       /* drops the lock while it waits */
+         break;
+      }
       /* Only the jobs that named this BO: an idle one can be reused at once from Mesa's cache. */
       if (((struct drm_panfrost_wait_bo *)arg)->timeout_ns == 0 &&
           bo_busy(((struct drm_panfrost_wait_bo *)arg)->handle))
@@ -546,7 +910,10 @@ drmIoctl(int fd, unsigned long request, void *arg)
          bo_wait(((struct drm_panfrost_wait_bo *)arg)->handle);
       break;
    case DRM_IOCTL_PANFROST_MADVISE:
-      ((struct drm_panfrost_madvise *)arg)->retained = 1;
+      if (sched == 1)
+         r = sched_madvise(arg);       /* the kernel's answer (v64: always retained) */
+      else
+         ((struct drm_panfrost_madvise *)arg)->retained = 1;
       break;
    case DRM_IOCTL_PANFROST_SUBMIT:
       r = submit(arg);
@@ -663,6 +1030,12 @@ herodrm_surface_import(uint32_t surface_id, struct herodrm_surface *info)
 EXPORT int
 herodrm_bo_sync(uint32_t handle)
 {
+   /* v64: selector 7 cleans at once, so first wait (without the lock) for the jobs that use the BO */
+   if (sched == 1 && conn) {
+      uint32_t kr = sched_wait_bo_call(handle, INT64_MAX);
+      if (kr)
+         herodrm_log("SYNC_BO %u: the wait for its jobs returned 0x%x", handle, kr);
+   }
    pthread_mutex_lock(&lock);
    queue_drain();
    uint64_t in = handle;
@@ -706,15 +1079,32 @@ drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
    return r;
 }
 
-/* Syncobjs: submits are synchronous, so every syncobj is signaled. */
+/* Syncobjs. Without the kernel's scheduler, submits are synchronous, so every
+ * syncobj is signaled. With it (sched == 1), see "the kernel's scheduler". */
 static uint32_t next_syncobj = 1;
 
 EXPORT int
 drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle)
 {
-   (void)fd; (void)flags;
+   (void)fd;
    pthread_mutex_lock(&lock);
-   *handle = next_syncobj++;
+   if (sched == 1) {
+      uint32_t h = 0;
+      for (uint32_t i = 1; i <= MAX_USYNC && !h; i++)
+         if (!usync_used[i])
+            h = i;
+      if (!h) {
+         pthread_mutex_unlock(&lock);
+         herodrm_log("SyncobjCreate: all %u handles in use", MAX_USYNC);
+         return fail(ENOMEM);
+      }
+      usync_used[h] = true;
+      usync[h] = flags & DRM_SYNCOBJ_CREATE_SIGNALED ? SIGNALED : NULL;
+      *handle = h;
+   } else {
+      (void)flags;
+      *handle = next_syncobj++;
+   }
    pthread_mutex_unlock(&lock);
    return 0;
 }
@@ -722,15 +1112,29 @@ drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle)
 EXPORT int
 drmSyncobjDestroy(int fd, uint32_t handle)
 {
-   (void)fd; (void)handle;
-   return 0;
+   (void)fd;
+   int r = 0;
+   pthread_mutex_lock(&lock);
+   if (sched == 1) {
+      if (usync_valid(handle)) {
+         usync_set(handle, NULL);
+         usync_used[handle] = false;
+      } else {
+         r = fail(EINVAL);
+      }
+   }
+   pthread_mutex_unlock(&lock);
+   return r;
 }
 
 EXPORT int
 drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles, int64_t timeout_nsec,
                unsigned flags, uint32_t *first_signaled)
 {
-   (void)fd; (void)handles; (void)num_handles; (void)timeout_nsec; (void)flags;
+   (void)fd;
+   if (sched == 1)
+      return sched_syncobj_wait(handles, num_handles, timeout_nsec, flags, first_signaled);
+   (void)handles; (void)num_handles; (void)timeout_nsec; (void)flags;
    queue_drain();
    if (first_signaled)
       *first_signaled = 0;
@@ -745,34 +1149,112 @@ drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points, unsigned num
    return drmSyncobjWait(fd, handles, num_handles, timeout_nsec, flags, first_signaled);
 }
 
+/* Reset (to no fence) or Signal (to signaled): with the scheduler, Mesa's handles are repointed here */
+static int
+usync_point_all(const uint32_t *handles, uint32_t count, struct kfence *to)
+{
+   int r = 0;
+   pthread_mutex_lock(&lock);
+   for (uint32_t i = 0; i < count; i++) {
+      if (usync_valid(handles[i]))
+         usync_set(handles[i], to);
+      else
+         r = fail(EINVAL);
+   }
+   pthread_mutex_unlock(&lock);
+   return r;
+}
+
 EXPORT int
 drmSyncobjReset(int fd, const uint32_t *handles, uint32_t handle_count)
 {
-   (void)fd; (void)handles; (void)handle_count;
+   (void)fd;
+   if (sched == 1)
+      return usync_point_all(handles, handle_count, NULL);
+   (void)handles; (void)handle_count;
    return 0;
 }
 
 EXPORT int
 drmSyncobjSignal(int fd, const uint32_t *handles, uint32_t handle_count)
 {
-   (void)fd; (void)handles; (void)handle_count;
+   (void)fd;
+   if (sched == 1)
+      return usync_point_all(handles, handle_count, SIGNALED);
+   (void)handles; (void)handle_count;
    return 0;
 }
 
+/* binary syncobjs only (points 0): dst takes src's fence */
 EXPORT int
 drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point, uint32_t src_handle,
                    uint64_t src_point, uint32_t flags)
 {
-   (void)fd; (void)dst_handle; (void)dst_point; (void)src_handle; (void)src_point; (void)flags;
-   return 0;
+   (void)fd; (void)flags;
+   if (sched != 1) {
+      (void)dst_handle; (void)dst_point; (void)src_handle; (void)src_point;
+      return 0;
+   }
+   if (dst_point || src_point)
+      return fail(EINVAL);
+   int r = 0;
+   pthread_mutex_lock(&lock);
+   if (usync_valid(dst_handle) && usync_valid(src_handle))
+      usync_set(dst_handle, fence_ref(usync[src_handle]));
+   else
+      r = fail(EINVAL);
+   pthread_mutex_unlock(&lock);
+   return r;
 }
 
-/* A sync file is a /dev/null descriptor: already signaled. (Mesa treats
- * -1 as a failed export and makes no fence.) */
+/* With the scheduler, a sync file's descriptor stands for a reference to one
+ * kfence until the descriptor is closed (Mesa closes it right after importing
+ * it). Descriptors closed meanwhile are swept here; with the lock held. */
+static void
+syncfile_sweep(void)
+{
+   for (unsigned i = 0; i < MAX_SYNCFILE; i++)
+      if (syncfiles[i].f && fcntl(syncfiles[i].fd, F_GETFD) == -1) {
+         fence_unref(syncfiles[i].f);
+         syncfiles[i].f = NULL;
+      }
+}
+
+/* A sync file is a /dev/null descriptor; without the scheduler, already
+ * signaled. (Mesa treats -1 as a failed export and makes no fence.) */
 EXPORT int
 drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd)
 {
-   (void)fd; (void)handle;
+   (void)fd;
+   if (sched == 1) {
+      pthread_mutex_lock(&lock);
+      if (!usync_valid(handle)) {
+         pthread_mutex_unlock(&lock);
+         return fail(EINVAL);
+      }
+      syncfile_sweep();
+      int sf = open("/dev/null", O_RDONLY | O_CLOEXEC);
+      if (sf < 0) {
+         pthread_mutex_unlock(&lock);
+         return -1;
+      }
+      unsigned slot = MAX_SYNCFILE;
+      for (unsigned i = 0; i < MAX_SYNCFILE && slot == MAX_SYNCFILE; i++)
+         if (!syncfiles[i].f || syncfiles[i].fd == sf)
+            slot = i;
+      if (slot == MAX_SYNCFILE) {        /* full of descriptors still open: drop the oldest */
+         slot = syncfile_next++ % MAX_SYNCFILE;
+         herodrm_log("sync files: all %u in use; one dropped", MAX_SYNCFILE);
+      }
+      fence_unref(syncfiles[slot].f);
+      /* no fence yet: Linux fails the export; signaled keeps Mesa's fence usable, as before v64 */
+      syncfiles[slot].f = usync[handle] ? fence_ref(usync[handle]) : SIGNALED;
+      syncfiles[slot].fd = sf;
+      *sync_file_fd = sf;
+      pthread_mutex_unlock(&lock);
+      return 0;
+   }
+   (void)handle;
    *sync_file_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
    return *sync_file_fd < 0 ? -1 : 0;
 }
@@ -780,15 +1262,43 @@ drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd)
 EXPORT int
 drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd)
 {
-   (void)fd; (void)handle; (void)sync_file_fd;
-   return 0;
+   (void)fd;
+   if (sched != 1) {
+      (void)handle; (void)sync_file_fd;
+      return 0;
+   }
+   int r = 0;
+   pthread_mutex_lock(&lock);
+   if (!usync_valid(handle)) {
+      r = fail(EINVAL);
+   } else {
+      struct kfence *f = NULL;
+      for (unsigned i = 0; i < MAX_SYNCFILE && !f; i++)
+         if (syncfiles[i].f && syncfiles[i].fd == sync_file_fd)
+            f = syncfiles[i].f;
+      if (!f) {                 /* not one of ours: nothing to wait for */
+         static unsigned told;
+         if (told++ < 4)
+            herodrm_log("ImportSyncFile: descriptor %d is not a sync file of this process; taken as signaled",
+                        sync_file_fd);
+         f = SIGNALED;
+      }
+      usync_set(handle, fence_ref(f));
+   }
+   pthread_mutex_unlock(&lock);
+   return r;
 }
 
 EXPORT int
 drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle)
 {
+   int r = drmSyncobjCreate(fd, 0, handle);
+   if (r == 0 && sched == 1 && drmSyncobjImportSyncFile(fd, *handle, obj_fd) != 0) {
+      drmSyncobjDestroy(fd, *handle);
+      return -1;
+   }
    (void)obj_fd;
-   return drmSyncobjCreate(fd, 0, handle);
+   return r;
 }
 
 EXPORT int
