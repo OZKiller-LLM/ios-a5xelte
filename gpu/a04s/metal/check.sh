@@ -194,9 +194,10 @@ hit_misses=$(grep -c '^rwa: front cache \(miss\|unreadable\)' fc-hit/stderr.log 
 echo "Metal front-end cache: first run $misses miss(es), $stored file(s) written; second run $hits hit(s), $hit_misses miss(es)"
 [ "$misses" -ge 1 ] && [ "$stored" -ge 1 ] && [ "$hits" -ge 1 ] && [ "$hit_misses" = 0 ] ||
 	fail "Metal front-end cache: expected a miss and a write, then only hits"
-# pandecode writes one file per frame (pandecode.dump.NNNN)
-cat fc-miss/pandecode.dump* > fc-miss.dump 2>/dev/null || true
-cat fc-hit/pandecode.dump* > fc-hit.dump 2>/dev/null || true
+# pandecode writes one file per frame (pandecode.dump.NNNN). Its "Shader <CPU address> (GPU VA ...)" lines name where
+# each process mapped the code, which ASLR moves between runs; that address is masked, the GPU addresses are not.
+cat fc-miss/pandecode.dump* 2>/dev/null | sed -E 's/^Shader 0x[0-9a-f]+ \(/Shader <cpu> (/' > fc-miss.dump || true
+cat fc-hit/pandecode.dump* 2>/dev/null | sed -E 's/^Shader 0x[0-9a-f]+ \(/Shader <cpu> (/' > fc-hit.dump || true
 if [ -s fc-miss.dump ] && cmp -s fc-miss.dump fc-hit.dump; then
 	echo "Metal front-end cache: the cached stage built the same chains ($(wc -l < fc-hit.dump) lines of pandecode, identical)"
 else
