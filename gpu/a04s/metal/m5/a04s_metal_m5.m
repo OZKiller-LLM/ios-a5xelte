@@ -121,17 +121,18 @@ bundle_current(void)
 	return n > 0;
 }
 
-static void
+/* true when a new build was copied in */
+static bool
 install_bundle(void)
 {
 	struct stat s;
 	if (stat(SRC_BUNDLE, &s) != 0) {
 		a04s_log("install: no %s (left as it is)", SRC_BUNDLE);
-		return;
+		return false;
 	}
 	if (bundle_current()) {
 		a04s_log("install: %s already holds this build", DST_BUNDLE);
-		return;
+		return false;
 	}
 	bool killed = stat(KILL, &s) == 0;
 	NSFileManager *fm = [NSFileManager defaultManager];
@@ -144,6 +145,7 @@ install_bundle(void)
 			close(fd);
 		a04s_log("install: the kill switch a04smetal.off was there and is kept");
 	}
+	return rc == 0;
 }
 
 /* ---- backboardd on Metal (M6b) ----------------------------------------------------------------
@@ -242,8 +244,10 @@ bb_permissions(void)
 		 bb_wanted() ? "1 (Metal)" : "not 1 (OpenGL ES)");
 }
 
+/* `installed`: this run copied a new build in, which a backboardd already on Metal has not loaded (it starts before the
+ * drop agent unpacks a package), so it is restarted too (M6b boot 2). */
 static void
-bb_restart_if_needed(void)
+bb_restart_if_needed(bool installed)
 {
 	const char *rs = getenv("A04S_BB_RESET");
 	if (rs && rs[0] == '1') {
@@ -267,11 +271,12 @@ bb_restart_if_needed(void)
 		a04s_log("bb: no backboardd running; nothing restarted");
 		return;
 	}
-	if ((bool)want == on_metal) {
+	if ((bool)want == on_metal && !(on_metal && installed)) {
 		a04s_log("bb: backboardd is already on the path the switch asks for; not restarted");
 		return;
 	}
-	a04s_log("bb: restarting backboardd (SIGTERM to pid %d) so that it starts on %s", pid, want ? "Metal" : "OpenGL ES");
+	a04s_log("bb: restarting backboardd (SIGTERM to pid %d) so that it starts on %s%s", pid, want ? "Metal" : "OpenGL ES",
+		 (bool)want == on_metal ? " with the device library just installed" : "");
 	kill(pid, SIGTERM);
 	for (unsigned i = 0; i < 90; i++) {
 		sleep(2);
@@ -647,7 +652,7 @@ main(int argc, char **argv)
 			return 0;
 		}
 		STEP("install");
-		install_bundle();
+		const bool installed = install_bundle();
 		NSError *err = nil;
 		NSBundle *b = [NSBundle bundleWithPath:@(DST_BUNDLE)];
 		BOOL loaded = [b loadAndReturnError:&err];
@@ -655,7 +660,7 @@ main(int argc, char **argv)
 			 err ? err.description.UTF8String : "");
 		STEP("backboardd");
 		bb_permissions();
-		bb_restart_if_needed();
+		bb_restart_if_needed(installed);
 		char self[PATH_MAX];
 		uint32_t size = sizeof(self);
 		if (_NSGetExecutablePath(self, &size) != 0)
