@@ -94,7 +94,7 @@ if [ ! -d "$SRC" ] || [ "$(cat "$SRC/.a04s-patches" 2>/dev/null)" != "$PATCHES" 
 	rm -rf "$SRC/src/compiler/air"
 	cp -r "$HERE/air" "$SRC/src/compiler/air"   # M6: the merged front end and library (air/NOTICE.md)
 	# M6b: the front end's identity, for its cache of translated stages (as m5/build-mesa-ios.sh)
-	echo "#define A04S_AIR_FRONT_ID \"$(cat "$HERE"/air/* | sha256sum | cut -c1-32)\"" > "$SRC/src/compiler/air/air_front_id.h"
+	echo "#define A04S_AIR_FRONT_ID \"$(ls "$HERE"/air/* | grep -v -e /air_metal_test.c -e /air2nir.c -e /NOTICE.md | xargs cat | sha256sum | cut -c1-32)\"" > "$SRC/src/compiler/air/air_front_id.h"
 	mkdir -p "$SRC/src/panfrost/drm-shim/hakios"
 	cp "$HK/mali-drmshim/hakios_mali_shim.c" "$HK/hakios.mali_va.h" "$SRC/src/panfrost/drm-shim/hakios/"
 	echo "$PATCHES" > "$SRC/.a04s-patches"
@@ -204,6 +204,22 @@ else
 	fail "Metal front-end cache: the chains differ between the translated and the cached stage, or none were dumped ($(diff fc-miss.dump fc-hit.dump | head -3 | tr '\n' ' '))"
 fi
 judge fc-hit "Metal front-end cache (cached run)"
+
+# M6b boot 6: a texture overwritten whole again and again (backboardd's linear textures over buffers, at every commit).
+# Panfrost turns such a texture linear in place after eight writes; a 416x258 A8 texture's linear layout does not fit
+# its tiled BO, and boot 5's backboardd died copying past it. mesa-patches/a04s-panfrost-linear-fit.patch keeps it tiled
+# (and says so); 448x258 fits and still turns linear. Both must read back as the last write.
+set +e
+on_mali stream-write "$AMT" --stream-write
+sw=$?
+set -e
+grep -h '^stream-write' stream-write/stdout.log | sed 's/^/Metal /'
+stayed=$(grep -c 'a 416x258 .* stays .*linear layout needs' stream-write/stderr.log || true)
+fit_stayed=$(grep -c 'a 448x258 .* stays ' stream-write/stderr.log || true)
+echo "Metal stream-write: Panfrost kept 416x258 as it was: $stayed line(s); 448x258: $fit_stayed line(s)"
+if [ "$sw" != 0 ] || [ "$(grep -c 'identical to the last' stream-write/stdout.log)" != 2 ] || [ "$stayed" = 0 ] || [ "$fit_stayed" != 0 ]; then
+	fail "Metal stream-write (exit $sw): $(grep -h 'stream-write\|air_metal_test' stream-write/stdout.log | tr '\n' ' ')"
+fi
 cd "$OUT"
 
 # M1b: our own Metal shaders (shaders/*.metal), compiled by Apple's Metal compiler on a macOS

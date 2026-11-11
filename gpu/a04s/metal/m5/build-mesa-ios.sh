@@ -64,7 +64,7 @@ if [ "$(cat mesa/.a04s-m5 2>/dev/null)" != "$STAMP" ]; then
 	rm -rf mesa/src/compiler/air
 	cp -R "$METAL/air" mesa/src/compiler/air   # M6: the merged front end and library (air/NOTICE.md)
 	# M6b: the front end's identity, for its cache of translated stages (air_metal.c, front_to_nir)
-	echo "#define A04S_AIR_FRONT_ID \"$(cat "$METAL"/air/* | shasum -a 256 | cut -c1-32)\"" > mesa/src/compiler/air/air_front_id.h
+	echo "#define A04S_AIR_FRONT_ID \"$(ls "$METAL"/air/* | grep -v -e /air_metal_test.c -e /air2nir.c -e /NOTICE.md | xargs cat | shasum -a 256 | cut -c1-32)\"" > mesa/src/compiler/air/air_front_id.h
 	echo "$STAMP" > mesa/.a04s-m5
 fi
 

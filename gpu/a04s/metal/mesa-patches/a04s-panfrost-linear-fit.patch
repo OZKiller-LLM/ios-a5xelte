@@ -1,0 +1,86 @@
+A04s (Metal track M6b boot 6): convert a texture to linear only when its linear layout fits its BO.
+
+A texture the processor overwrites whole LAYOUT_CONVERT_THRESHOLD (8) times is turned linear in place, in
+the BO it already has: the tiled one (u-interleaved), or the staging one of an AFBC write. Its comment says
+the conversion "shouldn't increase memory usage", and the assert that checks it is compiled out of a release
+build. It can: a linear row is aligned to 64 bytes, a tiled one only to 16 texels, so a 416x258 A8 texture
+needs 115,584 bytes linear and its tiled BO holds 114,688. backboardd rewrites its CPU-drawn textures at
+every commit (Metal's linear textures over buffers), reached the threshold within seconds, and died twice
+with a SIGSEGV in util_copy_rect, the conversion's copy running past the BO's mapping (M6b boot 5).
+
+A resource whose linear layout does not fit stays as it is (logged once per resource); one that fits converts
+as before. check.sh's stream-write test covers both. Mesa 25.0.7. Ours, under Mesa's licence for the file it
+changes (MIT).
+
+--- a/src/gallium/drivers/panfrost/pan_resource.c
++++ b/src/gallium/drivers/panfrost/pan_resource.c
+@@ -1651,6 +1651,48 @@
+    }
+ }
+ 
++/* A04s: whether this resource's linear layout fits in the BO that would hold it.
++ * The conversion keeps the BO it has (the tiled one, or the AFBC write's staging
++ * one), and "converting the resource from tiled to linear and back shouldn't
++ * increase memory usage" does not hold: a linear row is aligned to 64 bytes, a
++ * tiled one only to 16 texels, so a 416x258 R8 texture needs 115,584 bytes linear
++ * in a tiled BO of 114,688. The copy then ran past the BO's mapping (M6b boot 5:
++ * backboardd's SIGSEGV in util_copy_rect, twice). A resource whose linear layout
++ * does not fit stays as it is. */
++static bool
++panfrost_linear_fits(struct panfrost_device *dev, struct panfrost_resource *prsrc,
++                     struct panfrost_bo *bo)
++{
++   struct pan_image_layout linear = {
++      .modifier = DRM_FORMAT_MOD_LINEAR,
++      .format = prsrc->image.layout.format,
++      .dim = prsrc->image.layout.dim,
++      .width = prsrc->image.layout.width,
++      .height = prsrc->image.layout.height,
++      .depth = prsrc->image.layout.depth,
++      .array_size = prsrc->image.layout.array_size,
++      .nr_samples = prsrc->image.layout.nr_samples,
++      .nr_slices = prsrc->image.layout.nr_slices,
++      .crc = panfrost_should_checksum(dev, prsrc),
++   };
++
++   if (!bo || !pan_image_layout_init(dev->arch, &linear, NULL))
++      return false;
++
++   if (linear.data_size > panfrost_bo_size(bo)) {
++      if (prsrc->modifier_updates == LAYOUT_CONVERT_THRESHOLD)   /* once per resource */
++         mesa_logw("panfrost: a %ux%u %s stays %s: its linear layout needs %llu bytes, "
++                   "its BO holds %llu",
++                   linear.width, linear.height, util_format_short_name(linear.format),
++                   prsrc->image.layout.modifier == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED
++                      ? "tiled" : "compressed",
++                   (unsigned long long)linear.data_size,
++                   (unsigned long long)panfrost_bo_size(bo));
++      return false;
++   }
++   return true;
++}
++
+ static struct panfrost_bo *
+ panfrost_get_afbc_superblock_sizes(struct panfrost_context *ctx,
+                                    struct panfrost_resource *rsrc,
+@@ -1838,7 +1880,9 @@
+ 
+    if (trans->staging.rsrc) {
+       if (transfer->usage & PIPE_MAP_WRITE) {
+-         if (panfrost_should_linear_convert(ctx, prsrc, transfer)) {
++         if (panfrost_should_linear_convert(ctx, prsrc, transfer) &&
++             panfrost_linear_fits(dev, prsrc,
++                                  pan_resource(trans->staging.rsrc)->bo)) {
+ 
+             panfrost_bo_unreference(prsrc->bo);
+ 
+@@ -1877,7 +1921,8 @@
+ 
+          if (prsrc->image.layout.modifier ==
+              DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED) {
+-            if (panfrost_should_linear_convert(ctx, prsrc, transfer)) {
++            if (panfrost_should_linear_convert(ctx, prsrc, transfer) &&
++                panfrost_linear_fits(dev, prsrc, bo)) {
+                panfrost_resource_setup(screen, prsrc, DRM_FORMAT_MOD_LINEAR,
+                                        prsrc->image.layout.format);
+ 

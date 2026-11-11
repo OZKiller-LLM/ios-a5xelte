@@ -6215,6 +6215,74 @@ run_blend(const char *path, const char *func)
    return (wrong || refused_wrong || thin || !served) ? 1 : 0;
 }
 
+/* A04s (M6b boot 6): a texture the processor overwrites whole, again and again, as backboardd's linear textures over
+ * buffers are at every commit. After eight such writes Panfrost turns a tiled texture linear in place, keeping its BO;
+ * a linear row is aligned to 64 bytes and a tiled one only to 16 texels, so a 416x258 A8 texture's linear layout
+ * (115,584 bytes) is larger than its tiled BO (114,688) and the copy ran past it (boot 5's SIGSEGV in util_copy_rect).
+ * mesa-patches/a04s-panfrost-linear-fit.patch keeps such a texture tiled. Each size is written ten times, then read
+ * back and compared with the last write: 416x258 must stay tiled (Panfrost's warning says so), 448x258 fits and still
+ * turns linear. */
+static int
+run_stream_write(void)
+{
+   char why[512] = "";
+   struct rwa_device *device = rwa_device_open(why, sizeof(why));
+   if (!device) {
+      printf("air_metal_test: rwa_device_open: %s\n", why);
+      return 1;
+   }
+   static const unsigned sizes[][2] = { { 416, 258 }, { 448, 258 } };
+   int bad = 0;
+   for (unsigned s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++) {
+      const unsigned w = sizes[s][0], h = sizes[s][1];
+      const struct rwa_texture_shape ts = {
+         .pixel_format = 1 /* MTLPixelFormatA8Unorm */, .type = MTL_TEXTURE_TYPE_2D,
+         .width = w, .height = h, .depth = 1, .array_length = 1, .mip_levels = 1, .sample_count = 1,
+         .usage = MTL_USAGE_SHADER_READ,
+      };
+      struct rwa_texture *t = rwa_texture_create(device, &ts, why, sizeof(why));
+      uint8_t *src = malloc((size_t)w * h), *back = malloc((size_t)w * h);
+      if (!t || !src || !back) {
+         printf("air_metal_test: stream-write %ux%u: %s\n", w, h, t ? "no memory" : why);
+         return 1;
+      }
+      const unsigned origin[3] = { 0, 0, 0 }, extent[3] = { w, h, 1 };
+      const unsigned writes = 10;
+      for (unsigned i = 0; i < writes; i++) {
+         for (unsigned y = 0; y < h; y++)
+            for (unsigned x = 0; x < w; x++)
+               src[(size_t)y * w + x] = (uint8_t)(x * 7 + y * 13 + i * 29);
+         if (rwa_texture_write(t, 0, 0, origin, extent, src, w, why, sizeof(why)) != 0) {
+            printf("air_metal_test: stream-write %ux%u, write %u: %s\n", w, h, i, why);
+            return 1;
+         }
+      }
+      memset(back, 0, (size_t)w * h);
+      if (rwa_texture_read(t, 0, 0, origin, extent, back, w, why, sizeof(why)) != 0) {
+         printf("air_metal_test: stream-write %ux%u, read back: %s\n", w, h, why);
+         return 1;
+      }
+      size_t diff = 0, first = (size_t)-1;
+      for (size_t k = 0; k < (size_t)w * h; k++)
+         if (back[k] != src[k]) {
+            diff++;
+            if (first == (size_t)-1)
+               first = k;
+         }
+      if (diff)
+         printf("stream-write %ux%u A8: %u whole writes, read back: %zu of %u bytes differ (first at row %zu, column %zu)\n",
+                w, h, writes, diff, w * h, first / w, first % w);
+      else
+         printf("stream-write %ux%u A8: %u whole writes, read back: identical to the last\n", w, h, writes);
+      bad |= diff != 0;
+      free(src);
+      free(back);
+      rwa_texture_destroy(t);
+   }
+   rwa_device_close(device);
+   return bad;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -6228,6 +6296,8 @@ main(int argc, char **argv)
     * first: it is the answer a caller needs BEFORE it can make the textures the two
     * modes below make.
     */
+   if (argc >= 2 && !strcmp(argv[1], "--stream-write"))
+      return run_stream_write();
    if (argc >= 2 && !strcmp(argv[1], "--textures")) {
       if (argc < 3) {
          fprintf(stderr, "usage: air_metal_test --textures FILE.metallib [FUNCTION]\n");
