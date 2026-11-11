@@ -65,7 +65,9 @@ enum { SEL_PARAM, SEL_CREATE, SEL_FREE, SEL_MAP, SEL_SUBMIT, SEL_LOG, SEL_SURFAC
 #define KR_ABORTED      0xe00002ebu     /* kIOReturnAborted: the waiting thread was interrupted */
 
 static int sched = -1;                  /* the kernel's scheduler: -1 not asked yet, 0 no, 1 yes */
-static unsigned max_submit_bos = 1024;  /* v64's limit per submit (HERODRM_MAX_SUBMIT_BOS for a later kernel) */
+/* BOs per submit: v65 (7c-7b) takes 4096, v64 1024. A larger submit on v64 fails in the kernel with kIOReturnBadArgument,
+ * logged with its count below; HERODRM_MAX_SUBMIT_BOS=1024 refuses it here instead. */
+static unsigned max_submit_bos = 4096;
 static void sched_probe(void);
 
 #define MAX_BOS 4096
@@ -670,7 +672,7 @@ static int
 sched_submit(struct drm_panfrost_submit *s)
 {
    if (s->bo_handle_count > max_submit_bos || s->in_sync_count > MAX_IN_SYNCS) {
-      herodrm_log("SUBMIT refused: %u BOs (the kernel takes %u), %u in_syncs (%u)", s->bo_handle_count,
+      herodrm_log("SUBMIT refused: %u BOs (at most %u), %u in_syncs (%u)", s->bo_handle_count,
                   max_submit_bos, s->in_sync_count, MAX_IN_SYNCS);
       return fail(EINVAL);
    }
@@ -725,6 +727,8 @@ sched_submit(struct drm_panfrost_submit *s)
          herodrm_log("SUBMIT #%llu jc 0x%llx (%s, %u BOs, %u in_syncs): 0x%x", (unsigned long long)submits,
                      (unsigned long long)s->jc, s->requirements & PANFROST_JD_REQ_FS ? "fragment" : "vertex/tiler",
                      k.bo_handle_count, k.in_sync_count, kr);
+      if (kr == KR_BAD_ARGUMENT && k.bo_handle_count > 1024)
+         herodrm_log("  more than 1024 BOs: v64 takes no more (v65 takes 4096; HERODRM_MAX_SUBMIT_BOS=1024 on v64)");
       fence_unref(done);
       return fail(kr == KR_BAD_ARGUMENT ? EINVAL : EIO);
    }
