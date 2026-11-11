@@ -1139,10 +1139,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..b166bf7
+index 0000000..7f4483b
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
-@@ -0,0 +1,3010 @@
+@@ -0,0 +1,3293 @@
 +/*
 + * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
 + *
@@ -1605,6 +1605,7 @@ index 0000000..b166bf7
 +static LCK_MTX_DECLARE(a04s_gpu_mtx, &a04s_gpu_grp);
 +static uint32_t present_busy;
 +static uint32_t sched_hw_busy;  /* v64: job slots the scheduler has on the GPU (bit per slot); with a04s_gpu_mtx */
++static uint32_t sched_hw_as;    /* v65: the address spaces of those jobs (bit per AS); with a04s_gpu_mtx */
 +
 +static inline uint32_t
 +io_rd(vm_offset_t base, uint32_t off)
@@ -2635,14 +2636,33 @@ index 0000000..b166bf7
 + * close, once every user buffer's VA is back, powers the cores off again, unless the present path
 + * (sweetfb_gpu=1) is using them. Jobs the thermal limit refused are counted (HOT).
 + */
-+#define AS1                     (AS0 + 0x40u)
++/*
++ * v65 (7c-7b): one GPU address space per client. AS0 stays the kernel's (the present path, the boot
++ * tests); clients get AS1-AS7, as many as AS_PRESENT has. backboardd always gets AS1 (the display AS,
++ * never shared with another process); every other client gets a free AS of AS2-AS7, and once those
++ * are all taken the extras share the last one. An AS is free again only when its last client has gone,
++ * every buffer mapped in it is unmapped and no job of it is queued or running, so a new client never
++ * inherits a mapping. Each AS has its own 1 GiB of GPU VA (0x40000000-0x80000000, its own allocator)
++ * and its own L0, L1 and L2 tables at UPT_PA + (as - 1) * 0x3000; the L3 tables come from one pool of
++ * 744 pages after them (up to the self-test's buffer), and an AS gives its L3 tables back when it is
++ * released. A fault, or a job past its time, ends only the jobs of that AS; the other slot's job, in
++ * another AS, runs on. A recovery that fails puts only that AS out of service for the rest of the boot.
++ * user_page_ok() is unchanged: every page any AS maps is still checked to be XNU's RAM.
++ */
++#define AS_N(as)                (AS0 + 0x40u * (as))
++#define AS1                     AS_N(1u)                /* the boot self-test's */
 +#define AS_TRANSTAB_UNMAPPED    0u                      /* ADRMODE 0: every access faults */
-+#define AS1_FAULT_BITS          ((1u << 1) | (1u << 17))        /* AS1's page fault and bus fault */
++#define AS_FAULT_BITS(as)       ((1u << (as)) | (1u << (16u + (as))))   /* the AS's page fault and bus fault */
++#define AS1_FAULT_BITS          AS_FAULT_BITS(1u)
 +#define USER_STOP_US            100000u
 +#define GPU_AS_PRESENT          0x018u
++#define USER_AS_LAST            7u                      /* AS1-AS7 for clients */
++#define USER_AS_DISPLAY         1u                      /* backboardd's */
 +#define UPT_PA                  0xbc100000ull
-+#define UPT_L3_MAX              512u
-+#define UPT_BYTES               ((3u + UPT_L3_MAX) * 0x1000u)
++#define UPT_TOP_BYTES           0x3000u                 /* one AS's L0, L1 and L2 */
++#define UPT_POOL_OFF            0x18000u                /* after AS1-AS7's top tables (0x15000) */
++#define UPT_BYTES               0x300000u               /* up to the self-test's buffer */
++#define UPT_POOL_MAX            ((UPT_BYTES - UPT_POOL_OFF) / 0x1000u)  /* 744 L3 tables, shared */
 +#define UTEST_PA                0xbc400000ull           /* the self-test's buffer */
 +#define UTEST_BYTES             0x10000u
 +#define UTEST_PAGES             16u
@@ -2652,16 +2672,18 @@ index 0000000..b166bf7
 +#define USER_CHUNKS             16384u                  /* (USER_VA_END - USER_VA_BASE) / USER_CHUNK */
 +#define USER_JOB_POLLS          100000u                 /* 10 us each: 1 s */
 +#define UTEST_MARKER            0x1234567887654321ull
-+#if UPT_PA < GPU_MEM_PA + GPU_MEM_BYTES || UTEST_PA < UPT_PA + UPT_BYTES || UTEST_PA + UTEST_BYTES > RAM_WINDOW_END
-+#error "AS1's tables and the self-test buffer must sit in the window, clear of the private block and of each other"
++#if UPT_PA < GPU_MEM_PA + GPU_MEM_BYTES || UTEST_PA != UPT_PA + UPT_BYTES || UTEST_PA + UTEST_BYTES > RAM_WINDOW_END
++#error "the ASes' tables and the self-test buffer must sit in the window, clear of the private block and of each other"
++#endif
++#if UPT_POOL_OFF < USER_AS_LAST * UPT_TOP_BYTES
++#error "the L3 pool must start after every AS's top tables"
 +#endif
 +#if UTEST_PAGES * 0x1000u != UTEST_BYTES
 +#error "UTEST_PAGES must cover UTEST_BYTES"
 +#endif
 +
 +static vm_offset_t upt_va, utest_va;
-+static uint64_t user_used[USER_CHUNKS / 64u];
-+static unsigned user_clients, user_chunks, user_opens, user_hot;  /* with a04s_gpu_mtx (v50) */
++static unsigned user_clients, user_chunks, user_opens, user_hot;  /* with a04s_gpu_mtx; totals over the ASes */
 +
 +/*
 + * v51: a GPU test's verdict line is kept and repeated in every heartbeat ("GPUNOTE ..."), so any
@@ -2705,10 +2727,21 @@ index 0000000..b166bf7
 +	gpu_notes[slot].text[k] = '\0';
 +	__atomic_store_n(&gpu_notes[slot].len, k, __ATOMIC_RELEASE);
 +}
-+static uint16_t user_l3_of[512];
-+static unsigned user_l3_used;
 +static bool user_ready;
 +static uint32_t user_affinity;
++static uint32_t user_as_present;                /* v65: AS_PRESENT, read at bring-up */
++static struct user_as {
++	uint64_t used[USER_CHUNKS / 64u];       /* this AS's GPU VA, in 64 KiB chunks */
++	uint16_t l3_of[512];                    /* L2 slot -> pool table + 1 */
++	uint32_t chunks, clients, opens, l3, faults, recovers;
++	uint32_t jobs;                          /* queued or running (atomic) */
++	bool live;                              /* its tables are set up */
++	bool broken;                            /* a recovery failed: out of service until reboot */
++} uas[USER_AS_LAST + 1u];                       /* with a04s_gpu_mtx; [0] unused */
++static uint64_t upt_pool[(UPT_POOL_MAX + 63u) / 64u];
++static unsigned upt_pool_used;
++static void uas_release_locked(unsigned as);
++static void user_maybe_off_locked(void);
 +static struct {
 +	const char *state;                      /* OFF, RUNNING, OK, FAIL */
 +	const char *why;
@@ -2733,33 +2766,85 @@ index 0000000..b166bf7
 +	       (pa >= UTEST_PA && pa < UTEST_PA + UTEST_BYTES);
 +}
 +
-+/* AS1 from its tables; also flushes AS1's TLB. With a04s_gpu_mtx held. */
-+static bool
-+user_as_update(void)
++static vm_offset_t
++uas_top_va(unsigned as)
 +{
-+	uint64_t transtab = UPT_PA | 7u;                        /* ADRMODE_TABLE | READ_INNER */
-+	gpu_wr(AS1 + AS_TRANSTAB_LO, (uint32_t)transtab);
-+	gpu_wr(AS1 + AS_TRANSTAB_HI, (uint32_t)(transtab >> 32));
-+	gpu_wr(AS1 + AS_MEMATTR_LO, 0x888d88u);
-+	gpu_wr(AS1 + AS_MEMATTR_HI, 0);
-+	gpu_wr(AS1 + AS_TRANSCFG_LO, 0);                        /* ADRMODE_LEGACY, as AS0 */
-+	gpu_wr(AS1 + AS_TRANSCFG_HI, 0);
-+	gpu_wr(AS1 + AS_COMMAND, 1);                            /* UPDATE */
-+	return gpu_wait(AS1 + AS_STATUS, 1u, 0, 100000);
++	return upt_va + (vm_offset_t)(as - 1u) * UPT_TOP_BYTES;
 +}
 +
-+/* AS1's top tables, empty below L2, and the cores on. With a04s_gpu_mtx held. */
++static uint64_t
++uas_top_pa(unsigned as)
++{
++	return UPT_PA + (uint64_t)(as - 1u) * UPT_TOP_BYTES;
++}
++
++/* AS as from its tables; also flushes its TLB. For an AS with no job on the GPU. With a04s_gpu_mtx held. */
++static bool
++user_as_update(unsigned as)
++{
++	uint32_t r = AS_N(as);
++	uint64_t transtab = uas_top_pa(as) | 7u;                /* ADRMODE_TABLE | READ_INNER */
++	gpu_wr(r + AS_TRANSTAB_LO, (uint32_t)transtab);
++	gpu_wr(r + AS_TRANSTAB_HI, (uint32_t)(transtab >> 32));
++	gpu_wr(r + AS_MEMATTR_LO, 0x888d88u);
++	gpu_wr(r + AS_MEMATTR_HI, 0);
++	gpu_wr(r + AS_TRANSCFG_LO, 0);                          /* ADRMODE_LEGACY, as AS0 */
++	gpu_wr(r + AS_TRANSCFG_HI, 0);
++	gpu_wr(r + AS_COMMAND, 1);                              /* UPDATE */
++	return gpu_wait(r + AS_STATUS, 1u, 0, 100000);
++}
++
++/* AS as out of service: no tables, so every access faults (and stalled accesses end). With the lock. */
++static bool
++user_as_off(unsigned as)
++{
++	uint32_t r = AS_N(as);
++	gpu_wr(r + AS_TRANSTAB_LO, AS_TRANSTAB_UNMAPPED);
++	gpu_wr(r + AS_TRANSTAB_HI, 0);
++	gpu_wr(r + AS_COMMAND, 1);                              /* UPDATE */
++	return gpu_wait(r + AS_STATUS, 1u, 0, USER_STOP_US);
++}
++
++/*
++ * v64: page-table changes while the scheduler has jobs of this AS on the GPU. UPDATE re-reads the whole
++ * address space and is for an idle one; with jobs running, lock the user range and FLUSH_PT, which
++ * flushes the MMU's caches for that range and unlocks it. 0x40000000 | 29 is the naturally aligned 1 GiB
++ * user range (the size field is log2(bytes) - 1). With a04s_gpu_mtx held.
++ */
++#define AS_LOCKADDR_LO          0x10u
++#define AS_LOCKADDR_HI          0x14u
++#define AS_CMD_LOCK             2u
++#define AS_CMD_FLUSH_PT         4u
++static bool
++user_as_flush_locked(unsigned as)
++{
++	uint32_t r = AS_N(as);
++	if (!gpu_wait(r + AS_STATUS, 1u, 0, 100000)) {
++		return false;
++	}
++	gpu_wr(r + AS_LOCKADDR_LO, (uint32_t)USER_VA_BASE | 29u);
++	gpu_wr(r + AS_LOCKADDR_HI, 0);
++	gpu_wr(r + AS_COMMAND, AS_CMD_LOCK);
++	if (!gpu_wait(r + AS_STATUS, 1u, 0, 100000)) {
++		return false;
++	}
++	gpu_wr(r + AS_COMMAND, AS_CMD_FLUSH_PT);
++	return gpu_wait(r + AS_STATUS, 1u, 0, 100000);
++}
++
++/* The cores on and the table block mapped; each AS's tables come with its first client. With the lock. */
 +static bool
 +user_up_locked(void)
 +{
-+	if (uj.broken) {
-+		uj.why = "AS1 STUCK";
-+		return false;
-+	}
 +	if (user_ready) {
 +		return true;
 +	}
-+	if (!gpu_va || !mem_va || !(io_rd(gpu_va, GPU_AS_PRESENT) & 2u)) {
++	if (!gpu_va || !mem_va) {
++		uj.why = "NO GPU";
++		return false;
++	}
++	user_as_present = io_rd(gpu_va, GPU_AS_PRESENT);
++	if (!(user_as_present & 2u)) {
 +		uj.why = "NO AS1";
 +		return false;
 +	}
@@ -2777,42 +2862,105 @@ index 0000000..b166bf7
 +		uj.why = "POWER";
 +		return false;
 +	}
-+	gpu_zero(upt_va, 3u * 0x1000u);
-+	volatile uint64_t *l0 = (volatile uint64_t *)upt_va;
-+	volatile uint64_t *l1 = (volatile uint64_t *)(upt_va + 0x1000);
-+	l0[0] = (UPT_PA + 0x1000) | 3;
-+	l1[(USER_VA_BASE >> 30) & 0x1ffu] = (UPT_PA + 0x2000) | 3;      /* the whole user range: one L2 table */
-+	__asm__ volatile ("dsb sy" ::: "memory");
-+	for (unsigned i = 0; i < 512u; i++) {
-+		user_l3_of[i] = 0;
-+	}
-+	user_l3_used = 0;
-+	if (!user_as_update()) {
-+		uj.why = "AS1 UPDATE";
-+		return false;
-+	}
 +	user_affinity = core0;
 +	user_ready = true;
 +	return true;
 +}
 +
-+/* n consecutive 64 KiB chunks of user GPU VA, or 0. With a04s_gpu_mtx held. */
-+static uint64_t
-+user_va_alloc_locked(uint64_t bytes)
++static int
++upt_pool_get(void)
 +{
++	for (unsigned i = 0; i < UPT_POOL_MAX; i++) {
++		if (!(upt_pool[i / 64u] & (1ull << (i % 64u)))) {
++			upt_pool[i / 64u] |= 1ull << (i % 64u);
++			upt_pool_used++;
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++static void
++upt_pool_put(unsigned i)
++{
++	if (i < UPT_POOL_MAX && (upt_pool[i / 64u] & (1ull << (i % 64u)))) {
++		upt_pool[i / 64u] &= ~(1ull << (i % 64u));
++		upt_pool_used--;
++	}
++}
++
++/* AS as's top tables (empty below L2) and the AS itself, for its first client. With the lock. */
++static bool
++uas_live_locked(unsigned as)
++{
++	struct user_as *u = &uas[as];
++	if (u->live) {
++		return !u->broken;
++	}
++	if (u->broken || !user_ready) {
++		return false;
++	}
++	vm_offset_t top = uas_top_va(as);
++	uint64_t pa = uas_top_pa(as);
++	gpu_zero(top, UPT_TOP_BYTES);
++	volatile uint64_t *l0 = (volatile uint64_t *)top;
++	volatile uint64_t *l1 = (volatile uint64_t *)(top + 0x1000);
++	l0[0] = (pa + 0x1000) | 3;
++	l1[(USER_VA_BASE >> 30) & 0x1ffu] = (pa + 0x2000) | 3;    /* the whole user range: one L2 table */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	bzero(u->used, sizeof(u->used));
++	bzero(u->l3_of, sizeof(u->l3_of));
++	u->chunks = 0;
++	u->l3 = 0;
++	if (!user_as_update(as)) {
++		u->broken = true;
++		(void)user_as_off(as);
++		kprintf("A04S GPU USER AS%u: UPDATE timed out, out of service\n", as);
++		return false;
++	}
++	u->live = true;
++	return true;
++}
++
++/* An AS nobody uses any more: out of service, its L3 tables back in the pool. With the lock. */
++static void
++uas_release_locked(unsigned as)
++{
++	struct user_as *u = &uas[as];
++	if (as == 0 || as > USER_AS_LAST || !u->live || u->clients != 0 || u->chunks != 0 ||
++	    __atomic_load_n(&u->jobs, __ATOMIC_ACQUIRE) != 0 || (sched_hw_as & (1u << as))) {
++		return;
++	}
++	(void)user_as_off(as);
++	for (unsigned i = 0; i < 512u; i++) {
++		if (u->l3_of[i] != 0) {
++			upt_pool_put(u->l3_of[i] - 1u);
++			u->l3_of[i] = 0;
++		}
++	}
++	u->l3 = 0;
++	u->live = false;
++}
++
++/* n consecutive 64 KiB chunks of AS as's GPU VA, or 0. With a04s_gpu_mtx held. */
++static uint64_t
++user_va_alloc_locked(unsigned as, uint64_t bytes)
++{
++	struct user_as *u = &uas[as];
 +	unsigned n = (unsigned)((bytes + USER_CHUNK - 1u) / USER_CHUNK);
 +	if (n == 0 || n > USER_CHUNKS) {
 +		return 0;
 +	}
 +	unsigned run = 0;
 +	for (unsigned c = 0; c < USER_CHUNKS; c++) {
-+		if (user_used[c / 64u] & (1ull << (c % 64u))) {
++		if (u->used[c / 64u] & (1ull << (c % 64u))) {
 +			run = 0;
 +		} else if (++run == n) {
 +			unsigned first = c + 1u - n;
 +			for (unsigned k = first; k <= c; k++) {
-+				user_used[k / 64u] |= 1ull << (k % 64u);
++				u->used[k / 64u] |= 1ull << (k % 64u);
 +			}
++			u->chunks += n;
 +			user_chunks += n;
 +			return USER_VA_BASE + first * USER_CHUNK;
 +		}
@@ -2821,126 +2969,123 @@ index 0000000..b166bf7
 +}
 +
 +static void
-+user_va_free_locked(uint64_t va, unsigned pages)
++user_va_free_locked(unsigned as, uint64_t va, unsigned pages)
 +{
++	struct user_as *u = &uas[as];
 +	if (va < USER_VA_BASE || va >= USER_VA_END || pages == 0) {
 +		return;
 +	}
 +	unsigned first = (unsigned)((va - USER_VA_BASE) / USER_CHUNK);
 +	unsigned count = (unsigned)(((uint64_t)pages * 0x1000u + USER_CHUNK - 1u) / USER_CHUNK);
 +	for (unsigned k = first; k < first + count && k < USER_CHUNKS; k++) {
-+		if (user_used[k / 64u] & (1ull << (k % 64u))) {
-+			user_used[k / 64u] &= ~(1ull << (k % 64u));
++		if (u->used[k / 64u] & (1ull << (k % 64u))) {
++			u->used[k / 64u] &= ~(1ull << (k % 64u));
++			u->chunks--;
 +			user_chunks--;
 +		}
 +	}
 +}
 +
-+/*
-+ * v64: page-table changes while the scheduler has jobs on the GPU. UPDATE re-reads the whole address
-+ * space and is for an idle one; with jobs running, lock the user range and FLUSH_PT, which flushes the
-+ * MMU's caches for that range and unlocks it. 0x40000000 | 29 is the naturally aligned 1 GiB user range
-+ * (the size field is log2(bytes) - 1). With a04s_gpu_mtx held.
-+ */
-+#define AS_LOCKADDR_LO          0x10u
-+#define AS_LOCKADDR_HI          0x14u
-+#define AS_CMD_LOCK             2u
-+#define AS_CMD_FLUSH_PT         4u
++/* AS as's PTEs for n 4 KiB pages at va (pages NULL: unmap), every page checked first. With the lock. */
 +static bool
-+user_as_flush_locked(void)
++user_set_locked(unsigned as, uint64_t va, const uint64_t *pages, unsigned n)
 +{
-+	if (!gpu_wait(AS1 + AS_STATUS, 1u, 0, 100000)) {
-+		return false;
++	struct user_as *u = &uas[as];
++	if (!u->live) {
++		return pages == NULL;
 +	}
-+	gpu_wr(AS1 + AS_LOCKADDR_LO, (uint32_t)USER_VA_BASE | 29u);
-+	gpu_wr(AS1 + AS_LOCKADDR_HI, 0);
-+	gpu_wr(AS1 + AS_COMMAND, AS_CMD_LOCK);
-+	if (!gpu_wait(AS1 + AS_STATUS, 1u, 0, 100000)) {
-+		return false;
-+	}
-+	gpu_wr(AS1 + AS_COMMAND, AS_CMD_FLUSH_PT);
-+	return gpu_wait(AS1 + AS_STATUS, 1u, 0, 100000);
-+}
-+
-+/* AS1 PTEs for n 4 KiB pages at va (pages NULL: unmap), every page checked first. With the lock. */
-+static bool
-+user_set_locked(uint64_t va, const uint64_t *pages, unsigned n)
-+{
 +	for (unsigned i = 0; i < n; i++) {
 +		uint64_t a = va + (uint64_t)i * 0x1000u;
 +		if (a < USER_VA_BASE || a >= USER_VA_END || (pages != NULL && !user_page_ok(pages[i]))) {
 +			return false;
 +		}
 +	}
-+	volatile uint64_t *l2 = (volatile uint64_t *)(upt_va + 0x2000);
++	volatile uint64_t *l2 = (volatile uint64_t *)(uas_top_va(as) + 0x2000);
 +	for (unsigned i = 0; i < n; i++) {
 +		uint64_t a = va + (uint64_t)i * 0x1000u;
 +		unsigned l2i = (unsigned)((a >> 21) & 0x1ffu);
-+		if (user_l3_of[l2i] == 0) {
++		if (u->l3_of[l2i] == 0) {
 +			if (pages == NULL) {
 +				continue;
 +			}
-+			if (user_l3_used >= UPT_L3_MAX) {
++			int t = upt_pool_get();
++			if (t < 0) {
 +				return false;
 +			}
-+			uint32_t table = 0x3000u + user_l3_used * 0x1000u;
-+			gpu_zero(upt_va + table, 0x1000);
-+			user_l3_of[l2i] = (uint16_t)(++user_l3_used);
-+			l2[l2i] = (UPT_PA + table) | 3;
++			uint32_t off = UPT_POOL_OFF + (uint32_t)t * 0x1000u;
++			gpu_zero(upt_va + off, 0x1000);
++			u->l3_of[l2i] = (uint16_t)(t + 1);
++			u->l3++;
++			l2[l2i] = (UPT_PA + off) | 3;
 +		}
-+		volatile uint64_t *l3 = (volatile uint64_t *)(upt_va + 0x3000u + (user_l3_of[l2i] - 1u) * 0x1000u);
++		volatile uint64_t *l3 = (volatile uint64_t *)(upt_va + UPT_POOL_OFF + (u->l3_of[l2i] - 1u) * 0x1000u);
 +		l3[(a >> 12) & 0x1ffu] = pages != NULL ? (pages[i] | 0x2c1) : 0;
 +	}
 +	__asm__ volatile ("dsb sy" ::: "memory");
-+	return sched_hw_busy != 0 ? user_as_flush_locked() : user_as_update();        /* v64 */
++	if (u->broken) {
++		return pages == NULL;                  /* out of service: never put its tables back */
++	}
++	return (sched_hw_as & (1u << as)) ? user_as_flush_locked(as) : user_as_update(as);
 +}
 +
 +/*
-+ * v47: end a job in AS1 that faulted or would not finish. The faulting access keeps AS1 stalled, so
-+ * a hard stop alone doesn't end it, and clearing the fault with the same tables in place only lets it
-+ * fault again: in v46's self-test the AS0 job after the isolation test saw that second fault and gave
-+ * up. So: hard-stop the slot, take AS1 out of service (no tables, which ends the stalled accesses),
-+ * clear AS1's fault, wait for the slot to leave ACTIVE, clear again, and only then put AS1's tables
-+ * back. True if the slot is idle and no MMU fault is left; otherwise AS1 stays out of service.
-+ * With a04s_gpu_mtx held.
++ * v47: end jobs that faulted or would not finish. The faulting access keeps the AS stalled, so a hard
++ * stop alone doesn't end it, and clearing the fault with the same tables in place only lets it fault
++ * again. So: hard-stop the slots, take the AS out of service (no tables, which ends the stalled
++ * accesses), clear its fault, wait for the slots to leave ACTIVE, clear again, and only then put its
++ * tables back. v65: per AS, and only the slots in `slots` (a bit per slot); other ASes and slots are not
++ * touched. True if the slots are idle and the AS has no fault left; otherwise the AS stays out of
++ * service. With a04s_gpu_mtx held.
 + */
 +static bool
-+user_recover_locked(uint32_t slot)
++user_recover_locked(unsigned as, uint32_t slots)
 +{
-+	gpu_wr(slot + JS_COMMAND, JS_HARD_STOP);
-+	gpu_wr(AS1 + AS_TRANSTAB_LO, AS_TRANSTAB_UNMAPPED);
-+	gpu_wr(AS1 + AS_TRANSTAB_HI, 0);
-+	gpu_wr(AS1 + AS_COMMAND, 1);                            /* UPDATE */
-+	bool as_done = gpu_wait(AS1 + AS_STATUS, 1u, 0, USER_STOP_US);
-+	gpu_wr(MMU_IRQ_CLEAR, AS1_FAULT_BITS);
-+	bool stopped = false;
-+	for (unsigned us = 0; us <= USER_STOP_US; us += 10) {
-+		if ((io_rd(gpu_va, slot + JS_STATUS) & 0xffu) != JS_ACTIVE) {
-+			stopped = true;
-+			break;
++	for (unsigned js = 0; js < 2u; js++) {
++		if (slots & (1u << js)) {
++			gpu_wr(JS(js) + JS_COMMAND, JS_HARD_STOP);
 +		}
-+		delay(10);
 +	}
-+	uj.stop_status = io_rd(gpu_va, slot + JS_STATUS);
-+	gpu_wr(JOB_IRQ_CLEAR, 0xffffffffu);
-+	gpu_wr(MMU_IRQ_CLEAR, AS1_FAULT_BITS);
-+	bool back = stopped && as_done && user_as_update();
-+	uj.mmu_after = io_rd(gpu_va, MMU_IRQ_RAWSTAT);
++	bool as_done = user_as_off(as);
++	gpu_wr(MMU_IRQ_CLEAR, AS_FAULT_BITS(as));
++	bool stopped = true;
++	for (unsigned js = 0; js < 2u; js++) {
++		if (!(slots & (1u << js))) {
++			continue;
++		}
++		bool idle = false;
++		for (unsigned us = 0; us <= USER_STOP_US; us += 10) {
++			if ((io_rd(gpu_va, JS(js) + JS_STATUS) & 0xffu) != JS_ACTIVE) {
++				idle = true;
++				break;
++			}
++			delay(10);
++		}
++		uj.stop_status = io_rd(gpu_va, JS(js) + JS_STATUS);
++		stopped = stopped && idle;
++		gpu_wr(JOB_IRQ_CLEAR, (1u << js) | (1u << (16u + js)));
++	}
++	gpu_wr(MMU_IRQ_CLEAR, AS_FAULT_BITS(as));
++	bool back = stopped && as_done && user_as_update(as);
++	uj.mmu_after = io_rd(gpu_va, MMU_IRQ_RAWSTAT) & AS_FAULT_BITS(as);
 +	if (back && uj.mmu_after == 0) {
 +		uj.recovers++;
++		uas[as].recovers++;
 +		return true;
 +	}
 +	uj.recover_fails++;
-+	uj.broken = true;
-+	user_ready = false;
-+	kprintf("A04S GPU USER AS1 STUCK: STOP %x MMU %x, AS1 OUT OF SERVICE\n", uj.stop_status, uj.mmu_after);
++	uas[as].broken = true;
++	(void)user_as_off(as);
++	if (as == 1u) {
++		uj.broken = true;
++	}
++	kprintf("A04S GPU USER AS%u STUCK: STOP %x MMU %x, AS%u OUT OF SERVICE\n", as, uj.stop_status, uj.mmu_after, as);
 +	return false;
 +}
 +
-+/* One job chain at GPU VA jc on slot js, in AS1. 0 if it finished cleanly, else the slot's status,
-+ * or 0xffffffff on a timeout. With a04s_gpu_mtx held. */
++/* One job chain at GPU VA jc on slot js, in AS as, polled. 0 if it finished cleanly, else the slot's
++ * status, or 0xffffffff on a timeout. The boot self-test and a04sgpu_sched=0. With a04s_gpu_mtx held. */
 +static uint32_t
-+user_run_locked(unsigned js, uint64_t jc, uint32_t *fault, uint32_t *faddr, uint64_t *us)
++user_run_locked(unsigned as, unsigned js, uint64_t jc, uint32_t *fault, uint32_t *faddr, uint64_t *us)
 +{
 +	uint32_t slot = JS(js);
 +	uint32_t done = 1u << js, failed = 1u << (16u + js);
@@ -2951,8 +3096,8 @@ index 0000000..b166bf7
 +	gpu_wr(slot + JS_HEAD_NEXT_HI, (uint32_t)(jc >> 32));
 +	gpu_wr(slot + JS_AFFINITY_NEXT_LO, user_affinity);
 +	gpu_wr(slot + JS_AFFINITY_NEXT_HI, 0);
-+	/* Thread priority 8, clean and invalidate the GPU caches at start and end, address space 1. */
-+	gpu_wr(slot + JS_CONFIG_NEXT, (8u << 16) | (3u << 8) | (3u << 12) | 1u);
++	/* Thread priority 8, clean and invalidate the GPU caches at start and end, address space as. */
++	gpu_wr(slot + JS_CONFIG_NEXT, (8u << 16) | (3u << 8) | (3u << 12) | as);
 +	uint64_t start = mach_absolute_time();
 +	gpu_wr(slot + JS_COMMAND_NEXT, 1);                      /* START */
 +	uint32_t jirq = 0, mirq = 0, girq = 0;
@@ -2967,14 +3112,13 @@ index 0000000..b166bf7
 +	}
 +	*us = us_since(start);
 +	uint32_t st = io_rd(gpu_va, slot + JS_STATUS);
-+	/* AS_FAULTSTATUS and FAULTADDR keep the last fault until the next one (v50 counted a clean job
-+	 * after a bad one as a fault): only this job's own AS1 fault counts (v51). */
-+	bool as1_fault = (mirq & AS1_FAULT_BITS) != 0;
-+	*fault = as1_fault ? io_rd(gpu_va, AS1 + AS_FAULTSTATUS) : 0;
-+	*faddr = as1_fault ? io_rd(gpu_va, AS1 + AS_FAULTADDR_LO) : 0;
++	/* AS_FAULTSTATUS and FAULTADDR keep the last fault until the next one: only this job's own fault counts. */
++	bool as_fault = (mirq & AS_FAULT_BITS(as)) != 0;
++	*fault = as_fault ? io_rd(gpu_va, AS_N(as) + AS_FAULTSTATUS) : 0;
++	*faddr = as_fault ? io_rd(gpu_va, AS_N(as) + AS_FAULTADDR_LO) : 0;
 +	bool answered = (jirq & (done | failed)) || mirq || (girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT));
 +	if ((st & 0xffu) == JS_ACTIVE || mirq) {
-+		(void)user_recover_locked(slot);
++		(void)user_recover_locked(as, 1u << js);
 +	}
 +	gpu_wr(JOB_IRQ_CLEAR, 0xffffffffu);
 +	gpu_wr(MMU_IRQ_CLEAR, 0xffffffffu);
@@ -2995,9 +3139,9 @@ index 0000000..b166bf7
 + * Both slots run at once, one chain each (JS_*_NEXT is not chained behind a running job yet). While
 + * jobs are on the GPU the thread polls JOB/MMU/GPU_IRQ_RAWSTAT about every 100 us, sleeping in between
 + * (assert_wait_timeout, not delay()) and holding no client lock; with nothing queued it sleeps until a
-+ * submit wakes it. A job still running after 500 ms, or any MMU or GPU fault, ends every job on the GPU
-+ * through user_recover_locked() and fails their fences (the fault can't be pinned on one slot); if the
-+ * recovery fails, AS1 is out of service and everything queued fails. The thermal limit is checked as
++ * submit wakes it. A job still running after 500 ms, or an MMU fault, ends the jobs on the GPU of that
++ * job's address space through user_recover_locked() and fails their fences (v65; a GPU fault, not tied
++ * to an AS, ends them all); if the recovery fails, that AS is out of service and its queued jobs fail. The thermal limit is checked as
 + * each job starts.
 + *
 + * Fences are refcounted and signalled once, with a status: 0 clean, else the slot's status,
@@ -3040,6 +3184,7 @@ index 0000000..b166bf7
 +	void (*retire)(void *ctx);
 +	void *ctx;
 +	int pid;
++	unsigned as;                    /* v65: the client's address space */
 +};
 +
 +extern int proc_selfpid(void);
@@ -3224,40 +3369,66 @@ index 0000000..b166bf7
 +			kfree_type(struct a04s_fence *, j->ndeps, j->deps);
 +		}
 +		a04s_fence_release(j->fence);
++		unsigned as = j->as;
 +		kfree_type(struct a04s_job, j);
++		/* v65: the AS's last job gone (and its client too): it may be released, and the cores go off. */
++		if (__atomic_sub_fetch(&uas[as].jobs, 1u, __ATOMIC_ACQ_REL) == 0 &&
++		    __atomic_load_n(&uas[as].clients, __ATOMIC_RELAXED) == 0) {
++			lck_mtx_lock(&a04s_gpu_mtx);
++			uas_release_locked(as);
++			user_maybe_off_locked();
++			lck_mtx_unlock(&a04s_gpu_mtx);
++		}
 +	}
 +}
 +
-+/*
-+ * A fault, or a job past its time: hard-stop every slot in use, recover AS1 (user_recover_locked(), per
-+ * slot) and fail those jobs. With a04s_gpu_mtx and sched_mtx.
-+ */
 +static void
-+sched_recover_locked(bool fault, uint32_t mirq, struct a04s_job **retire)
++sched_hw_as_recalc(void)
 +{
-+	uint32_t asf = (mirq & AS1_FAULT_BITS) ? io_rd(gpu_va, AS1 + AS_FAULTSTATUS) : 0;
-+	uint32_t asa = (mirq & AS1_FAULT_BITS) ? io_rd(gpu_va, AS1 + AS_FAULTADDR_LO) : 0;
-+	uint32_t st[2] = { 0, 0 };
++	uint32_t m = 0;
 +	for (unsigned js = 0; js < 2u; js++) {
 +		if (sched_run[js] != NULL) {
-+			st[js] = io_rd(gpu_va, JS(js) + JS_STATUS);
-+			gpu_wr(JS(js) + JS_COMMAND, JS_HARD_STOP);
++			m |= 1u << sched_run[js]->as;
 +		}
 +	}
++	sched_hw_as = m;
++}
++
++/*
++ * v65: a fault, or a job past its time, in address space as: hard-stop the slots running that AS's jobs,
++ * recover the AS (user_recover_locked()) and fail those jobs. A job of another AS on the other slot runs
++ * on. With a04s_gpu_mtx and sched_mtx.
++ */
++static void
++sched_end_as_locked(unsigned as, bool fault, struct a04s_job **retire)
++{
++	uint32_t slots = 0, st[2] = { 0, 0 };
 +	for (unsigned js = 0; js < 2u; js++) {
-+		struct a04s_job *j = sched_run[js];
-+		if (j == NULL) {
++		if (sched_run[js] != NULL && sched_run[js]->as == as) {
++			slots |= 1u << js;
++			st[js] = io_rd(gpu_va, JS(js) + JS_STATUS);
++		}
++	}
++	if (slots == 0) {
++		return;
++	}
++	uint32_t asf = fault ? io_rd(gpu_va, AS_N(as) + AS_FAULTSTATUS) : 0;
++	uint32_t asa = fault ? io_rd(gpu_va, AS_N(as) + AS_FAULTADDR_LO) : 0;
++	(void)user_recover_locked(as, slots);
++	for (unsigned js = 0; js < 2u; js++) {
++		if (!(slots & (1u << js))) {
 +			continue;
 +		}
++		struct a04s_job *j = sched_run[js];
 +		uint64_t us = us_since(j->start);
 +		bool late = us > SCHED_TIMEOUT_US;
-+		(void)user_recover_locked(JS(js));
 +		sched_run[js] = NULL;
 +		sched_hw_busy &= ~(1u << js);
 +		uj.jobs++;
 +		sst.recovers++;
 +		if (fault) {
 +			uj.faults++;
++			uas[as].faults++;
 +			sst.faults++;
 +		} else if (late) {
 +			sst.timeouts++;
@@ -3268,20 +3439,18 @@ index 0000000..b166bf7
 +		sst.last_addr = asa;
 +		if (sst.logged < SCHED_LOG_MAX) {
 +			sst.logged++;
-+			kprintf("A04S GPU SCHED %s: JS%u pid %d jc %llx status %x fault %x@%x after %llu us\n",
-+			    fault ? "FAULT" : late ? "TIMEOUT" : "STOPPED", js, j->pid, j->jc, st[js], asf, asa, us);
++			kprintf("A04S GPU SCHED %s: AS%u JS%u pid %d jc %llx status %x fault %x@%x after %llu us\n",
++			    fault ? "FAULT" : late ? "TIMEOUT" : "STOPPED", as, js, j->pid, j->jc, st[js], asf, asa, us);
 +		}
 +		sched_end_locked(j, status, us, retire);
 +	}
-+	gpu_wr(JOB_IRQ_CLEAR, 0xffffffffu);
-+	gpu_wr(MMU_IRQ_CLEAR, 0xffffffffu);
-+	gpu_wr(GPU_IRQ_CLEAR, 0xffffffffu);
-+	if (uj.broken || !user_ready) {
-+		sched_fail_queued_locked(retire);
-+	}
++	sched_hw_as_recalc();
 +}
 +
-+/* The slots' state: finished jobs end, a fault or a late job means recovery. With both locks. */
++/*
++ * The slots' state: finished jobs end; an MMU fault ends the jobs of the AS that faulted, a GPU fault
++ * (not tied to an AS) those of every AS on the GPU, a late job those of its own AS. With both locks.
++ */
 +static void
 +sched_poll_locked(struct a04s_job **retire)
 +{
@@ -3291,40 +3460,62 @@ index 0000000..b166bf7
 +	uint32_t jirq = io_rd(gpu_va, JOB_IRQ_RAWSTAT);
 +	uint32_t mirq = io_rd(gpu_va, MMU_IRQ_RAWSTAT);
 +	uint32_t girq = io_rd(gpu_va, GPU_IRQ_RAWSTAT);
-+	bool fault = mirq != 0 || (girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT)) != 0;
-+	bool stuck = false;
-+	if (!fault) {
-+		for (unsigned js = 0; js < 2u; js++) {
-+			struct a04s_job *j = sched_run[js];
-+			if (j == NULL) {
-+				continue;
-+			}
-+			uint32_t done = 1u << js, failed = 1u << (16u + js);
-+			uint64_t us = us_since(j->start);
-+			if (jirq & (done | failed)) {
-+				uint32_t st = 0;
-+				if (jirq & failed) {
-+					st = io_rd(gpu_va, JS(js) + JS_STATUS);
-+					if (st == 0) {
-+						st = FENCE_FAULT;
-+					}
-+				}
-+				gpu_wr(JOB_IRQ_CLEAR, done | failed);
-+				if ((io_rd(gpu_va, JS(js) + JS_STATUS) & 0xffu) == JS_ACTIVE) {
-+					stuck = true;          /* failed but still active: recover below */
-+					continue;
-+				}
-+				sched_run[js] = NULL;
-+				sched_hw_busy &= ~(1u << js);
-+				uj.jobs++;
-+				sched_end_locked(j, st, us, retire);
-+			} else if (us > SCHED_TIMEOUT_US) {
-+				stuck = true;
-+			}
++	bool gpu_fault = (girq & (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT)) != 0;
++	uint32_t fault_as = 0, late_as = 0;                    /* a bit per AS */
++	for (unsigned as = 1u; as <= USER_AS_LAST; as++) {
++		if ((mirq & AS_FAULT_BITS(as)) || (gpu_fault && (sched_hw_as & (1u << as)))) {
++			fault_as |= 1u << as;
 +		}
 +	}
-+	if (fault || stuck) {
-+		sched_recover_locked(fault, mirq, retire);
++	for (unsigned js = 0; js < 2u; js++) {
++		struct a04s_job *j = sched_run[js];
++		if (j == NULL || (fault_as & (1u << j->as))) {
++			continue;
++		}
++		uint32_t done = 1u << js, failed = 1u << (16u + js);
++		uint64_t us = us_since(j->start);
++		if (jirq & (done | failed)) {
++			uint32_t st = 0;
++			if (jirq & failed) {
++				st = io_rd(gpu_va, JS(js) + JS_STATUS);
++				if (st == 0) {
++					st = FENCE_FAULT;
++				}
++			}
++			gpu_wr(JOB_IRQ_CLEAR, done | failed);
++			if ((io_rd(gpu_va, JS(js) + JS_STATUS) & 0xffu) == JS_ACTIVE) {
++				late_as |= 1u << j->as;       /* failed but still active: recover below */
++				continue;
++			}
++			sched_run[js] = NULL;
++			sched_hw_busy &= ~(1u << js);
++			uj.jobs++;
++			sched_end_locked(j, st, us, retire);
++		} else if (us > SCHED_TIMEOUT_US) {
++			late_as |= 1u << j->as;
++		}
++	}
++	sched_hw_as_recalc();
++	for (unsigned as = 1u; as <= USER_AS_LAST; as++) {
++		if (fault_as & (1u << as)) {
++			sched_end_as_locked(as, true, retire);
++		} else if (late_as & (1u << as)) {
++			sched_end_as_locked(as, false, retire);
++		}
++	}
++	/* A fault bit no job on the GPU owns (an AS whose job already ended): clear it. */
++	uint32_t owned = 0;
++	for (unsigned js = 0; js < 2u; js++) {
++		if (sched_run[js] != NULL) {
++			owned |= AS_FAULT_BITS(sched_run[js]->as);
++		}
++	}
++	uint32_t stray = io_rd(gpu_va, MMU_IRQ_RAWSTAT) & ~owned;
++	if (stray != 0) {
++		gpu_wr(MMU_IRQ_CLEAR, stray);
++	}
++	if (gpu_fault) {
++		gpu_wr(GPU_IRQ_CLEAR, IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT);
 +	}
 +}
 +
@@ -3348,7 +3539,7 @@ index 0000000..b166bf7
 +			}
 +			sched_q[js].len--;
 +			j->next = NULL;
-+			if (!user_ready || uj.broken) {
++			if (!user_ready || !uas[j->as].live || uas[j->as].broken) {
 +				sst.refused++;
 +				sched_end_locked(j, FENCE_REFUSED, 0, retire);
 +				continue;
@@ -3369,12 +3560,13 @@ index 0000000..b166bf7
 +			gpu_wr(slot + JS_HEAD_NEXT_HI, (uint32_t)(j->jc >> 32));
 +			gpu_wr(slot + JS_AFFINITY_NEXT_LO, user_affinity);
 +			gpu_wr(slot + JS_AFFINITY_NEXT_HI, 0);
-+			/* As user_run_locked(): thread priority 8, clean and invalidate the caches at start and end, AS1. */
-+			gpu_wr(slot + JS_CONFIG_NEXT, (8u << 16) | (3u << 8) | (3u << 12) | 1u);
++			/* As user_run_locked(): thread priority 8, clean and invalidate the caches at start and end, the job's AS. */
++			gpu_wr(slot + JS_CONFIG_NEXT, (8u << 16) | (3u << 8) | (3u << 12) | j->as);
 +			j->start = mach_absolute_time();
 +			gpu_wr(slot + JS_COMMAND_NEXT, 1);                    /* START */
 +			sched_run[js] = j;
 +			sched_hw_busy |= 1u << js;
++			sched_hw_as |= 1u << j->as;
 +		}
 +	}
 +}
@@ -3431,15 +3623,15 @@ index 0000000..b166bf7
 +}
 +
 +/*
-+ * Queue the chain at user GPU VA jc on slot js (0 fragment, 1 the rest), to start once every non-NULL
++ * Queue the chain at user GPU VA jc of address space as on slot js (0 fragment, 1 the rest), to start once every non-NULL
 + * fence in deps is signalled. retire(ctx) runs when the job has ended (no lock held), or before this
 + * returns if the job is refused. Returns the job's fence, one reference for the caller, already
 + * signalled with 0xfffffffc if refused; NULL only if even that couldn't be allocated.
 + */
-+struct a04s_fence *a04s_gpu_queue(unsigned js, uint64_t jc, struct a04s_fence *const *deps, unsigned ndeps,
-+    void (*retire)(void *ctx), void *ctx);
++struct a04s_fence *a04s_gpu_queue(unsigned as, unsigned js, uint64_t jc, struct a04s_fence *const *deps,
++    unsigned ndeps, void (*retire)(void *ctx), void *ctx);
 +struct a04s_fence *
-+a04s_gpu_queue(unsigned js, uint64_t jc, struct a04s_fence *const *deps, unsigned ndeps,
++a04s_gpu_queue(unsigned as, unsigned js, uint64_t jc, struct a04s_fence *const *deps, unsigned ndeps,
 +    void (*retire)(void *ctx), void *ctx)
 +{
 +	unsigned nd = 0;
@@ -3452,7 +3644,7 @@ index 0000000..b166bf7
 +	struct a04s_job *j = kalloc_type(struct a04s_job, Z_WAITOK | Z_ZERO);
 +	struct a04s_fence **dv = nd != 0 ? kalloc_type(struct a04s_fence *, nd, Z_WAITOK | Z_ZERO) : NULL;
 +	bool ok = f != NULL && j != NULL && (nd == 0 || dv != NULL) && js <= 1u && jc >= USER_VA_BASE &&
-+	    jc < USER_VA_END && a04s_gpu_sched_on() && sched_thread_up();
++	    jc < USER_VA_END && as >= 1u && as <= USER_AS_LAST && a04s_gpu_sched_on() && sched_thread_up();
 +	if (!ok) {
 +		if (dv != NULL) {
 +			kfree_type(struct a04s_fence *, nd, dv);
@@ -3488,6 +3680,8 @@ index 0000000..b166bf7
 +	j->retire = retire;
 +	j->ctx = ctx;
 +	j->pid = proc_selfpid();
++	j->as = as;
++	__atomic_add_fetch(&uas[as].jobs, 1u, __ATOMIC_ACQ_REL);       /* v65: back in sched_retire() */
 +	lck_mtx_lock(&sched_mtx);
 +	if (sched_q[js].tail != NULL) {
 +		sched_q[js].tail->next = j;
@@ -3515,7 +3709,7 @@ index 0000000..b166bf7
 +	return idle;
 +}
 +
-+/* For 7c-5b's user client: bring AS1 up (the boot tests must have passed). */
++/* For 7c-5b's user client: bring the GPU up (the boot tests must have passed). */
 +bool a04s_gpu_user_up(void);
 +bool
 +a04s_gpu_user_up(void)
@@ -3529,39 +3723,100 @@ index 0000000..b166bf7
 +	return ok;
 +}
 +
-+/* v50: a HeroGPU client opens. AS1 and the cores come up with the first one. */
-+bool a04s_gpu_user_open(void);
-+bool
-+a04s_gpu_user_open(void)
++/*
++ * v65: the AS for a new client. The display AS for backboardd; for the others the first free AS of
++ * AS2-AS7 (no client, nothing mapped, no job), else the last one, shared. AS1 only if it is the only
++ * AS left. 0 if none. With the lock.
++ */
++static unsigned
++user_as_pick_locked(bool display)
 +{
-+	if (job.state[0] != 'O' || job.state[1] != 'K') {
-+		return false;
++	unsigned last = 0;
++	bool display_ok = (user_as_present & (1u << USER_AS_DISPLAY)) && !uas[USER_AS_DISPLAY].broken;
++	if (display && display_ok) {
++		return USER_AS_DISPLAY;
 +	}
-+	lck_mtx_lock(&a04s_gpu_mtx);
-+	bool ok = user_up_locked();
-+	if (ok) {
-+		user_clients++;
-+		user_opens++;
++	for (unsigned as = USER_AS_DISPLAY + 1u; as <= USER_AS_LAST; as++) {
++		const struct user_as *u = &uas[as];
++		if (!(user_as_present & (1u << as)) || u->broken) {
++			continue;
++		}
++		last = as;
++		if (u->clients == 0 && u->chunks == 0 && __atomic_load_n(&u->jobs, __ATOMIC_ACQUIRE) == 0) {
++			return as;
++		}
 +	}
-+	lck_mtx_unlock(&a04s_gpu_mtx);
-+	return ok;
++	if (last != 0) {
++		return last;                          /* more clients than ASes: the extras share the last */
++	}
++	return display_ok ? USER_AS_DISPLAY : 0;
 +}
 +
-+/* v50: a client that opened has gone. After the last one, with every user VA chunk given back,
-+ * the cores go off (not while the present path uses them), and the next open starts AS1 afresh. */
-+void a04s_gpu_user_close(void);
-+void
-+a04s_gpu_user_close(void)
++/*
++ * v50: a HeroGPU client opens; the cores come up with the first one. v65: it gets an address space
++ * (display: backboardd's), returned for every later call; 0 if the GPU or no AS is available.
++ */
++unsigned a04s_gpu_user_open(bool display);
++unsigned
++a04s_gpu_user_open(bool display)
 +{
++	if (job.state[0] != 'O' || job.state[1] != 'K') {
++		return 0;
++	}
 +	lck_mtx_lock(&a04s_gpu_mtx);
++	unsigned as = user_up_locked() ? user_as_pick_locked(display) : 0;
++	if (as != 0 && uas_live_locked(as)) {
++		uas[as].clients++;
++		uas[as].opens++;
++		user_clients++;
++		user_opens++;
++	} else {
++		as = 0;
++	}
++	lck_mtx_unlock(&a04s_gpu_mtx);
++	return as;
++}
++
++/*
++ * The cores go off once nothing uses the GPU: no client, every AS released (its buffers unmapped, its
++ * jobs ended), the scheduler idle, and the present path (sweetfb_gpu=1) not using them. The next open
++ * brings them up afresh. With a04s_gpu_mtx held.
++ */
++static void
++user_maybe_off_locked(void)
++{
++	if (user_clients != 0 || !user_ready || __atomic_load_n(&present_ready, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	for (unsigned as = 1u; as <= USER_AS_LAST; as++) {
++		if (uas[as].live && !uas[as].broken) {
++			return;
++		}
++	}
++	if (!sched_idle_locked()) {
++		return;
++	}
++	gpu_cores_off();
++	user_ready = false;
++}
++
++/* v50: a client that opened has gone. v65: its AS is released once its buffers and jobs are gone too. */
++void a04s_gpu_user_close(unsigned as);
++void
++a04s_gpu_user_close(unsigned as)
++{
++	if (as == 0 || as > USER_AS_LAST) {
++		return;
++	}
++	lck_mtx_lock(&a04s_gpu_mtx);
++	if (uas[as].clients > 0) {
++		uas[as].clients--;
++	}
 +	if (user_clients > 0) {
 +		user_clients--;
 +	}
-+	if (user_clients == 0 && user_chunks == 0 && user_ready && !uj.broken &&
-+	    !__atomic_load_n(&present_ready, __ATOMIC_ACQUIRE) && sched_idle_locked()) {
-+		gpu_cores_off();
-+		user_ready = false;
-+	}
++	uas_release_locked(as);
++	user_maybe_off_locked();
 +	lck_mtx_unlock(&a04s_gpu_mtx);
 +}
 +
@@ -3576,49 +3831,65 @@ index 0000000..b166bf7
 +	return io_rd(gpu_va, off);
 +}
 +
-+uint64_t a04s_gpu_user_va_alloc(uint64_t bytes);
-+uint64_t
-+a04s_gpu_user_va_alloc(uint64_t bytes)
++static bool
++user_as_ok(unsigned as)
 +{
++	return as >= 1u && as <= USER_AS_LAST;
++}
++
++uint64_t a04s_gpu_user_va_alloc(unsigned as, uint64_t bytes);
++uint64_t
++a04s_gpu_user_va_alloc(unsigned as, uint64_t bytes)
++{
++	if (!user_as_ok(as)) {
++		return 0;
++	}
 +	lck_mtx_lock(&a04s_gpu_mtx);
-+	uint64_t va = user_ready ? user_va_alloc_locked(bytes) : 0;
++	uint64_t va = user_ready && uas[as].live && !uas[as].broken ? user_va_alloc_locked(as, bytes) : 0;
 +	lck_mtx_unlock(&a04s_gpu_mtx);
 +	return va;
 +}
 +
-+bool a04s_gpu_user_map(uint64_t va, const uint64_t *pages, unsigned n);
++bool a04s_gpu_user_map(unsigned as, uint64_t va, const uint64_t *pages, unsigned n);
 +bool
-+a04s_gpu_user_map(uint64_t va, const uint64_t *pages, unsigned n)
++a04s_gpu_user_map(unsigned as, uint64_t va, const uint64_t *pages, unsigned n)
 +{
-+	if (pages == NULL || n == 0) {
++	if (!user_as_ok(as) || pages == NULL || n == 0) {
 +		return false;
 +	}
 +	lck_mtx_lock(&a04s_gpu_mtx);
-+	bool ok = user_ready && user_set_locked(va, pages, n);
++	bool ok = user_ready && !uas[as].broken && user_set_locked(as, va, pages, n);
 +	lck_mtx_unlock(&a04s_gpu_mtx);
 +	return ok;
 +}
 +
-+/* Unmap n pages at va and give the VA back. */
-+void a04s_gpu_user_unmap(uint64_t va, unsigned n);
++/* Unmap n pages at va in AS as and give the VA back; a client-less AS may then be released. */
++void a04s_gpu_user_unmap(unsigned as, uint64_t va, unsigned n);
 +void
-+a04s_gpu_user_unmap(uint64_t va, unsigned n)
++a04s_gpu_user_unmap(unsigned as, uint64_t va, unsigned n)
 +{
++	if (!user_as_ok(as)) {
++		return;
++	}
 +	lck_mtx_lock(&a04s_gpu_mtx);
 +	if (user_ready) {
-+		(void)user_set_locked(va, NULL, n);
-+		user_va_free_locked(va, n);
++		(void)user_set_locked(as, va, NULL, n);
++		user_va_free_locked(as, va, n);
++		if (uas[as].clients == 0) {
++			uas_release_locked(as);
++			user_maybe_off_locked();
++		}
 +	}
 +	lck_mtx_unlock(&a04s_gpu_mtx);
 +}
 +
-+/* Run the job chain at user GPU VA jc on slot js (0 fragment, 1 the rest) and wait (at most 1 s).
++/* Run the job chain at user GPU VA jc of AS as on slot js (0 fragment, 1 the rest) and wait.
 + * 0: finished cleanly; 0xfffffffe: the thermal limit; else the slot's status or 0xffffffff. */
-+uint32_t a04s_gpu_user_submit(unsigned js, uint64_t jc, uint64_t *us);
++uint32_t a04s_gpu_user_submit(unsigned as, unsigned js, uint64_t jc, uint64_t *us);
 +uint32_t
-+a04s_gpu_user_submit(unsigned js, uint64_t jc, uint64_t *us)
++a04s_gpu_user_submit(unsigned as, unsigned js, uint64_t jc, uint64_t *us)
 +{
-+	if (js > 1 || jc < USER_VA_BASE || jc >= USER_VA_END) {
++	if (!user_as_ok(as) || js > 1 || jc < USER_VA_BASE || jc >= USER_VA_END) {
 +		return 0xffffffffu;
 +	}
 +	if (!a04s_gpu_allowed()) {
@@ -3629,7 +3900,7 @@ index 0000000..b166bf7
 +	}
 +	if (a04s_gpu_sched_on()) {
 +		/* v64: through the scheduler, waiting for the job's fence (no lock held meanwhile). */
-+		struct a04s_fence *f = a04s_gpu_queue(js, jc, NULL, 0, NULL, NULL);
++		struct a04s_fence *f = a04s_gpu_queue(as, js, jc, NULL, 0, NULL, NULL);
 +		if (f == NULL) {
 +			return 0xffffffffu;
 +		}
@@ -3646,11 +3917,12 @@ index 0000000..b166bf7
 +	uint32_t fault = 0, faddr = 0, st = 0xffffffffu;
 +	uint64_t t = 0;
 +	lck_mtx_lock(&a04s_gpu_mtx);
-+	if (user_ready && !uj.broken) {
-+		st = user_run_locked(js, jc, &fault, &faddr, &t);
++	if (user_ready && uas[as].live && !uas[as].broken) {
++		st = user_run_locked(as, js, jc, &fault, &faddr, &t);
 +		uj.jobs++;
 +		if (fault) {
 +			uj.faults++;
++			uas[as].faults++;
 +		}
 +	}
 +	lck_mtx_unlock(&a04s_gpu_mtx);
@@ -3689,9 +3961,9 @@ index 0000000..b166bf7
 +	}
 +	lck_mtx_lock(&a04s_gpu_mtx);
 +	if (sched_hw_busy != 0) {
-+		uj.why = "SCHED BUSY";           /* v64: user_run_locked() would share the slots with the scheduler */
++		uj.why = "SCHED BUSY";           /* v64: user_run_locked(1u, ) would share the slots with the scheduler */
 +	}
-+	if (sched_hw_busy != 0 || !user_up_locked()) {
++	if (sched_hw_busy != 0 || !user_up_locked() || !uas_live_locked(1u)) {     /* v65: AS1, as before */
 +		lck_mtx_unlock(&a04s_gpu_mtx);
 +		uj.state = "FAIL";
 +		kprintf("A04S GPU USER FAIL %s\n", uj.why);
@@ -3700,11 +3972,11 @@ index 0000000..b166bf7
 +	if (!utest_va) {
 +		utest_va = ml_io_map((vm_offset_t)UTEST_PA, UTEST_BYTES);
 +	}
-+	uint64_t va = utest_va ? user_va_alloc_locked(UTEST_BYTES) : 0;
-+	if (va == 0 || !user_set_locked(va, pages, UTEST_PAGES)) {
++	uint64_t va = utest_va ? user_va_alloc_locked(1u, UTEST_BYTES) : 0;
++	if (va == 0 || !user_set_locked(1u, va, pages, UTEST_PAGES)) {
 +		if (va != 0) {
-+			(void)user_set_locked(va, NULL, UTEST_PAGES);
-+			user_va_free_locked(va, UTEST_PAGES);  /* v50: give the VA back, or the cores never go off */
++			(void)user_set_locked(1u, va, NULL, UTEST_PAGES);
++			user_va_free_locked(1u, va, UTEST_PAGES);  /* v50: give the VA back, or the cores never go off */
 +		}
 +		lck_mtx_unlock(&a04s_gpu_mtx);
 +		uj.state = "FAIL";
@@ -3712,7 +3984,7 @@ index 0000000..b166bf7
 +		kprintf("A04S GPU USER FAIL MAP\n");
 +		return;
 +	}
-+	uj.l3 = user_l3_used;
++	uj.l3 = uas[1].l3;
 +	uint64_t us = 0;
 +	uint32_t fault = 0, faddr = 0;
 +
@@ -3722,7 +3994,7 @@ index 0000000..b166bf7
 +	volatile uint64_t *out = (volatile uint64_t *)(utest_va + 0x100);
 +	*out = 0xa5a5a5a55a5a5a5aull;
 +	__asm__ volatile ("dsb sy" ::: "memory");
-+	uj.wv_status = user_run_locked(1, va, &fault, &faddr, &us);
++	uj.wv_status = user_run_locked(1u, 1, va, &fault, &faddr, &us);
 +	uj.wv_us = (uint32_t)us;
 +	uj.wv_output = *out;
 +
@@ -3731,7 +4003,7 @@ index 0000000..b166bf7
 +	volatile uint64_t *priv = (volatile uint64_t *)(mem_va + GPU_DATA_OFF + GPU_OUT_OFF);
 +	*priv = UTEST_MARKER;
 +	utest_write_value(GPU_VA + GPU_OUT_OFF);
-+	uj.iso_status = user_run_locked(1, va, &uj.iso_fault, &uj.iso_addr, &us);
++	uj.iso_status = user_run_locked(1u, 1, va, &uj.iso_fault, &uj.iso_addr, &us);
 +	uj.iso_output = *priv;
 +
 +	/* 3 (v47): AS1 works again after the fault, on its own buffer. */
@@ -3741,7 +4013,7 @@ index 0000000..b166bf7
 +		utest_write_value(va + 0x100u);
 +		*out = 0xa5a5a5a55a5a5a5aull;
 +		__asm__ volatile ("dsb sy" ::: "memory");
-+		uj.wv2_status = user_run_locked(1, va, &fault, &faddr, &us);
++		uj.wv2_status = user_run_locked(1u, 1, va, &fault, &faddr, &us);
 +	}
 +	uj.wv2_output = *out;
 +
@@ -3750,8 +4022,9 @@ index 0000000..b166bf7
 +	uj.as0_ok = frag_job(GPU_VA + FRAG_RT_OFF, FRAG_W, FRAG_H, FRAG_W * 4u, FRAG_COLOR, core0, &uj.as0, 0, 0,
 +	    SWIZZLE_RGBA);
 +
-+	(void)user_set_locked(va, NULL, UTEST_PAGES);
-+	user_va_free_locked(va, UTEST_PAGES);
++	(void)user_set_locked(1u, va, NULL, UTEST_PAGES);
++	user_va_free_locked(1u, va, UTEST_PAGES);
++	uas_release_locked(1u);                 /* v65: give AS1 back for backboardd */
 +	lck_mtx_unlock(&a04s_gpu_mtx);
 +
 +	bool wv_ok = uj.wv_status == 0 && uj.wv_output == 0;
@@ -4107,6 +4380,16 @@ index 0000000..b166bf7
 +	    uj.recover_fails, uj.wv2_status, uj.as0_ok ? "OK" : "-", uj.as0.js_status, uj.as0.mirq, uj.jobs, uj.faults,
 +	    present_busy, __atomic_load_n(&user_clients, __ATOMIC_RELAXED), __atomic_load_n(&user_opens, __ATOMIC_RELAXED),
 +	    __atomic_load_n(&user_chunks, __ATOMIC_RELAXED), __atomic_load_n(&user_hot, __ATOMIC_RELAXED));
++	/* v65: the user address spaces (a snapshot, no lock). */
++	kprintf("GPUAS PRESENT %x POOL %u/%u", user_as_present, upt_pool_used, (unsigned)UPT_POOL_MAX);
++	for (unsigned as = 1u; as <= USER_AS_LAST; as++) {
++		const struct user_as *u = &uas[as];
++		if (u->live || u->broken || u->opens != 0) {
++			kprintf(" AS%u %s C%u O%u VA%u L3 %u J%u F%u R%u", as, u->broken ? "STUCK" : u->live ? "UP" : "OFF",
++			    u->clients, u->opens, u->chunks, u->l3, u->jobs, u->faults, u->recovers);
++		}
++	}
++	kprintf("\n");
 +	/* v64: the scheduler (a snapshot, no lock). */
 +	kprintf("GPUSCHED %s THREAD %u Q %u/%u RUN %x QUEUED %u DONE %u FAIL %u TMO %u FAULT %u REC %u HOT %u REF %u "
 +	    "MAXQ %u US AVG %u MAX %u WAITS %u LAST %x PID %d ASF %x@%x\n", sched_mode == 0 ? "OFF" : "ON",
@@ -8399,7 +8682,7 @@ index 0000000..e3b8eb3
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 diff --git a/iokit/Kernel/arm/HeroGPU.cpp b/iokit/Kernel/arm/HeroGPU.cpp
-index 3ba3cb8..08ef1dc 100644
+index 3ba3cb8..5ff3a48 100644
 --- a/iokit/Kernel/arm/HeroGPU.cpp
 +++ b/iokit/Kernel/arm/HeroGPU.cpp
 @@ -16,6 +16,7 @@
@@ -8419,7 +8702,7 @@ index 3ba3cb8..08ef1dc 100644
  #include <IOKit/IOService.h>
  #include <IOKit/IOUserClient.h>
  #include <IOKit/IOKitKeys.h>
-@@ -39,6 +40,51 @@
+@@ -39,6 +40,54 @@
  #include <sys/proc.h>
  #include "SweetSurface.h"
  
@@ -8427,8 +8710,10 @@ index 3ba3cb8..08ef1dc 100644
 +/*
 + * 7c-5b: the Galaxy A04s's Mali-G52 MP1 (Bifrost, v7) through bsd/dev/a04s_gpu.c, with the same
 + * selectors, so gpu/mesa/herodrm.c serves both phones. User buffers live in their own GPU address
-+ * space (AS1, GPU VA 0x40000000-0x80000000), apart from the panel and the kernel's GPU pages in
-+ * AS0, and every page is checked to be RAM before it is mapped. Jobs run one at a time under the
++ * space (GPU VA 0x40000000-0x80000000), apart from the panel and the kernel's GPU pages in AS0, and
++ * every page is checked to be RAM before it is mapped. v65 (7c-7b): each client opens its own address
++ * space (AS1 for backboardd, AS2-AS7 for the others, the extras sharing the last), and a fault ends
++ * only that address space's jobs. Jobs run one at a time under the
 + * GPU lock, after the thermal limit, polled for at most 1 s; a faulting job fails alone and AS1 is
 + * recovered. The first client brings AS1 and the cores up; the last one, once its buffers are
 + * gone, powers the cores off (unless sweetfb_gpu=1 uses them). No IOAcceleratorES on this phone
@@ -8437,13 +8722,14 @@ index 3ba3cb8..08ef1dc 100644
 +#include <sys/errno.h>
 +struct a04s_fence;
 +extern "C" {
-+bool a04s_gpu_user_open(void);
-+void a04s_gpu_user_close(void);
++/* v65: every call names the client's address space, from a04s_gpu_user_open(). */
++unsigned a04s_gpu_user_open(bool display);
++void a04s_gpu_user_close(unsigned as);
 +uint32_t a04s_gpu_reg(uint32_t off);
-+uint64_t a04s_gpu_user_va_alloc(uint64_t bytes);
-+bool a04s_gpu_user_map(uint64_t va, const uint64_t *pages, unsigned n);
-+void a04s_gpu_user_unmap(uint64_t va, unsigned n);
-+uint32_t a04s_gpu_user_submit(unsigned js, uint64_t jc, uint64_t *us);
++uint64_t a04s_gpu_user_va_alloc(unsigned as, uint64_t bytes);
++bool a04s_gpu_user_map(unsigned as, uint64_t va, const uint64_t *pages, unsigned n);
++void a04s_gpu_user_unmap(unsigned as, uint64_t va, unsigned n);
++uint32_t a04s_gpu_user_submit(unsigned as, unsigned js, uint64_t jc, uint64_t *us);
 +/* v64 (7c-7a): the scheduler and its fences (bsd/dev/a04s_gpu.c). */
 +bool a04s_gpu_sched_on(void);
 +struct a04s_fence *a04s_fence_create(bool signaled);
@@ -8451,16 +8737,16 @@ index 3ba3cb8..08ef1dc 100644
 +void a04s_fence_release(struct a04s_fence *f);
 +uint64_t a04s_gpu_deadline(int64_t ns);
 +int a04s_fence_wait(struct a04s_fence *const *f, unsigned n, bool all, uint64_t deadline, unsigned *first);
-+struct a04s_fence *a04s_gpu_queue(unsigned js, uint64_t jc, struct a04s_fence *const *deps, unsigned ndeps,
-+    void (*retire)(void *ctx), void *ctx);
++struct a04s_fence *a04s_gpu_queue(unsigned as, unsigned js, uint64_t jc, struct a04s_fence *const *deps,
++    unsigned ndeps, void (*retire)(void *ctx), void *ctx);
 +}
-+#define herolte_gpu_up          a04s_gpu_user_open
-+#define herolte_gpu_down        a04s_gpu_user_close
 +#define herolte_gpu_reg         a04s_gpu_reg
-+#define herolte_gpu_va_alloc    a04s_gpu_user_va_alloc
-+#define herolte_gpu_map         a04s_gpu_user_map
-+#define herolte_gpu_unmap       a04s_gpu_user_unmap
-+#define herolte_gpu_submit      a04s_gpu_user_submit
++#define HG_UP(display)              a04s_gpu_user_open(display)
++#define HG_DOWN(as)                 a04s_gpu_user_close(as)
++#define HG_VA_ALLOC(as, bytes)      a04s_gpu_user_va_alloc((as), (bytes))
++#define HG_MAP(as, va, pa, n)       a04s_gpu_user_map((as), (va), (pa), (n))
++#define HG_UNMAP(as, va, n)         a04s_gpu_user_unmap((as), (va), (n))
++#define HG_SUBMIT(as, js, jc, us)   a04s_gpu_user_submit((as), (js), (jc), (us))
 +#define HEROGPU_NAME            "Mali-G52 MP1"
 +#define HEROGPU_ACCEL_DEFAULT   0
 +#define HEROGPU_SELFTEST_MS     90000
@@ -8471,7 +8757,7 @@ index 3ba3cb8..08ef1dc 100644
  extern "C" {
  bool herolte_gpu_up(void);
  uint32_t herolte_gpu_reg(uint32_t off);
-@@ -47,6 +93,16 @@ bool herolte_gpu_map(uint64_t va, const uint64_t *pages, unsigned n);
+@@ -47,6 +96,23 @@ bool herolte_gpu_map(uint64_t va, const uint64_t *pages, unsigned n);
  void herolte_gpu_unmap(uint64_t va, unsigned n);
  uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
  }
@@ -8479,6 +8765,13 @@ index 3ba3cb8..08ef1dc 100644
 +herolte_gpu_down(void)
 +{
 +}
++/* v65: the S7 has one address space: the AS argument is ignored. */
++#define HG_UP(display)              (herolte_gpu_up() ? 1u : 0u)
++#define HG_DOWN(as)                 herolte_gpu_down()
++#define HG_VA_ALLOC(as, bytes)      herolte_gpu_va_alloc(bytes)
++#define HG_MAP(as, va, pa, n)       herolte_gpu_map((va), (pa), (n))
++#define HG_UNMAP(as, va, n)         herolte_gpu_unmap((va), (n))
++#define HG_SUBMIT(as, js, jc, us)   herolte_gpu_submit((js), (jc), (us))
 +#define HEROGPU_NAME            "Mali-T880 MP12"
 +#define HEROGPU_ACCEL_DEFAULT   1
 +#define HEROGPU_SELFTEST_MS     70000
@@ -8488,7 +8781,7 @@ index 3ba3cb8..08ef1dc 100644
  
  enum {
  	kHeroGPUGetParam = 0,
-@@ -57,6 +113,15 @@ enum {
+@@ -57,6 +123,15 @@ enum {
  	kHeroGPULog      = 5,
  	kHeroGPUSurfaceBO = 6,
  	kHeroGPUSyncBO   = 7,
@@ -8504,7 +8797,7 @@ index 3ba3cb8..08ef1dc 100644
  };
  
  #define HEROGPU_MAX_BOS         4096
-@@ -107,21 +172,31 @@ herogpu_param(uint64_t param)
+@@ -107,21 +182,32 @@ herogpu_param(uint64_t param)
  		return id & 0xffff;
  	case 38:        /* NR_CORE_GROUPS: one L2 */
  		return 1;
@@ -8532,11 +8825,41 @@ index 3ba3cb8..08ef1dc 100644
  	uint64_t                  va;
  	uint32_t                  pages;
 +	uint32_t                  refs;         /* v64: the handle, plus one per queued job that lists it */
++	uint32_t                  as;           /* v65: the client's address space it is mapped in */
 +	struct a04s_fence        *last;         /* v64 (A04s): the last job that listed it; with the client lock */
  };
  
  static bool
-@@ -198,6 +273,37 @@ herogpu_bo_import_surface(struct herogpu_bo *bo, uint32_t id)
+@@ -158,8 +244,9 @@ herogpu_surface_sync(SweetSurface *s)
+  * write. The surface stays retained until the BO is freed.
+  */
+ static bool
+-herogpu_bo_import_surface(struct herogpu_bo *bo, uint32_t id)
++herogpu_bo_import_surface(struct herogpu_bo *bo, uint32_t id, unsigned as)
+ {
++	bo->as = as;
+ 	SweetSurface *s = sweet_surface_copy(id);
+ 	if (s == NULL || s->memory == NULL || s->allocSize == 0) {
+ 		OSSafeReleaseNULL(s);
+@@ -178,14 +265,14 @@ herogpu_bo_import_surface(struct herogpu_bo *bo, uint32_t id)
+ 		pa[i] = s->memory->getPhysicalSegment((IOByteCount)i * 0x1000, &len, kIOMemoryMapperNone);
+ 		ok = pa[i] != 0 && (pa[i] & 0xfff) == 0;
+ 	}
+-	bo->va = ok ? herolte_gpu_va_alloc(size) : 0;
+-	ok = bo->va != 0 && herolte_gpu_map(bo->va, pa, bo->pages);
++	bo->va = ok ? HG_VA_ALLOC(as, size) : 0;
++	ok = bo->va != 0 && HG_MAP(as, bo->va, pa, bo->pages);
+ 	if (pa != NULL) {
+ 		IOFreeData(pa, bo->pages * sizeof(uint64_t));
+ 	}
+ 	if (!ok) {
+ 		if (bo->va != 0) {
+-			herolte_gpu_unmap(bo->va, bo->pages);   /* and its VA */
++			HG_UNMAP(as, bo->va, bo->pages);   /* and its VA */
+ 		}
+ 		s->release();
+ 		bo->va = 0;
+@@ -198,10 +285,42 @@ herogpu_bo_import_surface(struct herogpu_bo *bo, uint32_t id)
  	return true;
  }
  
@@ -8573,8 +8896,29 @@ index 3ba3cb8..08ef1dc 100644
 +
  /* Allocate, zero, clean and GPU-map a buffer. */
  static bool
- herogpu_bo_create(struct herogpu_bo *bo, uint64_t size)
-@@ -237,6 +343,9 @@ herogpu_bo_create(struct herogpu_bo *bo, uint64_t size)
+-herogpu_bo_create(struct herogpu_bo *bo, uint64_t size)
++herogpu_bo_create(struct herogpu_bo *bo, uint64_t size, unsigned as)
+ {
++	bo->as = as;
+ 	size = (size + 0xfff) & ~0xfffull;
+ 	if (size == 0 || size > HEROGPU_MAX_BO_BYTES) {
+ 		return false;
+@@ -225,18 +344,21 @@ herogpu_bo_create(struct herogpu_bo *bo, uint64_t size)
+ 		pa[i] = bo->mem->getPhysicalSegment((IOByteCount)i * 0x1000, &len, kIOMemoryMapperNone);
+ 		ok = pa[i] != 0;
+ 	}
+-	bo->va = ok ? herolte_gpu_va_alloc(size) : 0;
+-	ok = bo->va != 0 && herolte_gpu_map(bo->va, pa, bo->pages);
++	bo->va = ok ? HG_VA_ALLOC(as, size) : 0;
++	ok = bo->va != 0 && HG_MAP(as, bo->va, pa, bo->pages);
+ 	if (pa != NULL) {
+ 		IOFreeData(pa, bo->pages * sizeof(uint64_t));
+ 	}
+ 	if (!ok) {
+ 		if (bo->va != 0) {
+-			herolte_gpu_unmap(bo->va, bo->pages);   /* and its VA */
++			HG_UNMAP(as, bo->va, bo->pages);   /* and its VA */
+ 		}
  		OSSafeReleaseNULL(bo->mem);
  		bo->va = 0;
  	}
@@ -8584,10 +8928,12 @@ index 3ba3cb8..08ef1dc 100644
  	return ok;
  }
  
-@@ -247,12 +356,209 @@ herogpu_bo_free(struct herogpu_bo *bo)
+@@ -246,13 +368,210 @@ herogpu_bo_free(struct herogpu_bo *bo)
+ 	if (!herogpu_bo_used(bo)) {
  		return;
  	}
- 	herolte_gpu_unmap(bo->va, bo->pages);
+-	herolte_gpu_unmap(bo->va, bo->pages);
++	HG_UNMAP(bo->as, bo->va, bo->pages);
 +	if (bo->mem != NULL) {
 +		herogpu_mem_note(-(int64_t)bo->pages * 0x1000);      /* v60 */
 +	}
@@ -8646,10 +8992,10 @@ index 3ba3cb8..08ef1dc 100644
 + * any of them (Linux panfrost's implicit sync, every BO a writer); WAIT_BO waits for that last job.
 + * PANFROST_JD_REQ_FS picks JS0, else JS1. A syncobj with no fence: as an in_sync it is ignored; a wait
 + * on it fails unless WAIT_FOR_SUBMIT (or WAIT_AVAILABLE), which waits for a submit to give it one.
-+ * At most 1024 BOs and 32 in_syncs a submit, 4096 syncobjs a client; larger calls are refused, never
++ * At most 4096 BOs and 32 in_syncs a submit, 4096 syncobjs a client; larger calls are refused, never
 + * cut. a04sgpu_sched=0 refuses 8-15.
 + */
-+#define HEROGPU_MAX_SUBMIT_BOS  1024u
++#define HEROGPU_MAX_SUBMIT_BOS  4096u          /* v65: was 1024 */
 +#define HEROGPU_MAX_IN_SYNCS    32u
 +#define HEROGPU_MAX_SYNCOBJS    4096u
 +#define HEROGPU_MAX_STRUCT      (64u * 1024u)
@@ -8794,13 +9140,14 @@ index 3ba3cb8..08ef1dc 100644
  class HeroGPU : public IOService {
  	OSDeclareDefaultStructors(HeroGPU);
  
-@@ -279,7 +585,41 @@ class HeroGPUUserClient : public IOUserClient {
+@@ -279,7 +598,42 @@ class HeroGPUUserClient : public IOUserClient {
  
  	task_t             fTask;
  	IOLock            *fLock;
 -	struct herogpu_bo *fBOs;          /* handle = index + 1 */
 +	struct herogpu_bo **fBOs;        /* handle = index + 1; v64: each BO refcounted */
 +	bool               fUp;          /* the GPU side was opened for this client */
++	unsigned           fAS;          /* v65: its GPU address space (a04s_gpu_user_open()) */
 +#if defined(ARM64_BOARD_CONFIG_A04S)
 +	struct herogpu_syncobj *fSync;   /* v64: handle = index + 1; allocated on first use */
 +#endif
@@ -8837,7 +9184,7 @@ index 3ba3cb8..08ef1dc 100644
  
  public:
  	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
-@@ -300,14 +640,29 @@ HeroGPU::start(IOService *provider)
+@@ -300,14 +654,29 @@ HeroGPU::start(IOService *provider)
  		return false;
  	}
  	setProperty(kIOUserClientClassKey, "HeroGPUUserClient");
@@ -8869,19 +9216,24 @@ index 3ba3cb8..08ef1dc 100644
  			es->registerService();
  			IOLog("HEROGPU: IOAcceleratorES registered\n");
  		}
-@@ -330,8 +685,9 @@ HeroGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
+@@ -330,8 +699,14 @@ HeroGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
  	}
  	fTask = owningTask;
  	fLock = IOLockAlloc();
 -	fBOs = (struct herogpu_bo *)IOMallocZeroData(HEROGPU_MAX_BOS * sizeof(*fBOs));
 -	return fLock != NULL && fBOs != NULL && herolte_gpu_up();
 +	fBOs = IONewZero(struct herogpu_bo *, HEROGPU_MAX_BOS);
-+	fUp = fLock != NULL && fBOs != NULL && herolte_gpu_up();
++	/* v65: backboardd composites the display: it gets the display AS, shared with no other process. */
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	bool display = strncmp(name, "backboardd", sizeof(name)) == 0;
++	fAS = fLock != NULL && fBOs != NULL ? HG_UP(display) : 0;
++	fUp = fAS != 0;
 +	return fUp;
  }
  
  IOReturn
-@@ -346,11 +702,25 @@ HeroGPUUserClient::free(void)
+@@ -346,11 +721,25 @@ HeroGPUUserClient::free(void)
  {
  	if (fBOs != NULL) {
  		for (unsigned i = 0; i < HEROGPU_MAX_BOS; i++) {
@@ -8903,13 +9255,13 @@ index 3ba3cb8..08ef1dc 100644
 +	}
 +#endif
 +	if (fUp) {
-+		herolte_gpu_down();     /* after every buffer, so their GPU VA is back (unless a job still holds one) */
++		HG_DOWN(fAS);           /* after every buffer, so their GPU VA is back (unless a job still holds one) */
 +		fUp = false;
 +	}
  	if (fLock != NULL) {
  		IOLockFree(fLock);
  		fLock = NULL;
-@@ -358,6 +728,297 @@ HeroGPUUserClient::free(void)
+@@ -358,6 +747,297 @@ HeroGPUUserClient::free(void)
  	IOUserClient::free();
  }
  
@@ -8970,7 +9322,7 @@ index 3ba3cb8..08ef1dc 100644
 +	ctx->bos = bos;
 +	ctx->n = s.bo_handle_count;
 +	/* a04s_gpu_queue() takes its own references on deps before it returns (we hold fLock meanwhile). */
-+	struct a04s_fence *f = a04s_gpu_queue((s.requirements & HEROGPU_REQ_FS) ? 0 : 1, s.jc, deps, nd,
++	struct a04s_fence *f = a04s_gpu_queue(fAS, (s.requirements & HEROGPU_REQ_FS) ? 0 : 1, s.jc, deps, nd,
 +	    herogpu_job_retire, ctx);
 +	if (deps != NULL) {
 +		IODelete(deps, struct a04s_fence *, nd);
@@ -9207,7 +9559,7 @@ index 3ba3cb8..08ef1dc 100644
  IOReturn
  HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
      __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
-@@ -368,6 +1029,19 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+@@ -368,6 +1048,19 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
  	IOReturn ret = kIOReturnSuccess;
  	uint64_t in0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
  	uint64_t in1 = args->scalarInputCount > 1 ? args->scalarInput[1] : 0;
@@ -9227,7 +9579,7 @@ index 3ba3cb8..08ef1dc 100644
  
  	IOLockLock(fLock);
  	switch (selector) {
-@@ -376,44 +1050,49 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+@@ -376,44 +1069,49 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
  		outCount = 1;
  		break;
  	case kHeroGPUCreateBO: {
@@ -9242,7 +9594,7 @@ index 3ba3cb8..08ef1dc 100644
 -		} else if (!herogpu_bo_create(&fBOs[i], in0)) {
 +		} else if (b == NULL) {
 +			ret = kIOReturnNoMemory;
-+		} else if (!herogpu_bo_create(b, in0)) {
++		} else if (!herogpu_bo_create(b, in0, fAS)) {
 +			IOFreeType(b, struct herogpu_bo);
  			ret = kIOReturnNoMemory;
  		} else {
@@ -9294,7 +9646,7 @@ index 3ba3cb8..08ef1dc 100644
  			outCount = 1;
  		}
  		break;
-@@ -422,7 +1101,8 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+@@ -422,27 +1120,30 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
  		/*
  		 * Not under the client's lock: the call lasts as long as the job,
  		 * and gpu/mesa/herodrm.c queues jobs so that its other calls (log,
@@ -9303,8 +9655,9 @@ index 3ba3cb8..08ef1dc 100644
 +		 * the job goes through the scheduler and this waits for its fence.)
  		 */
  		IOLockUnlock(fLock);
- 		out[0] = herolte_gpu_submit(in1 ? 1 : 0, in0, &out[1]);
-@@ -430,19 +1110,21 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+-		out[0] = herolte_gpu_submit(in1 ? 1 : 0, in0, &out[1]);
++		out[0] = HG_SUBMIT(fAS, in1 ? 1 : 0, in0, &out[1]);
+ 		IOLockLock(fLock);
  		outCount = 2;
  		break;
  	case kHeroGPUSurfaceBO: {
@@ -9319,7 +9672,7 @@ index 3ba3cb8..08ef1dc 100644
 -		} else if (!herogpu_bo_import_surface(&fBOs[i], (uint32_t)in0)) {
 +		} else if (b == NULL) {
 +			ret = kIOReturnNoMemory;
-+		} else if (!herogpu_bo_import_surface(b, (uint32_t)in0)) {
++		} else if (!herogpu_bo_import_surface(b, (uint32_t)in0, fAS)) {
 +			IOFreeType(b, struct herogpu_bo);
  			ret = kIOReturnNotFound;
  		} else {
@@ -9334,7 +9687,7 @@ index 3ba3cb8..08ef1dc 100644
  			out[3] = s->bytesPerRow;
  			out[4] = s->width;
  			out[5] = s->height;
-@@ -454,30 +1136,78 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+@@ -454,30 +1155,78 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
  		break;
  	}
  	case kHeroGPUSyncBO: {
@@ -9418,42 +9771,49 @@ index 3ba3cb8..08ef1dc 100644
  
  	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
  		args->scalarOutput[i] = i < outCount ? out[i] : 0;
-@@ -499,9 +1229,10 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+@@ -499,9 +1248,11 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
  static void
  herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  {
 -	IOSleep(70000);
+-	if (!herolte_gpu_up()) {
 +	IOSleep(HEROGPU_SELFTEST_MS);
- 	if (!herolte_gpu_up()) {
++	unsigned as = HG_UP(false);
++	if (as == 0) {
  		IOLog("HEROGPU SELFTEST: GPU not up\n");
 +		HEROGPU_NOTE_LIT(1, "HEROGPU SELFTEST: GPU not up");
  		return;
  	}
  	IOLog("HEROGPU SELFTEST: GPU_ID %#llx rev %#llx shaders %#llx tiler features %#llx "
-@@ -511,6 +1242,8 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+@@ -509,8 +1260,10 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+ 	    herogpu_param(2), herogpu_param(10), herogpu_param(18), herogpu_param(14));
+ 	struct herogpu_bo bo;
  	bzero(&bo, sizeof(bo));
- 	if (!herogpu_bo_create(&bo, 0x10000)) {
+-	if (!herogpu_bo_create(&bo, 0x10000)) {
++	if (!herogpu_bo_create(&bo, 0x10000, as)) {
  		IOLog("HEROGPU SELFTEST: buffer failed\n");
 +		HEROGPU_NOTE_LIT(1, "HEROGPU SELFTEST: buffer failed");
-+		herolte_gpu_down();
++		HG_DOWN(as);
  		return;
  	}
  	/* Through a write-combined kernel mapping, as a client would. */
-@@ -519,7 +1252,9 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+@@ -519,7 +1272,9 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  	volatile uint8_t *job = map ? (volatile uint8_t *)map->getVirtualAddress() : NULL;
  	if (job == NULL) {
  		IOLog("HEROGPU SELFTEST: mapping failed\n");
 +		HEROGPU_NOTE_LIT(1, "HEROGPU SELFTEST: mapping failed");
  		herogpu_bo_free(&bo);
-+		herolte_gpu_down();
++		HG_DOWN(as);
  		return;
  	}
  	job[16] = 1 | (2 << 1);                         /* 64-bit, WRITE_VALUE */
-@@ -531,9 +1266,13 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+@@ -530,10 +1285,14 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+ 	*output = 0xa5a5a5a55a5a5a5aull;
  	__asm__ volatile ("dsb sy" ::: "memory");
  	uint64_t us = 0;
- 	uint32_t status = herolte_gpu_submit(1, bo.va, &us);
+-	uint32_t status = herolte_gpu_submit(1, bo.va, &us);
 -	IOLog("HEROGPU SELFTEST: buffer at GPU VA %#llx, status %#x in %llu us, output %#llx -> %s\n",
++	uint32_t status = HG_SUBMIT(as, 1, bo.va, &us);
 +	char note[160];
 +	snprintf(note, sizeof(note), "HEROGPU SELFTEST: buffer at GPU VA %#llx, status %#x in %llu us, output %#llx -> %s",
  	    bo.va, status, us, *output, status == 0 && *output == 0 ? "OK" : "FAILED");
@@ -9461,7 +9821,7 @@ index 3ba3cb8..08ef1dc 100644
 +	HEROGPU_NOTE(1, note, strnlen(note, sizeof(note)));
  	map->release();
  	herogpu_bo_free(&bo);
-+	herolte_gpu_down();
++	HG_DOWN(as);
  }
 -#endif /* ARM64_BOARD_CONFIG_HEROLTE */
 +#endif /* ARM64_BOARD_CONFIG_HEROLTE || ARM64_BOARD_CONFIG_A04S */
