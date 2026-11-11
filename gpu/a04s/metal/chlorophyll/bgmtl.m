@@ -147,6 +147,10 @@ __attribute__((weak)) void bgmtl_note_completed(void) {}   // a command buffer f
 __attribute__((weak)) void bgmtl_note_committed(void) {}   // a command buffer was committed (starts the injection's dead-man clock)
 __attribute__((weak)) void bgmtl_note_line(const char *line) { (void)line; }   // one diagnostic line, logged by the injection dylib
 __attribute__((weak)) void bgmtl_note_present(const char *line) { (void)line; }   // per-present diagnostics, logged (rate-limited) by the injection dylib   // likewise: logged by the injection dylib
+// A04s (Metal track M6b, a04s_bb.m in backboardd): each IOSurface a texture is made over, and what became of it
+__attribute__((weak)) void bgmtl_note_surface(unsigned id, size_t w, size_t h, size_t bpr, size_t alloc, unsigned fmt, unsigned planes,
+                                              unsigned plane, int render_target, const char *result)
+{ (void)id; (void)w; (void)h; (void)bpr; (void)alloc; (void)fmt; (void)planes; (void)plane; (void)render_target; (void)result; }
 // A04s (Metal track M6b, a04s_bb.m in backboardd): the first refresh of each CPU-written texture, its rows as stored
 __attribute__((weak)) void bgmtl_note_cpu_rows(const char *what, unsigned w, unsigned h, unsigned fmt, const uint8_t *src, size_t bpr,
                                                int reversed)
@@ -1696,16 +1700,33 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    char why[512] = { 0 };
    if (surface) {
       _shape.usage |= 5;   /* a drawable is rendered into and may be sampled whatever CA asked for (MTLTextureUsageRenderTarget | ShaderRead) */
+      /* A04s (M6b boot 1): the kernel panicked wiring a page past the end of a one-page VM object, and backboardd on Metal
+       * imports every IOSurface it samples (SpringBoard's backing stores down to 24 x 28) where the ES route did not.
+       * A04S_SURFACE_IMPORT_MIN_BYTES: a surface smaller than that (IOSurfaceGetAllocSize) that is not rendered into takes
+       * the copy path below instead of the kernel's SurfaceBO; 0 (the default) imports every one. Each import is reported
+       * to bgmtl_note_surface (a04s_bb.m logs them in backboardd). */
+      static long min_import = -1;
+      if (min_import < 0)
+         min_import = getenv("A04S_SURFACE_IMPORT_MIN_BYTES") ? atol(getenv("A04S_SURFACE_IMPORT_MIN_BYTES")) : 0;
+      const size_t alloc = IOSurfaceGetAllocSize((IOSurfaceRef)surface);
+      const BOOL rt = ([d usage] & MTLTextureUsageRenderTarget) != 0;
+      const BOOL small = min_import > 0 && alloc < (size_t)min_import && !rt;
       /* a CAMetalLayer drawable: CoreAnimation made the IOSurface and sends the device this one message; the texture IS that memory */
       bg_lock();
-      _tex = rwa_texture_from_surface([device rwa], &_shape, (int)IOSurfaceGetID((IOSurfaceRef)surface), 0, 0, why, sizeof(why));
+      if (!small)
+         _tex = rwa_texture_from_surface([device rwa], &_shape, (int)IOSurfaceGetID((IOSurfaceRef)surface), 0, 0, why, sizeof(why));
+      bgmtl_note_surface(IOSurfaceGetID((IOSurfaceRef)surface), IOSurfaceGetWidthOfPlane((IOSurfaceRef)surface, plane),
+                         IOSurfaceGetHeightOfPlane((IOSurfaceRef)surface, plane),
+                         IOSurfaceGetBytesPerRowOfPlane((IOSurfaceRef)surface, plane), alloc,
+                         (unsigned)IOSurfaceGetPixelFormat((IOSurfaceRef)surface), (unsigned)IOSurfaceGetPlaneCount((IOSurfaceRef)surface),
+                         (unsigned)plane, rt, _tex ? "imported" : small ? "copy (under A04S_SURFACE_IMPORT_MIN_BYTES)" : why);
       /* A04s (Metal track M6): a surface the GPU cannot take as it is -- small glyph and mask backing stores whose rows
        * are not 64-byte aligned, the EAGL route's missing page dots and magnifier -- gets a texture of our own, filled
        * from the surface's pixels when it is sampled and the surface's seed has moved since. Without it the texture was
        * nil and the layer was simply not drawn. Not for a render target: CoreAnimation's drawables import directly. */
       if (!_tex) {
          static unsigned logged;
-         if (logged++ < 16)
+         if (!small && logged++ < 16)
             BG_LOG("IOSurface %u (%zux%zu, %zu bytes a row) not importable (%s); a copy refreshed from it stands in\n",
                    IOSurfaceGetID((IOSurfaceRef)surface), IOSurfaceGetWidthOfPlane((IOSurfaceRef)surface, plane),
                    IOSurfaceGetHeightOfPlane((IOSurfaceRef)surface, plane),
@@ -1830,8 +1851,16 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
       bg_unlock();
    }
    if (_linSrc && _tex) {
+      /* A04s (M6b boot 1): in backboardd every CPU-written texture (labels, the clock, the date) came out upside down with its
+       * rows reversed, and the label dumps are upright as stored. So rows go as stored there; the probe's CARenderer scenes
+       * (M6a run 12) still match only reversed -- why the two differ is open (the probe's CPU reference is drawn into an
+       * unflipped CGBitmapContext). BGMTL_FLIP_CPU_TEXTURES=0/1 still overrides both. */
+      static int reverse_by_default = -1;
+      if (reverse_by_default < 0)
+         reverse_by_default = strcmp(getprogname(), "backboardd") != 0;
       bg_lock();
-      [self a04sWriteCPURows:(const uint8_t *)[(BGMTLBuffer *)_linSrc contents] + _linOff bytesPerRow:_linBpr what:"linear" flipByDefault:YES];
+      [self a04sWriteCPURows:(const uint8_t *)[(BGMTLBuffer *)_linSrc contents] + _linOff bytesPerRow:_linBpr what:"linear"
+               flipByDefault:reverse_by_default ? YES : NO];
       bg_unlock();
    }
    return _tex;

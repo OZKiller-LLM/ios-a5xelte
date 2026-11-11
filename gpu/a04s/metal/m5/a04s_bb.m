@@ -20,10 +20,12 @@
  * - A line every 10 s while compositing: command buffers committed, completed and failed, commit to
  *   completion time (average and maximum), pipelines built and refused, textures refused, draws and clears
  *   skipped, Metal selectors the device does not implement.
+ * - Each texture over an IOSurface: its size, allocation and whether the kernel imported it (M6b boot 1 panicked wiring a
+ *   page past a one-page object), and A04S_SURFACE_IMPORT_MIN_BYTES in bgmtl.m to copy small ones instead.
  * - The first CPU-written (linear) textures: their size, format and whether their rows were reversed, and
- *   the first A04S_BB_DUMP_LINEAR (default 8) of up to 512 x 512 written as stored, before any reversal,
- *   to bb-metal/linear-NN-WxH-fmtF.bgra: an icon that reads upright there confirms the reversal (M6a
- *   run 12) for backboardd's icons and wallpaper.
+ *   the first A04S_BB_DUMP_LINEAR (default 8) of up to 512 x 512 (at least 8 rows) written as stored, before any reversal,
+ *   to bb-metal/linear-NN-WxH-fmtF-bprB.raw. Boot 1: labels are upright as stored, so backboardd no longer reverses
+ *   them (bgmtl.m); the probe still does (M6a run 12).
  */
 #define A04S_LOG_DIVERT_STRONG 1
 #import <Foundation/Foundation.h>
@@ -312,7 +314,8 @@ bgmtl_note_cpu_rows(const char *what, unsigned w, unsigned h, unsigned fmt, cons
    if (k < 24)
       bb_log("bb: %s texture %ux%u fmt %u, rows of %zu bytes, rows %s", what, w, h, fmt, bpr,
              reversed ? "reversed (bottom-up, as CoreAnimation samples them)" : "as stored");
-   if (!src || w == 0 || h == 0 || w > 512 || h > 512 || bpr < (size_t)w * 4)
+   /* boot 1 spent its slots on 256 x 1 lookup tables; text masks are 2 bytes a pixel (RG8), so rows go out whole */
+   if (!src || w == 0 || h < 8 || w > 512 || h > 512 || bpr < w || bpr > 4096)
       return;
    unsigned d = __atomic_fetch_add(&dumped, 1, __ATOMIC_RELAXED);
    if ((int)d >= dump_max) {
@@ -320,23 +323,59 @@ bgmtl_note_cpu_rows(const char *what, unsigned w, unsigned h, unsigned fmt, cons
       return;
    }
    struct bb_dump *job = calloc(1, sizeof(*job));
-   uint8_t *bytes = malloc((size_t)w * 4 * h);
+   uint8_t *bytes = malloc(bpr * h);
    if (!job || !bytes) {
       free(job);
       free(bytes);
       return;
    }
-   for (unsigned y = 0; y < h; y++)
-      memcpy(bytes + (size_t)y * w * 4, src + (size_t)y * bpr, (size_t)w * 4);
-   snprintf(job->path, sizeof(job->path), BB_DIR "/linear-%02u-%ux%u-fmt%u.bgra", d, w, h, fmt);
+   memcpy(bytes, src, bpr * h);
+   snprintf(job->path, sizeof(job->path), BB_DIR "/linear-%02u-%ux%u-fmt%u-bpr%zu.raw", d, w, h, fmt, bpr);
    job->bytes = bytes;
-   job->len = (size_t)w * 4 * h;
+   job->len = bpr * h;
    pthread_mutex_lock(&bb_q_lock);
    job->next = bb_dumps;
    bb_dumps = job;
    pthread_cond_signal(&bb_q_cond);
    pthread_mutex_unlock(&bb_q_lock);
    bb_log("bb: %s texture %ux%u fmt %u written as stored to %s", what, w, h, fmt, job->path);
+}
+
+/* bgmtl.m: a texture over an IOSurface, and whether the kernel imported it (M6b boot 1's panic: a page wired past the end
+ * of a one-page VM object). The first 400 are logged; the stats line counts them by outcome. */
+static unsigned bb_surf_imported, bb_surf_copied, bb_surf_refused;
+static size_t bb_surf_smallest = SIZE_MAX;
+
+void
+bgmtl_note_surface(unsigned id, size_t w, size_t h, size_t bpr, size_t alloc, unsigned fmt, unsigned planes, unsigned plane,
+                   int render_target, const char *result)
+{
+   if (!atomic_load(&bb_on))
+      return;
+   static unsigned shown;
+   const bool imported = result && !strcmp(result, "imported"), copied = result && !strncmp(result, "copy", 4);
+   pthread_mutex_lock(&bb_c_lock);
+   if (imported) {
+      bb_surf_imported++;
+      if (alloc < bb_surf_smallest)
+         bb_surf_smallest = alloc;
+   } else if (copied) {
+      bb_surf_copied++;
+   } else {
+      bb_surf_refused++;
+   }
+   bool show = shown < 400;
+   if (show)
+      shown++;
+   pthread_mutex_unlock(&bb_c_lock);
+   if (show) {
+      char f[5] = { (char)(fmt >> 24), (char)(fmt >> 16), (char)(fmt >> 8), (char)fmt, 0 };
+      for (unsigned i = 0; i < 4; i++)
+         if (f[i] < 0x20 || f[i] > 0x7e)
+            f[i] = '?';
+      bb_log("bb: IOSurface %u %zux%zu, %zu bytes a row, alloc %zu (%#zx), '%s' %u plane(s) [%u]%s: %s", id, w, h, bpr, alloc,
+             alloc, f, planes, plane, render_target ? ", render target" : "", result ? result : "-");
+   }
 }
 
 /* ---- images ------------------------------------------------------------------------------------ */
@@ -469,6 +508,10 @@ bb_main(void *arg)
          unsigned pm = bb_pipes_made, pr = bb_pipes_refused, tr = bb_tex_refused, ds = bb_draw_skipped,
                   cs = bb_clear_skipped, orf = bb_other_refused;
          double ps = bb_pipe_secs;
+         unsigned si = bb_surf_imported, sc = bb_surf_copied, sr = bb_surf_refused;
+         size_t ss = bb_surf_smallest;
+         bb_surf_imported = bb_surf_copied = bb_surf_refused = 0;
+         bb_surf_smallest = SIZE_MAX;
          bb_lat_n = bb_lat_sum = bb_lat_max = 0;
          bb_pipes_made = bb_pipes_refused = 0;
          bb_pipe_secs = 0;
@@ -476,13 +519,14 @@ bb_main(void *arg)
          bb_presents = 0;
          pthread_mutex_unlock(&bb_c_lock);
          uint64_t dc = committed - w_committed, dd = completed - w_completed, df = failed - w_failed;
-         if (dc || dd || df || pm || pr || outstanding)
+         if (dc || dd || df || pm || pr || outstanding || si || sc || sr)
             bb_log("bb stats %.1f s: %llu committed, %llu completed (%.1f/s), %llu failed, %u outstanding (oldest %.2f s); "
                    "commit to completion avg %.1f ms, max %.1f ms; %llu presents; pipelines %u made, %u refused, %.1f s building; "
-                   "textures refused %u, draws skipped %u, clears skipped %u, other refusals %u",
+                   "textures refused %u, draws skipped %u, clears skipped %u, other refusals %u; IOSurfaces %u imported "
+                   "(smallest %zu bytes), %u copied, %u refused",
                    t - last_stats, (unsigned long long)dc, (unsigned long long)dd, dd / (t - last_stats),
                    (unsigned long long)df, outstanding, oldest, lat_n ? lat_sum / 1e6 / lat_n : 0, lat_max / 1e6,
-                   (unsigned long long)presents, pm, pr, ps, tr, ds, cs, orf);
+                   (unsigned long long)presents, pm, pr, ps, tr, ds, cs, orf, si, si ? ss : 0, sc, sr);
          w_committed = committed;
          w_completed = completed;
          w_failed = failed;
