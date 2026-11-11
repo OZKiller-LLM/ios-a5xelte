@@ -11198,6 +11198,40 @@ index 25438c9..d478b02 100644
 +	}
 +	kprintf("\n");
 +}
+diff --git a/osfmk/vm/vm_resident.c b/osfmk/vm/vm_resident.c
+index 6394730..6e6804c 100644
+--- a/osfmk/vm/vm_resident.c
++++ b/osfmk/vm/vm_resident.c
+@@ -84,6 +84,7 @@
+ #include <vm/vm_init.h>
+ #include <vm/vm_map.h>
+ #include <vm/vm_page.h>
++#include <kern/backtrace.h>
+ #include <vm/vm_pageout.h>
+ #include <vm/vm_kern.h>                 /* kmem_alloc() */
+ #include <kern/misc_protos.h>
+@@ -1805,8 +1806,19 @@ vm_page_insert_internal(
+ 		}
+ #endif
+ 		if (object->internal && (offset >= object->vo_size)) {
+-			panic("vm_page_insert_internal: (page=%p,obj=%p,off=0x%llx,size=0x%llx) inserted at offset past object bounds",
+-			    mem, object, offset, object->vo_size);
++			/* A04s v67: the call chain and the object on the panic screen (the A04s's M6b boot 1 panicked here with no backtrace). */
++			uintptr_t a04s_bt[10] = { 0 };
++			unsigned int a04s_n = backtrace(a04s_bt, 10, NULL, NULL);
++			panic("vm_page_insert_internal: (page=%p,obj=%p,off=0x%llx,size=0x%llx) inserted at offset past object bounds; "
++			    "obj ref %d res %u wired %u named %d phys %d pager %d delta 0x%x tag %u; bt(%u) %lx %lx %lx %lx %lx %lx %lx %lx %lx %lx",
++			    mem, object, offset, object->vo_size, object->ref_count, object->resident_page_count, object->wired_page_count,
++			    (int)object->named, (int)object->phys_contiguous, (int)object->pager_created, (unsigned)object->vo_size_delta,
++			    (unsigned)object->wire_tag, a04s_n,
++			    (unsigned long)VM_KERNEL_UNSLIDE(a04s_bt[0]), (unsigned long)VM_KERNEL_UNSLIDE(a04s_bt[1]),
++			    (unsigned long)VM_KERNEL_UNSLIDE(a04s_bt[2]), (unsigned long)VM_KERNEL_UNSLIDE(a04s_bt[3]),
++			    (unsigned long)VM_KERNEL_UNSLIDE(a04s_bt[4]), (unsigned long)VM_KERNEL_UNSLIDE(a04s_bt[5]),
++			    (unsigned long)VM_KERNEL_UNSLIDE(a04s_bt[6]), (unsigned long)VM_KERNEL_UNSLIDE(a04s_bt[7]),
++			    (unsigned long)VM_KERNEL_UNSLIDE(a04s_bt[8]), (unsigned long)VM_KERNEL_UNSLIDE(a04s_bt[9]));
+ 		}
+ 
+ 		assert(vm_page_lookup(object, offset) == VM_PAGE_NULL);
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 index c37636f..36da34c 100644
 --- a/pexpert/arm/pe_fiq.c
