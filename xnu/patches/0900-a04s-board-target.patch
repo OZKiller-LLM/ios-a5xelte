@@ -8789,7 +8789,7 @@ index 0000000..e3b8eb3
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 diff --git a/iokit/Kernel/arm/HeroGPU.cpp b/iokit/Kernel/arm/HeroGPU.cpp
-index 3ba3cb8..5ff3a48 100644
+index 3ba3cb8..6c75a50 100644
 --- a/iokit/Kernel/arm/HeroGPU.cpp
 +++ b/iokit/Kernel/arm/HeroGPU.cpp
 @@ -16,6 +16,7 @@
@@ -8966,7 +8966,7 @@ index 3ba3cb8..5ff3a48 100644
  		}
  		s->release();
  		bo->va = 0;
-@@ -198,10 +285,42 @@ herogpu_bo_import_surface(struct herogpu_bo *bo, uint32_t id)
+@@ -198,11 +285,54 @@ herogpu_bo_import_surface(struct herogpu_bo *bo, uint32_t id)
  	return true;
  }
  
@@ -9001,16 +9001,29 @@ index 3ba3cb8..5ff3a48 100644
 +	*bos = __atomic_load_n(&herogpu_live_bos, __ATOMIC_RELAXED);
 +}
 +
++/*
++ * v68: on the A04s a buffer a process can map is whole 16 KiB pages: the kernel's pages are 4 KiB but
++ * iOS processes' are 16 KiB, and touching a 4 KiB buffer faults a whole user page in, past the
++ * buffer's end (the M6b panic in vm_page_insert_internal). The GPU still maps it in 4 KiB pages.
++ */
++#if defined(ARM64_BOARD_CONFIG_A04S)
++#define HEROGPU_USER_PAGE       0x4000ull
++#else
++#define HEROGPU_USER_PAGE       0x1000ull
++#endif
++
  /* Allocate, zero, clean and GPU-map a buffer. */
  static bool
 -herogpu_bo_create(struct herogpu_bo *bo, uint64_t size)
 +herogpu_bo_create(struct herogpu_bo *bo, uint64_t size, unsigned as)
  {
+-	size = (size + 0xfff) & ~0xfffull;
 +	bo->as = as;
- 	size = (size + 0xfff) & ~0xfffull;
++	size = (size + HEROGPU_USER_PAGE - 1) & ~(HEROGPU_USER_PAGE - 1);
  	if (size == 0 || size > HEROGPU_MAX_BO_BYTES) {
  		return false;
-@@ -225,18 +344,21 @@ herogpu_bo_create(struct herogpu_bo *bo, uint64_t size)
+ 	}
+@@ -225,18 +355,21 @@ herogpu_bo_create(struct herogpu_bo *bo, uint64_t size)
  		pa[i] = bo->mem->getPhysicalSegment((IOByteCount)i * 0x1000, &len, kIOMemoryMapperNone);
  		ok = pa[i] != 0;
  	}
@@ -9035,7 +9048,7 @@ index 3ba3cb8..5ff3a48 100644
  	return ok;
  }
  
-@@ -246,13 +368,210 @@ herogpu_bo_free(struct herogpu_bo *bo)
+@@ -246,13 +379,210 @@ herogpu_bo_free(struct herogpu_bo *bo)
  	if (!herogpu_bo_used(bo)) {
  		return;
  	}
@@ -9247,7 +9260,7 @@ index 3ba3cb8..5ff3a48 100644
  class HeroGPU : public IOService {
  	OSDeclareDefaultStructors(HeroGPU);
  
-@@ -279,7 +598,42 @@ class HeroGPUUserClient : public IOUserClient {
+@@ -279,7 +609,42 @@ class HeroGPUUserClient : public IOUserClient {
  
  	task_t             fTask;
  	IOLock            *fLock;
@@ -9291,7 +9304,7 @@ index 3ba3cb8..5ff3a48 100644
  
  public:
  	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
-@@ -300,14 +654,29 @@ HeroGPU::start(IOService *provider)
+@@ -300,14 +665,29 @@ HeroGPU::start(IOService *provider)
  		return false;
  	}
  	setProperty(kIOUserClientClassKey, "HeroGPUUserClient");
@@ -9323,7 +9336,7 @@ index 3ba3cb8..5ff3a48 100644
  			es->registerService();
  			IOLog("HEROGPU: IOAcceleratorES registered\n");
  		}
-@@ -330,8 +699,14 @@ HeroGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
+@@ -330,8 +710,14 @@ HeroGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
  	}
  	fTask = owningTask;
  	fLock = IOLockAlloc();
@@ -9340,7 +9353,7 @@ index 3ba3cb8..5ff3a48 100644
  }
  
  IOReturn
-@@ -346,11 +721,25 @@ HeroGPUUserClient::free(void)
+@@ -346,11 +732,25 @@ HeroGPUUserClient::free(void)
  {
  	if (fBOs != NULL) {
  		for (unsigned i = 0; i < HEROGPU_MAX_BOS; i++) {
@@ -9368,7 +9381,7 @@ index 3ba3cb8..5ff3a48 100644
  	if (fLock != NULL) {
  		IOLockFree(fLock);
  		fLock = NULL;
-@@ -358,6 +747,297 @@ HeroGPUUserClient::free(void)
+@@ -358,6 +758,297 @@ HeroGPUUserClient::free(void)
  	IOUserClient::free();
  }
  
@@ -9666,7 +9679,7 @@ index 3ba3cb8..5ff3a48 100644
  IOReturn
  HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
      __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
-@@ -368,6 +1048,19 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+@@ -368,6 +1059,19 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
  	IOReturn ret = kIOReturnSuccess;
  	uint64_t in0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
  	uint64_t in1 = args->scalarInputCount > 1 ? args->scalarInput[1] : 0;
@@ -9686,7 +9699,7 @@ index 3ba3cb8..5ff3a48 100644
  
  	IOLockLock(fLock);
  	switch (selector) {
-@@ -376,44 +1069,49 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+@@ -376,44 +1080,49 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
  		outCount = 1;
  		break;
  	case kHeroGPUCreateBO: {
@@ -9753,7 +9766,7 @@ index 3ba3cb8..5ff3a48 100644
  			outCount = 1;
  		}
  		break;
-@@ -422,27 +1120,30 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+@@ -422,27 +1131,30 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
  		/*
  		 * Not under the client's lock: the call lasts as long as the job,
  		 * and gpu/mesa/herodrm.c queues jobs so that its other calls (log,
@@ -9794,7 +9807,7 @@ index 3ba3cb8..5ff3a48 100644
  			out[3] = s->bytesPerRow;
  			out[4] = s->width;
  			out[5] = s->height;
-@@ -454,30 +1155,78 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+@@ -454,30 +1166,78 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
  		break;
  	}
  	case kHeroGPUSyncBO: {
@@ -9878,7 +9891,7 @@ index 3ba3cb8..5ff3a48 100644
  
  	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
  		args->scalarOutput[i] = i < outCount ? out[i] : 0;
-@@ -499,9 +1248,11 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+@@ -499,9 +1259,11 @@ HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
  static void
  herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  {
@@ -9892,7 +9905,7 @@ index 3ba3cb8..5ff3a48 100644
  		return;
  	}
  	IOLog("HEROGPU SELFTEST: GPU_ID %#llx rev %#llx shaders %#llx tiler features %#llx "
-@@ -509,8 +1260,10 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+@@ -509,8 +1271,10 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  	    herogpu_param(2), herogpu_param(10), herogpu_param(18), herogpu_param(14));
  	struct herogpu_bo bo;
  	bzero(&bo, sizeof(bo));
@@ -9904,7 +9917,7 @@ index 3ba3cb8..5ff3a48 100644
  		return;
  	}
  	/* Through a write-combined kernel mapping, as a client would. */
-@@ -519,7 +1272,9 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+@@ -519,7 +1283,9 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  	volatile uint8_t *job = map ? (volatile uint8_t *)map->getVirtualAddress() : NULL;
  	if (job == NULL) {
  		IOLog("HEROGPU SELFTEST: mapping failed\n");
@@ -9914,7 +9927,7 @@ index 3ba3cb8..5ff3a48 100644
  		return;
  	}
  	job[16] = 1 | (2 << 1);                         /* 64-bit, WRITE_VALUE */
-@@ -530,10 +1285,14 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
+@@ -530,10 +1296,14 @@ herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
  	*output = 0xa5a5a5a55a5a5a5aull;
  	__asm__ volatile ("dsb sy" ::: "memory");
  	uint64_t us = 0;
@@ -10494,10 +10507,10 @@ index f1e25f9..cdfabe0 100644
   * For the GPU copy test (bsd/dev/herolte_gpu.c): the 4 KiB physical pages
   * of the last full-screen iOS surface, its layout and kernel address. The
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index aba42b4..e5f82bb 100644
+index aba42b4..ade50a8 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -76,6 +76,19 @@ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+@@ -76,6 +76,31 @@ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
  static uint32_t      sweet_surface_next_id = 1;
  static uint32_t      sweet_surface_creates_logged;
  static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
@@ -10506,18 +10519,30 @@ index aba42b4..e5f82bb 100644
 +
 +/* v61: for the heartbeat's MEM line (bsd/dev/a04s_gpu.c). */
 +extern "C" void sweet_surface_mem_stats(uint32_t *live, uint64_t *buffers, uint64_t *wrapped, uint64_t *state);
++/*
++ * v68: on the A04s, a buffer a client can map is whole 16 KiB pages. The kernel's pages are 4 KiB but
++ * iOS processes' are 16 KiB, and the first touch of a 4 KiB buffer faults a whole user page in, past
++ * the buffer's end (the M6b panic in vm_page_insert_internal). Physical surfaces are not affected.
++ */
++#if defined(ARM64_BOARD_CONFIG_A04S)
++#define SWEET_USER_PAGE         0x4000ull
++#else
++#define SWEET_USER_PAGE         ((uint64_t)page_size)
++#endif
++#define sweet_round_user(x)     ((((uint64_t)(x)) + SWEET_USER_PAGE - 1) & ~(SWEET_USER_PAGE - 1))
++
 +extern "C" void
 +sweet_surface_mem_stats(uint32_t *live, uint64_t *buffers, uint64_t *wrapped, uint64_t *state)
 +{
 +	*live = __atomic_load_n(&sweet_surface_live, __ATOMIC_RELAXED);
 +	*buffers = __atomic_load_n(&sweet_surface_wired, __ATOMIC_RELAXED);
 +	*wrapped = __atomic_load_n(&sweet_surface_wrapped, __ATOMIC_RELAXED);
-+	*state = (uint64_t)*live * page_size;
++	*state = (uint64_t)*live * SWEET_USER_PAGE;
 +}
  #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
  
  OSDefineMetaClassAndStructors(SweetSurface, OSObject);
-@@ -86,6 +99,12 @@ SweetSurface::free()
+@@ -86,6 +111,12 @@ SweetSurface::free()
  	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
  		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
  	}
@@ -10530,15 +10555,23 @@ index aba42b4..e5f82bb 100644
  	OSSafeReleaseNULL(kernelMap);
  	OSSafeReleaseNULL(memory);
  	OSSafeReleaseNULL(state);
-@@ -214,6 +233,7 @@ sweet_surface_alloc(void)
+@@ -208,12 +239,13 @@ sweet_surface_alloc(void)
  		return NULL;
  	}
- 	bzero(s->state->getBytesNoCopy(), page_size);
+ 	s->state = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-	    kIODirectionInOut | kIOMemoryKernelUserShared, page_size, page_size);
++	    kIODirectionInOut | kIOMemoryKernelUserShared, SWEET_USER_PAGE, page_size);    /* v68 */
+ 	if (s->state == NULL) {
+ 		s->release();
+ 		return NULL;
+ 	}
+-	bzero(s->state->getBytesNoCopy(), page_size);
++	bzero(s->state->getBytesNoCopy(), SWEET_USER_PAGE);
 +	__atomic_add_fetch(&sweet_surface_live, 1u, __ATOMIC_RELAXED);                         /* v61 */
  	return s;
  }
  
-@@ -251,6 +271,39 @@ sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+@@ -251,6 +283,39 @@ sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
  	return s;
  }
  
@@ -10557,7 +10590,7 @@ index aba42b4..e5f82bb 100644
 +	s->bytesPerElement = 4;
 +	s->elementWidth = s->elementHeight = 1;
 +	s->pixelFormat = pixelFormat;
-+	s->allocSize = (uint32_t)round_page(bytesPerRow * height);
++	s->allocSize = (uint32_t)sweet_round_user(bytesPerRow * height);           /* v68 */
 +	IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
 +	    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
 +	if (mem != NULL) {
@@ -10578,7 +10611,7 @@ index aba42b4..e5f82bb 100644
  mach_port_name_t
  sweet_surface_port_in_task(SweetSurface *s, task_t task)
  {
-@@ -302,7 +355,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -302,7 +367,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
  	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
  		return kIOReturnBadArgument;
  	}
@@ -10587,7 +10620,16 @@ index aba42b4..e5f82bb 100644
  	/*
  	 * Every surface is memory this driver allocates (wrapping client memory
  	 * is refused), and clients take the row pitch from the lock result: round
-@@ -709,7 +762,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -365,7 +430,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	if (alloc < end) {
+ 		alloc = end;
+ 	}
+-	alloc = round_page(alloc);
++	alloc = sweet_round_user(alloc);                /* v68: whole user pages */
+ 	if (alloc == 0 || alloc > SWEET_SURFACE_MAX_ALLOC) {
+ 		return kIOReturnNoMemory;
+ 	}
+@@ -709,7 +774,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  	}
  	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
  	ret = sweet_surface_layout(s, props);
@@ -10596,7 +10638,7 @@ index aba42b4..e5f82bb 100644
  	/*
  	 * A surface over the client's own memory, page aligned (SpringBoard's
  	 * 1008x1792 RGhA picture): the surface IS those pages, wired, so what the
-@@ -728,6 +781,8 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -728,6 +793,8 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  				s->memory = over;
  				s->mapCache = kIOMapDefaultCache;
  				wrapped = true;
@@ -10605,7 +10647,7 @@ index aba42b4..e5f82bb 100644
  				if (!sweet_surface_publish(s)) {
  					ret = kIOReturnNoResources;
  				}
-@@ -753,7 +808,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -753,7 +820,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  			ret = kIOReturnNoMemory;
  		} else {
  			bzero(mem->getBytesNoCopy(), s->allocSize);
@@ -10614,7 +10656,7 @@ index aba42b4..e5f82bb 100644
  			/*
  			 * A surface over the client's own memory: not mapped here, but it
  			 * must at least start with those pixels. Ignored, the surface
-@@ -782,7 +837,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -782,7 +849,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u -> 0x%x\n",
  		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
  		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
@@ -10623,7 +10665,7 @@ index aba42b4..e5f82bb 100644
  		/* which keys a surface is asked for with, to tell who is meant to fill it */
  		OSCollectionIterator *keys = OSCollectionIterator::withCollection(props);
  		if (keys != NULL) {
-@@ -867,7 +922,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+@@ -867,7 +934,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
  		 * NULL+0x30.
  		 */
  		sweet_surf_log_once("sel", selector);
