@@ -7,7 +7,7 @@
 #   OUT/metal/A04sMetal.bundle/Info.plist
 #   OUT/metal/A04sMetal.bundle/libA04sMetalDevice.dylib   Chlorophyll's device + A04sMTLDevice
 #   OUT/metal/A04sMetal.bundle/libhakiosair.dylib         Mesa: AIR -> NIR -> Panfrost/softpipe
-#   OUT/metal/A04sMetal.bundle/libdrm.2.dylib             HeroGPU's libdrm stand-in
+#   OUT/metal/A04sMetal.bundle/liba04sdrm.dylib           HeroGPU's libdrm stand-in (an install name of its own, M6b)
 #   OUT/metal/core.metallib, OUT/metal/m5.metallib        our own test shaders (../shaders)
 # The libraries live inside the bundle because the bundle's folder is what every process that may
 # later get a device can read (Chlorophyll's lesson); in M5 only the probe uses them.
@@ -38,9 +38,9 @@ $CC $CF -bundle -o "$B/A04sMetal" "$HERE/A04sMetal.m" -framework Foundation -fra
 cp "$HERE/Info.plist" "$B/Info.plist"
 
 # the device, beside the Mesa library and libdrm stand-in it links (@loader_path)
-cp "$MESA_OUT/libhakiosair.dylib" "$MESA_OUT/libdrm.2.dylib" "$B/"
-$CC $CF -dynamiclib -o "$B/libA04sMetalDevice.dylib" "$HERE/A04sMTLDevice.m" \
-	"$B/libhakiosair.dylib" "$B/libdrm.2.dylib" \
+cp "$MESA_OUT/libhakiosair.dylib" "$MESA_OUT/liba04sdrm.dylib" "$B/"
+$CC $CF -dynamiclib -o "$B/libA04sMetalDevice.dylib" "$HERE/A04sMTLDevice.m" "$HERE/a04s_bb.m" \
+	"$B/libhakiosair.dylib" "$B/liba04sdrm.dylib" \
 	-framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation \
 	$PRIV -install_name @rpath/libA04sMetalDevice.dylib -Wl,-rpath,@loader_path
 
@@ -64,6 +64,9 @@ for f in "$B/A04sMetal" "$B/libA04sMetalDevice.dylib"; do
 	echo "== $(basename "$f"): Metal's private classes bound by name"
 	xcrun --sdk iphoneos nm -u "$f" | grep '_OBJC_CLASS_\$__MTL' || true
 done
+echo "== libdrm references (only @rpath/liba04sdrm.dylib; no libdrm.2.dylib)"
+otool -L "$B/libhakiosair.dylib" "$B/libA04sMetalDevice.dylib" | grep -i drm
+if otool -L "$B/libhakiosair.dylib" "$B/libA04sMetalDevice.dylib" | grep -q "libdrm.2.dylib"; then echo "a library still names libdrm.2.dylib" >&2; exit 1; fi
 echo "== libA04sMetalDevice.dylib: rwa_ calls not in libhakiosair (must be none)"
 comm -23 <(xcrun --sdk iphoneos nm -u "$B/libA04sMetalDevice.dylib" | grep '^_rwa_' | sort) \
 	<(xcrun --sdk iphoneos nm -gU "$B/libhakiosair.dylib" | awk '{print $3}' | grep '^_rwa_' | sort)

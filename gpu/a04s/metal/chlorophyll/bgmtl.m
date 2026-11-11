@@ -72,6 +72,8 @@
 @end
 
 #define BG_LOG(...) bg_log(__VA_ARGS__)
+static int bg_trace(void);
+void bgmtl_note_line(const char *line);
 static void
 bg_log(const char *fmt, ...)
 {
@@ -82,6 +84,15 @@ bg_log(const char *fmt, ...)
    fprintf(stderr, "bgmtl[%d]: ", getpid());
    vfprintf(stderr, fmt, ap);
    va_end(ap);
+   // A04s (Metal track M6b): without the trace, what is logged is a refusal, a skip or a failure; in backboardd stderr goes
+   // nowhere, so the line also goes to bgmtl_note_line (a04s_bb.m counts it and logs the first of each kind)
+   if (!bg_trace()) {
+      char line[512];
+      va_start(ap, fmt);
+      vsnprintf(line, sizeof(line), fmt, ap);
+      va_end(ap);
+      bgmtl_note_line(line);
+   }
    // /private/var/tmp/bgmtl.trace: the log also goes to bgmtl-trace-<pid>.txt there (daemons and extensions whose stderr
    // nobody reads and whose environment launchd sets, such as the wallpaper poster)
    if (!tf_tried) {
@@ -136,6 +147,10 @@ __attribute__((weak)) void bgmtl_note_completed(void) {}   // a command buffer f
 __attribute__((weak)) void bgmtl_note_committed(void) {}   // a command buffer was committed (starts the injection's dead-man clock)
 __attribute__((weak)) void bgmtl_note_line(const char *line) { (void)line; }   // one diagnostic line, logged by the injection dylib
 __attribute__((weak)) void bgmtl_note_present(const char *line) { (void)line; }   // per-present diagnostics, logged (rate-limited) by the injection dylib   // likewise: logged by the injection dylib
+// A04s (Metal track M6b, a04s_bb.m in backboardd): the first refresh of each CPU-written texture, its rows as stored
+__attribute__((weak)) void bgmtl_note_cpu_rows(const char *what, unsigned w, unsigned h, unsigned fmt, const uint8_t *src, size_t bpr,
+                                               int reversed)
+{ (void)what; (void)w; (void)h; (void)fmt; (void)src; (void)bpr; (void)reversed; }
 
 @class BGMTLDevice;
 @class BGMTLComputePipeline;
@@ -354,6 +369,7 @@ bg_install_fallback(Class c)
    NSUInteger _ncLength;
    void (^_ncDealloc)(void *, NSUInteger);
    BOOL _cpuTraced;      // A04s (M6a run 11): the first refresh of a no-copy or linear texture was logged
+   BOOL _cpuNoted;       // A04s (M6b): ... and handed to bgmtl_note_cpu_rows
 }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
@@ -1789,6 +1805,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    }
    const char *fl = getenv("BGMTL_FLIP_CPU_TEXTURES");
    const BOOL flip = fl && fl[0] == '0' ? NO : fl && fl[0] == '1' ? YES : flipDefault;
+   if (!_cpuNoted) {
+      _cpuNoted = YES;
+      bgmtl_note_cpu_rows(what, w, h, _shape.pixel_format, src, bpr, flip && h > 1);
+   }
    uint8_t *tmp = NULL;
    if (flip && h > 1 && (tmp = malloc(bpr * h))) {
       for (unsigned y = 0; y < h; y++)

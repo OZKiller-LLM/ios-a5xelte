@@ -42,6 +42,7 @@
 #include <spawn.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/wait.h>
 
 #include "a04s_metal_log.h"
@@ -142,6 +143,145 @@ install_bundle(void)
 			close(fd);
 		a04s_log("install: the kill switch a04smetal.off was there and is kept");
 	}
+}
+
+/* ---- backboardd on Metal (M6b) ----------------------------------------------------------------
+ *
+ * The switch is /private/var/a04s/bb-metal.env (a drop file): A04S_BB_METAL=1 lets the gate give backboardd a
+ * device, anything else keeps it on OpenGL ES (A04sMetal.m, bb_refusal). backboardd reads it when it starts,
+ * which at boot is before the drop agent unpacks a package, so a new value takes effect at its next launch:
+ * the next boot, or at once with A04S_BB_RESTART=1 in autorun.env, which restarts backboardd here when the
+ * path it is on (bb-metal/mode) is not the one the switch asks for. A04S_BB_RESET=1 forgets this boot's
+ * fallback and launch count first. */
+
+#define BB_ENV "/private/var/a04s/bb-metal.env"
+#define BB_DIR "/private/var/a04s/bb-metal"
+
+/* what A04S_BB_METAL says in bb-metal.env: 1, 0 (anything else, or no file) */
+static int
+bb_wanted(void)
+{
+	FILE *f = fopen(BB_ENV, "r");
+	if (!f)
+		return 0;
+	char line[256];
+	int on = 0;
+	while (fgets(line, sizeof(line), f)) {
+		line[strcspn(line, "#\r\n")] = 0;
+		char *k = line;
+		while (*k == ' ' || *k == '\t')
+			k++;
+		if (!strncmp(k, "A04S_BB_METAL", 13) && (k[13] == '=' || k[13] == ' ' || k[13] == '\t')) {
+			char *v = strchr(k, '=');
+			while (v && (*++v == ' ' || *v == '\t'))
+				;
+			on = v && v[0] == '1' && (v[1] == 0 || v[1] == ' ' || v[1] == '\t');
+		}
+	}
+	fclose(f);
+	return on;
+}
+
+static pid_t
+pid_of(const char *name)
+{
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+	size_t len = 0;
+	if (sysctl(mib, 3, NULL, &len, NULL, 0) != 0 || !len)
+		return 0;
+	len += len / 4;
+	struct kinfo_proc *kp = malloc(len);
+	pid_t found = 0;
+	if (kp && sysctl(mib, 3, kp, &len, NULL, 0) == 0)
+		for (size_t i = 0; i < len / sizeof(*kp) && !found; i++)
+			if (!strncmp(kp[i].kp_proc.p_comm, name, MAXCOMLEN))
+				found = kp[i].kp_proc.p_pid;
+	free(kp);
+	return found;
+}
+
+/* bb-metal/mode: "<pid> <metal|eagl|metal-fallback> <why>" */
+static bool
+bb_mode_line(char *out, size_t len)
+{
+	FILE *f = fopen(BB_DIR "/mode", "r");
+	if (!f)
+		return false;
+	bool ok = fgets(out, (int)len, f) != NULL;
+	fclose(f);
+	if (ok)
+		out[strcspn(out, "\r\n")] = 0;
+	return ok;
+}
+
+/* the bundle readable by every user: backboardd may not run as root */
+static void
+bb_permissions(void)
+{
+	NSFileManager *fm = [NSFileManager defaultManager];
+	chmod(DST_BUNDLE, 0755);
+	unsigned n = 0;
+	for (NSString *rel in [fm enumeratorAtPath:@(DST_BUNDLE)]) {
+		NSString *p = [@(DST_BUNDLE) stringByAppendingPathComponent:rel];
+		BOOL dir = NO;
+		if (![fm fileExistsAtPath:p isDirectory:&dir])
+			continue;
+		chmod(p.fileSystemRepresentation, dir || [rel hasSuffix:@".dylib"] || [rel isEqualToString:@"A04sMetal"] ? 0755 : 0644);
+		n++;
+	}
+	const char *dirs[] = { BB_DIR, "/private/var/a04s/mesa-cache-bb" };
+	for (unsigned i = 0; i < 2; i++) {
+		mkdir(dirs[i], 0777);
+		chmod(dirs[i], 0777);
+	}
+	chmod(BB_ENV, 0644);
+	struct stat st;
+	a04s_log("bb: %u bundle entries made readable by all; %s and mesa-cache-bb writable by all; bb-metal.env %s, "
+		 "A04S_BB_METAL %s", n, BB_DIR, stat(BB_ENV, &st) == 0 ? "present" : "MISSING (backboardd stays on OpenGL ES)",
+		 bb_wanted() ? "1 (Metal)" : "not 1 (OpenGL ES)");
+}
+
+static void
+bb_restart_if_needed(void)
+{
+	const char *rs = getenv("A04S_BB_RESET");
+	if (rs && rs[0] == '1') {
+		unlink(BB_DIR "/fallback");
+		unlink(BB_DIR "/launches");
+		a04s_log("bb: A04S_BB_RESET=1: this boot's fallback and launch count forgotten");
+	}
+	const char *e = getenv("A04S_BB_RESTART");
+	if (!(e && e[0] == '1'))
+		return;
+	int want = bb_wanted();
+	pid_t pid = pid_of("backboardd");
+	char mode[512] = "";
+	bool known = bb_mode_line(mode, sizeof(mode));
+	pid_t mode_pid = known ? (pid_t)atoi(mode) : 0;
+	const char *what = known ? strchr(mode, ' ') : NULL;
+	bool on_metal = known && mode_pid == pid && what && !strncmp(what + 1, "metal ", 6);
+	a04s_log("bb: backboardd pid %d; bb-metal/mode: %s; the switch asks for %s", pid, known ? mode : "(none yet)",
+		 want ? "Metal" : "OpenGL ES");
+	if (!pid) {
+		a04s_log("bb: no backboardd running; nothing restarted");
+		return;
+	}
+	if ((bool)want == on_metal) {
+		a04s_log("bb: backboardd is already on the path the switch asks for; not restarted");
+		return;
+	}
+	a04s_log("bb: restarting backboardd (SIGTERM to pid %d) so that it starts on %s", pid, want ? "Metal" : "OpenGL ES");
+	kill(pid, SIGTERM);
+	for (unsigned i = 0; i < 90; i++) {
+		sleep(2);
+		pid_t now = pid_of("backboardd");
+		if (now && now != pid && bb_mode_line(mode, sizeof(mode)) && (pid_t)atoi(mode) == now) {
+			a04s_log("bb: backboardd restarted as pid %d after %u s; bb-metal/mode: %s", now, 2 * (i + 1), mode);
+			return;
+		}
+	}
+	a04s_log("bb: after 180 s, backboardd pid %d and bb-metal/mode \"%s\" (no new mode line: it may not have asked "
+		 "Metal for a device yet)", pid_of("backboardd"), bb_mode_line(mode, sizeof(mode)) ? mode : "(none)");
 }
 
 static void
@@ -512,6 +652,9 @@ main(int argc, char **argv)
 		BOOL loaded = [b loadAndReturnError:&err];
 		a04s_log("bundle %s: %s%s%s", DST_BUNDLE, loaded ? "loads" : "does NOT load", err ? ": " : "",
 			 err ? err.description.UTF8String : "");
+		STEP("backboardd");
+		bb_permissions();
+		bb_restart_if_needed();
 		char self[PATH_MAX];
 		uint32_t size = sizeof(self);
 		if (_NSGetExecutablePath(self, &size) != 0)

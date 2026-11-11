@@ -22,6 +22,11 @@
 #include <sys/stat.h>
 #include <time.h>
 
+/* a04s_bb.m: backboardd's log thread, watchdog and statistics (M6b); they do nothing in other processes */
+void a04s_bb_device_ready(const char *name, const char *cache_dir);
+void a04s_bb_device_failed(const char *why);
+void a04s_bb_note_pipeline(double secs, int made);
+
 typedef mach_port_t a04s_io_registry_entry_t;
 extern kern_return_t IORegistryEntryGetRegistryEntryID(a04s_io_registry_entry_t entry, uint64_t *id);
 
@@ -244,6 +249,7 @@ a04s_cpu_now(void)
    a04s_log("render pipeline %s + %s: %s in %.2f s (CPU %.2f s)%s%s", d.vertexFunction.name.UTF8String ?: "-",
             d.fragmentFunction.name.UTF8String ?: "-", p ? "made" : "REFUSED", a04s_now() - t, a04s_cpu_now() - c,
             !p && e ? ": " : "", !p && e ? e.localizedDescription.UTF8String : "");
+   a04s_bb_note_pipeline(a04s_now() - t, p != nil);
    a04s_apply_constants([self rwa], RWA_STAGE_VERTEX, nil);
    a04s_apply_constants([self rwa], RWA_STAGE_FRAGMENT, nil);
    if (p)
@@ -280,6 +286,7 @@ a04s_cpu_now(void)
    a04s_log("compute pipeline %s: %s in %.2f s (CPU %.2f s)%s%s", [[function name] UTF8String] ?: "-",
             p ? "made" : "REFUSED", a04s_now() - t, a04s_cpu_now() - c, !p && error && *error ? ": " : "",
             !p && error && *error ? (*error).localizedDescription.UTF8String : "");
+   a04s_bb_note_pipeline(a04s_now() - t, p != nil);
    a04s_apply_constants([self rwa], RWA_STAGE_COMPUTE, nil);
    bg_unlock();
    return p;
@@ -291,20 +298,26 @@ a04s_cpu_now(void)
    a04s_log("A04sMTLDevice initWithAcceleratorPort: %u (M6, %s)", port,
             soft && soft[0] == '1' ? "softpipe: RWA_SOFTWARE=1" : "Panfrost on the Mali-G52");
    /* A04s (M6): Panfrost's compiled shaders kept across processes and boots (Mesa's disk cache),
-    * in a folder every client of the device can write. */
+    * in a folder every client of the device can write. backboardd (M6b) keeps its own, which the
+    * autorun makes writable for it: Mesa makes the cache's subfolders 0755, so one made by the
+    * root probe could not be written by a backboardd running as another user. */
    if (!getenv("MESA_SHADER_CACHE_DIR")) {
-      mkdir("/private/var/a04s/mesa-cache", 0777);
-      chmod("/private/var/a04s/mesa-cache", 0777);
-      setenv("MESA_SHADER_CACHE_DIR", "/private/var/a04s/mesa-cache", 0);
+      const char *dir = !strcmp(getprogname(), "backboardd") ? "/private/var/a04s/mesa-cache-bb" : "/private/var/a04s/mesa-cache";
+      mkdir(dir, 0777);
+      chmod(dir, 0777);
+      setenv("MESA_SHADER_CACHE_DIR", dir, 0);
    }
    self = [super initWithAcceleratorPort:port];
-   if (!self)
+   if (!self) {
+      a04s_bb_device_failed("BGMTLDevice's init answered nil");
       return nil;
+   }
    if (port)
       IORegistryEntryGetRegistryEntryID(port, &_a04sRegistry);
    if (![self rwa]) {
       /* fully initialised by now, so BGMTLDevice's own teardown runs, as Chlorophyll's plug-in does */
       a04s_log("A04sMTLDevice: no GPU behind the device (%s): none is made", [[self bgWhy] UTF8String]);
+      a04s_bb_device_failed([[self bgWhy] UTF8String] ?: "no GPU behind the device");
       [self release];
       return nil;
    }
@@ -321,6 +334,7 @@ a04s_cpu_now(void)
    a04s_log("A04sMTLDevice ready: %s, registryID %#llx, shader cache %s (%s)", rwa_device_name([self rwa]),
             (unsigned long long)_a04sRegistry, rwa_shader_cache_sync([self rwa]) ? "on" : "OFF",
             getenv("MESA_SHADER_CACHE_DIR") ? getenv("MESA_SHADER_CACHE_DIR") : "no MESA_SHADER_CACHE_DIR");
+   a04s_bb_device_ready(rwa_device_name([self rwa]), rwa_shader_cache_sync([self rwa]) ? getenv("MESA_SHADER_CACHE_DIR") : NULL);
    return self;
 }
 

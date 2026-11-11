@@ -11,7 +11,10 @@
 #
 #   gpu/a04s/metal/m5/build-mesa-ios.sh WORK OUT      (macOS with Xcode)
 #
-# OUT gets libhakiosair.dylib and libdrm.2.dylib, install names @rpath/..., ad-hoc signed.
+# OUT gets libhakiosair.dylib and liba04sdrm.dylib, install names @rpath/..., ad-hoc signed.
+# M6b: the libdrm stand-in's install name is @rpath/liba04sdrm.dylib, not libdrm.2.dylib: in backboardd the
+# OpenGL ES route (libheroeagl, libOSMesa) has already loaded its own @rpath/libdrm.2.dylib, and dyld could bind
+# libhakiosair to that one instead of ours.
 # Nothing of Apple's is in OUT.
 set -euo pipefail
 
@@ -59,10 +62,11 @@ if [ "$(cat mesa/.a04s-m5 2>/dev/null)" != "$STAMP" ]; then
 	echo "$STAMP" > mesa/.a04s-m5
 fi
 
-# The libdrm stand-in, and a pkg-config file pointing Mesa at it (as gpu/mesa/build-mesa.sh).
+# The libdrm stand-in, and a pkg-config file pointing Mesa at it (as gpu/mesa/build-mesa.sh). Its file here is
+# still libdrm.2.dylib (Mesa links -ldrm); the install name Mesa records is @rpath/liba04sdrm.dylib (M6b).
 mkdir -p drm-standin pc
 $CC_IOS -O2 -Wall -fvisibility=hidden -dynamiclib \
-	-install_name @rpath/libdrm.2.dylib \
+	-install_name @rpath/liba04sdrm.dylib \
 	-I libdrm -I libdrm/include/drm -I mesa/include \
 	-o drm-standin/libdrm.2.dylib "$GPU_MESA/herodrm.c" \
 	-framework IOKit -framework CoreFoundation
@@ -130,9 +134,10 @@ EOF
 ninja -C build src/gallium/targets/hakiosair/libhakiosair.dylib
 
 cp build/src/gallium/targets/hakiosair/libhakiosair.dylib "$OUT/libhakiosair.dylib"
-cp drm-standin/libdrm.2.dylib "$OUT/libdrm.2.dylib"
+cp drm-standin/libdrm.2.dylib "$OUT/liba04sdrm.dylib"
 xcrun strip -x "$OUT/libhakiosair.dylib"
 install_name_tool -id @rpath/libhakiosair.dylib "$OUT/libhakiosair.dylib"
+install_name_tool -change @rpath/libdrm.2.dylib @rpath/liba04sdrm.dylib "$OUT/libhakiosair.dylib"
 for dep in $(otool -L "$OUT/libhakiosair.dylib" | awk 'NR > 1 { print $1 }'); do
 	case "$dep" in
 	/usr/lib/*|/System/*|@rpath/*) ;;

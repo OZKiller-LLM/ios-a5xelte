@@ -19,10 +19,14 @@
 
 #include <mach/mach_time.h>
 #include <pthread.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
 
 extern const char *getprogname(void);
 
-/* Seconds since this process's first log line, from mach_absolute_time. */
+/* Seconds since this process started, from mach_absolute_time. M6b: the origin is the process's start
+ * (sysctl), not the first call, because each file and image including this header has its own copy: in
+ * backboardd the gate, the device and a04s_bb.m then all log on one clock. */
 static inline double
 a04s_now(void)
 {
@@ -31,10 +35,43 @@ a04s_now(void)
 	if (!tb.denom)
 		mach_timebase_info(&tb);
 	uint64_t t = mach_absolute_time();
-	if (!t0)
-		t0 = t;
+	if (!t0) {
+		struct kinfo_proc kp;
+		size_t len = sizeof(kp);
+		int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+		struct timeval now;
+		gettimeofday(&now, NULL);
+		double since = 0;
+		if (sysctl(mib, 4, &kp, &len, NULL, 0) == 0 && len)
+			since = (double)(now.tv_sec - kp.kp_proc.p_starttime.tv_sec) +
+				(now.tv_usec - kp.kp_proc.p_starttime.tv_usec) / 1e6;
+		if (since < 0 || since > 1e7)
+			since = 0;
+		uint64_t back = (uint64_t)(since * 1e9 * tb.denom / tb.numer);
+		t0 = back < t ? t - back : 1;
+	}
 	return (double)(t - t0) * tb.numer / tb.denom / 1e9;
 }
+
+/*
+ * A04s (Metal track M6b): in backboardd a log line must not wait for the eMMC on the render thread
+ * (an fsync took up to 15 s in run 12). a04s_bb.m, linked into the device library, defines this
+ * hook strongly (it defines A04S_LOG_DIVERT_STRONG before including this header): it takes the
+ * finished line, queues it for its own writer thread and returns 1. Everywhere else (the gate,
+ * the probe) this weak default returns 0 and the line is written here.
+ */
+#ifdef A04S_LOG_DIVERT_STRONG
+__attribute__((visibility("hidden"))) int a04s_log_divert(const char *line, size_t n);
+#else
+/* hidden: each image keeps its own, so dyld never coalesces the weak copies across images */
+__attribute__((weak, visibility("hidden"))) int
+a04s_log_divert(const char *line, size_t n)
+{
+	(void)line;
+	(void)n;
+	return 0;
+}
+#endif
 
 /*
  * Each line carries its time since start and how long the PREVIOUS line's fsync took ("sync
@@ -63,6 +100,10 @@ a04s_log(const char *fmt, ...)
 	line[n++] = '\n';
 	line[n] = 0;
 	(void)!write(2, line, (size_t)n);
+	if (a04s_log_divert(line, (size_t)n)) {
+		pthread_mutex_unlock(&lock);
+		return;
+	}
 	const char *path = getenv("A04S_METAL_LOG");
 	const char *sync = getenv("A04S_METAL_LOG_SYNC");
 	int fd = open(path ? path : "/private/var/a04s/metal-probe.log",
