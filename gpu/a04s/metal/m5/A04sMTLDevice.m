@@ -244,11 +244,19 @@ a04s_cpu_now(void)
    a04s_apply_constants([self rwa], RWA_STAGE_VERTEX, d.vertexFunction);
    a04s_apply_constants([self rwa], RWA_STAGE_FRAGMENT, d.fragmentFunction);
    double t = a04s_now(), c = a04s_cpu_now();
+   unsigned h0, m0, h1, m1;
+   rwa_front_cache_counts(&h0, &m0, NULL, NULL);
    NSError *e = nil;
    id p = [super newRenderPipelineStateWithDescriptor:d error:&e];
-   a04s_log("render pipeline %s + %s: %s in %.2f s (CPU %.2f s)%s%s", d.vertexFunction.name.UTF8String ?: "-",
-            d.fragmentFunction.name.UTF8String ?: "-", p ? "made" : "REFUSED", a04s_now() - t, a04s_cpu_now() - c,
-            !p && e ? ": " : "", !p && e ? e.localizedDescription.UTF8String : "");
+   rwa_front_cache_counts(&h1, &m1, NULL, NULL);
+   uint64_t tid = 0;
+   pthread_threadid_np(NULL, &tid);
+   /* M6b: which thread builds (against the threads that commit, in a04s_bb.m's stats), and whether the front end's
+    * cache had the stages */
+   a04s_log("render pipeline %s + %s: %s in %.2f s (CPU %.2f s), thread %llu%s, front cache %u hit %u miss%s%s",
+            d.vertexFunction.name.UTF8String ?: "-", d.fragmentFunction.name.UTF8String ?: "-", p ? "made" : "REFUSED",
+            a04s_now() - t, a04s_cpu_now() - c, (unsigned long long)tid, pthread_main_np() ? " (main)" : "", h1 - h0,
+            m1 - m0, !p && e ? ": " : "", !p && e ? e.localizedDescription.UTF8String : "");
    a04s_bb_note_pipeline(a04s_now() - t, p != nil);
    a04s_apply_constants([self rwa], RWA_STAGE_VERTEX, nil);
    a04s_apply_constants([self rwa], RWA_STAGE_FRAGMENT, nil);

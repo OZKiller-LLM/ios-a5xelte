@@ -163,6 +163,8 @@ static unsigned bb_pipes_made, bb_pipes_refused;
 static double bb_pipe_secs;
 static unsigned bb_tex_refused, bb_draw_skipped, bb_clear_skipped, bb_other_refused;
 static char bb_last_failure[256];
+static uint64_t bb_commit_threads[4];    /* the threads that committed in this stats window (the first four) */
+static unsigned bb_commit_nthreads;
 
 static uint64_t
 bb_ns(void)
@@ -200,6 +202,13 @@ bgmtl_note_committed(void)
              a04s_now() - bb_t_ready);
    }
    bb_committed++;
+   uint64_t tid = 0;
+   pthread_threadid_np(NULL, &tid);
+   bool seen = false;
+   for (unsigned i = 0; i < bb_commit_nthreads && !seen; i++)
+      seen = bb_commit_threads[i] == tid;
+   if (!seen && bb_commit_nthreads < 4)
+      bb_commit_threads[bb_commit_nthreads++] = tid;
    if (bb_ring_len == BB_RING)
       bb_pop(now, false);     /* only if completions go missing; the oldest is dropped */
    bb_ring[(bb_ring_head + bb_ring_len++) % BB_RING] = now;
@@ -510,6 +519,13 @@ bb_main(void *arg)
          double ps = bb_pipe_secs;
          unsigned si = bb_surf_imported, sc = bb_surf_copied, sr = bb_surf_refused;
          size_t ss = bb_surf_smallest;
+         char threads[96] = "";
+         for (unsigned i = 0; i < bb_commit_nthreads; i++) {
+            char one[24];
+            snprintf(one, sizeof(one), "%s%llu", i ? "," : "", (unsigned long long)bb_commit_threads[i]);
+            strlcat(threads, one, sizeof(threads));
+         }
+         bb_commit_nthreads = 0;
          bb_surf_imported = bb_surf_copied = bb_surf_refused = 0;
          bb_surf_smallest = SIZE_MAX;
          bb_lat_n = bb_lat_sum = bb_lat_max = 0;
@@ -523,10 +539,11 @@ bb_main(void *arg)
             bb_log("bb stats %.1f s: %llu committed, %llu completed (%.1f/s), %llu failed, %u outstanding (oldest %.2f s); "
                    "commit to completion avg %.1f ms, max %.1f ms; %llu presents; pipelines %u made, %u refused, %.1f s building; "
                    "textures refused %u, draws skipped %u, clears skipped %u, other refusals %u; IOSurfaces %u imported "
-                   "(smallest %zu bytes), %u copied, %u refused",
+                   "(smallest %zu bytes), %u copied, %u refused; committing threads %s",
                    t - last_stats, (unsigned long long)dc, (unsigned long long)dd, dd / (t - last_stats),
                    (unsigned long long)df, outstanding, oldest, lat_n ? lat_sum / 1e6 / lat_n : 0, lat_max / 1e6,
-                   (unsigned long long)presents, pm, pr, ps, tr, ds, cs, orf, si, si ? ss : 0, sc, sr);
+                   (unsigned long long)presents, pm, pr, ps, tr, ds, cs, orf, si, si ? ss : 0, sc, sr,
+                   threads[0] ? threads : "-");
          w_committed = committed;
          w_completed = completed;
          w_failed = failed;

@@ -93,6 +93,8 @@ if [ ! -d "$SRC" ] || [ "$(cat "$SRC/.a04s-patches" 2>/dev/null)" != "$PATCHES" 
 	PY
 	rm -rf "$SRC/src/compiler/air"
 	cp -r "$HERE/air" "$SRC/src/compiler/air"   # M6: the merged front end and library (air/NOTICE.md)
+	# M6b: the front end's identity, for its cache of translated stages (as m5/build-mesa-ios.sh)
+	echo "#define A04S_AIR_FRONT_ID \"$(cat "$HERE"/air/* | sha256sum | cut -c1-32)\"" > "$SRC/src/compiler/air/air_front_id.h"
 	mkdir -p "$SRC/src/panfrost/drm-shim/hakios"
 	cp "$HK/mali-drmshim/hakios_mali_shim.c" "$HK/hakios.mali_va.h" "$SRC/src/panfrost/drm-shim/hakios/"
 	echo "$PATCHES" > "$SRC/.a04s-patches"
@@ -172,6 +174,35 @@ run_metal() {
 run_metal phiconst phiconst.bc
 run_metal fragpos --draw fragpos.bc fragPos 125
 run_metal argbuf --draw-argbuf argbuf_set.bc argbuf_direct.bc
+
+# M6b: the front end's cache of translated stages (air_metal.c, front_to_nir). The same draw twice in a fresh cache
+# folder: the first translates its stage and writes it, the second must read it back instead, and both must build the
+# same chains (pandecode's dumps compared, addresses and all).
+FC=$OUT/air/front-cache
+rm -rf "$FC" fc-miss fc-hit
+mkdir -p "$FC"
+export A04S_AIR_CACHE_DIR=$FC RWA_AIR_CACHE_LOG=1
+set +e
+on_mali fc-miss "$AMT" --draw fragpos.bc fragPos 125
+on_mali fc-hit "$AMT" --draw fragpos.bc fragPos 125
+set -e
+unset A04S_AIR_CACHE_DIR RWA_AIR_CACHE_LOG
+stored=$(ls "$FC/a04s-air" 2>/dev/null | grep -c '\.bin$' || true)
+misses=$(grep -c '^rwa: front cache miss' fc-miss/stderr.log || true)
+hits=$(grep -c '^rwa: front cache hit' fc-hit/stderr.log || true)
+hit_misses=$(grep -c '^rwa: front cache \(miss\|unreadable\)' fc-hit/stderr.log || true)
+echo "Metal front-end cache: first run $misses miss(es), $stored file(s) written; second run $hits hit(s), $hit_misses miss(es)"
+[ "$misses" -ge 1 ] && [ "$stored" -ge 1 ] && [ "$hits" -ge 1 ] && [ "$hit_misses" = 0 ] ||
+	fail "Metal front-end cache: expected a miss and a write, then only hits"
+# pandecode writes one file per frame (pandecode.dump.NNNN)
+cat fc-miss/pandecode.dump* > fc-miss.dump 2>/dev/null || true
+cat fc-hit/pandecode.dump* > fc-hit.dump 2>/dev/null || true
+if [ -s fc-miss.dump ] && cmp -s fc-miss.dump fc-hit.dump; then
+	echo "Metal front-end cache: the cached stage built the same chains ($(wc -l < fc-hit.dump) lines of pandecode, identical)"
+else
+	fail "Metal front-end cache: the chains differ between the translated and the cached stage, or none were dumped ($(diff fc-miss.dump fc-hit.dump | head -3 | tr '\n' ' '))"
+fi
+judge fc-hit "Metal front-end cache (cached run)"
 cd "$OUT"
 
 # M1b: our own Metal shaders (shaders/*.metal), compiled by Apple's Metal compiler on a macOS

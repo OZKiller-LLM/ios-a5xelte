@@ -611,6 +611,9 @@ struct rwa_constant {
  * (Mesa writes it on a thread of its own, and a process that ends early loses what is queued).
  * 1 when the screen has a cache at all, 0 when it has none. */
 int rwa_shader_cache_sync(struct rwa_device *device);
+/* A04s (Metal track M6b): the front end's cache of translated stages (air_metal.c, front_to_nir), counted since the
+ * library loaded: stages found, translated, written, and files that did not read back. Any pointer may be NULL. */
+void rwa_front_cache_counts(unsigned *hits, unsigned *misses, unsigned *stores, unsigned *bad);
 void rwa_set_function_constants(struct rwa_device *device, unsigned stage,
 				const struct rwa_constant *values, unsigned count);
 struct rwa_fence;

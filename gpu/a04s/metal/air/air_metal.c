@@ -826,6 +826,300 @@ rwa_shader_cache_sync(struct rwa_device *device)
    return 1;
 }
 
+/* ---- A04s (Metal track M6b): the front end's cache ------------------------------------------------
+ *
+ * backboardd built 211 pipelines on M6b's boot 2, 204 s of wall time with Panfrost's own shader cache warm: most of
+ * a pipeline is this library's front end -- reading the AIR module (twice: once for its function constants), then
+ * translating it to NIR -- before Panfrost looks in its cache. So each stage's translation is kept on disk:
+ *   key:   the stage's AIR bytes, its entry point, the function constants set for the stage, the GPU's name, the
+ *          environment the translation reads (AIR_FC_FILL, AIR_FC_SET) and the front end's own identity
+ *          (A04S_AIR_FRONT_ID: a hash of src/compiler/air at build time, or the build's date and time);
+ *   value: the air_shader_info the translation filled, then the NIR, serialised (nir_serialize).
+ * Files: <dir>/a04s-air/<sha1>.bin, dir = A04S_AIR_CACHE_DIR, else MESA_SHADER_CACHE_DIR; none: no cache. They are
+ * written to a temporary name and renamed, so a reader never sees half a file; a file that does not read back is
+ * ignored and rewritten. RWA_AIR_CACHE=0 turns it off. Nothing is evicted: one entry per stage variant. */
+#include "util/blob.h"
+#include "util/mesa-sha1.h"
+#include "nir_serialize.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <unistd.h>
+static unsigned apply_function_constants(const struct rwa_device *device, unsigned stage,
+                                         struct air_constant_value *constants, unsigned num);
+#if defined(__has_include)
+#if __has_include("air_front_id.h")
+#include "air_front_id.h"
+#endif
+#endif
+#ifndef A04S_AIR_FRONT_ID
+#define A04S_AIR_FRONT_ID "build " __DATE__ " " __TIME__
+#endif
+
+#define FRONT_MAGIC 0x41465231u   /* "AFR1" */
+
+static unsigned front_hits, front_misses, front_stores, front_bad;
+
+void
+rwa_front_cache_counts(unsigned *hits, unsigned *misses, unsigned *stores, unsigned *bad)
+{
+   if (hits) *hits = front_hits;
+   if (misses) *misses = front_misses;
+   if (stores) *stores = front_stores;
+   if (bad) *bad = front_bad;
+}
+
+/* the cache's folder, made if needed; false: no cache */
+static bool
+front_dir(char *out, size_t len)
+{
+   const char *off = getenv("RWA_AIR_CACHE");
+   if (off && off[0] == '0')
+      return false;
+   const char *d = getenv("A04S_AIR_CACHE_DIR");
+   if (!d || !*d)
+      d = getenv("MESA_SHADER_CACHE_DIR");
+   if (!d || !*d)
+      return false;
+   snprintf(out, len, "%s/a04s-air", d);
+   if (mkdir(out, 0777) != 0 && errno != EEXIST)
+      return false;
+   return true;
+}
+
+static void
+front_key(const struct rwa_device *device, unsigned stage, const void *bitcode, size_t size,
+          const char *entry, char hex[41])
+{
+   struct mesa_sha1 ctx;
+   _mesa_sha1_init(&ctx);
+   const char *id = "a04s-air-front 1 " A04S_AIR_FRONT_ID;
+   _mesa_sha1_update(&ctx, id, strlen(id) + 1);
+   const char *gpu = device->screen->get_name(device->screen);
+   _mesa_sha1_update(&ctx, gpu, strlen(gpu) + 1);
+   _mesa_sha1_update(&ctx, &stage, sizeof(stage));
+   uint64_t sz = size;
+   _mesa_sha1_update(&ctx, &sz, sizeof(sz));
+   _mesa_sha1_update(&ctx, bitcode, size);
+   _mesa_sha1_update(&ctx, entry ? entry : "", strlen(entry ? entry : "") + 1);
+   unsigned n = device->num_fc[stage];
+   _mesa_sha1_update(&ctx, &n, sizeof(n));
+   for (unsigned i = 0; i < n; i++) {
+      uint64_t kv[2] = { device->fc[stage][i].index, device->fc[stage][i].bits };
+      _mesa_sha1_update(&ctx, kv, sizeof(kv));
+   }
+   static const char *const env[] = { "AIR_FC_FILL", "AIR_FC_SET" };
+   for (unsigned i = 0; i < ARRAY_SIZE(env); i++) {
+      const char *v = getenv(env[i]);
+      _mesa_sha1_update(&ctx, v ? "1" : "0", 1);
+      if (v)
+         _mesa_sha1_update(&ctx, v, strlen(v) + 1);
+   }
+   unsigned char sha[20];
+   _mesa_sha1_final(&ctx, sha);
+   _mesa_sha1_format(hex, sha);
+}
+
+static void
+front_write_str(struct blob *b, const char *s)
+{
+   blob_write_uint8(b, s != NULL);
+   if (s)
+      blob_write_string(b, s);
+}
+
+static const char *
+front_read_str(struct blob_reader *r, void *mem_ctx)
+{
+   if (!blob_read_uint8(r))
+      return NULL;
+   const char *s = blob_read_string(r);
+   return s && !r->overrun ? ralloc_strdup(mem_ctx, s) : NULL;
+}
+
+static void
+front_write_info(struct blob *b, const struct air_shader_info *info)
+{
+   struct air_shader_info c = *info;
+   c.entry_point = NULL;
+   c.resources = NULL;
+   c.varyings = NULL;
+   c.vertex_attributes = NULL;
+   c.notes = NULL;
+   blob_write_bytes(b, &c, sizeof(c));
+   front_write_str(b, info->entry_point);
+   for (unsigned i = 0; i < info->num_resources; i++) {
+      struct air_resource r = info->resources[i];
+      r.name = r.type_name = NULL;
+      blob_write_bytes(b, &r, sizeof(r));
+      front_write_str(b, info->resources[i].name);
+      front_write_str(b, info->resources[i].type_name);
+   }
+   for (unsigned i = 0; i < info->num_varyings; i++) {
+      struct air_varying v = info->varyings[i];
+      v.name = NULL;
+      blob_write_bytes(b, &v, sizeof(v));
+      front_write_str(b, info->varyings[i].name);
+   }
+   for (unsigned i = 0; i < info->num_vertex_attributes; i++) {
+      struct air_vertex_attribute a = info->vertex_attributes[i];
+      a.name = a.type_name = a.function_constant = NULL;
+      blob_write_bytes(b, &a, sizeof(a));
+      front_write_str(b, info->vertex_attributes[i].name);
+      front_write_str(b, info->vertex_attributes[i].type_name);
+      front_write_str(b, info->vertex_attributes[i].function_constant);
+   }
+   for (unsigned i = 0; i < info->num_notes; i++)
+      front_write_str(b, info->notes[i]);
+}
+
+static bool
+front_read_info(struct blob_reader *r, void *mem_ctx, struct air_shader_info *info)
+{
+   blob_copy_bytes(r, info, sizeof(*info));
+   if (r->overrun)
+      return false;
+   info->entry_point = front_read_str(r, mem_ctx);
+   info->resources = info->num_resources ? rzalloc_array(mem_ctx, struct air_resource, info->num_resources) : NULL;
+   for (unsigned i = 0; i < info->num_resources && !r->overrun; i++) {
+      blob_copy_bytes(r, &info->resources[i], sizeof(info->resources[i]));
+      info->resources[i].name = front_read_str(r, mem_ctx);
+      info->resources[i].type_name = front_read_str(r, mem_ctx);
+   }
+   info->varyings = info->num_varyings ? rzalloc_array(mem_ctx, struct air_varying, info->num_varyings) : NULL;
+   for (unsigned i = 0; i < info->num_varyings && !r->overrun; i++) {
+      blob_copy_bytes(r, &info->varyings[i], sizeof(info->varyings[i]));
+      info->varyings[i].name = front_read_str(r, mem_ctx);
+   }
+   info->vertex_attributes = info->num_vertex_attributes
+      ? rzalloc_array(mem_ctx, struct air_vertex_attribute, info->num_vertex_attributes) : NULL;
+   for (unsigned i = 0; i < info->num_vertex_attributes && !r->overrun; i++) {
+      blob_copy_bytes(r, &info->vertex_attributes[i], sizeof(info->vertex_attributes[i]));
+      info->vertex_attributes[i].name = front_read_str(r, mem_ctx);
+      info->vertex_attributes[i].type_name = front_read_str(r, mem_ctx);
+      info->vertex_attributes[i].function_constant = front_read_str(r, mem_ctx);
+   }
+   info->notes = info->num_notes ? rzalloc_array(mem_ctx, const char *, info->num_notes) : NULL;
+   for (unsigned i = 0; i < info->num_notes && !r->overrun; i++)
+      info->notes[i] = front_read_str(r, mem_ctx);
+   return !r->overrun;
+}
+
+/* the whole file, malloc'd; NULL when there is none */
+static void *
+front_slurp(const char *path, size_t *len)
+{
+   int fd = open(path, O_RDONLY);
+   if (fd < 0)
+      return NULL;
+   struct stat st;
+   void *buf = NULL;
+   if (fstat(fd, &st) == 0 && st.st_size > 16 && st.st_size < (64 << 20) && (buf = malloc(st.st_size))) {
+      size_t got = 0;
+      while (got < (size_t)st.st_size) {
+         ssize_t n = read(fd, (char *)buf + got, st.st_size - got);
+         if (n <= 0)
+            break;
+         got += n;
+      }
+      if (got != (size_t)st.st_size) {
+         free(buf);
+         buf = NULL;
+      } else {
+         *len = got;
+      }
+   }
+   close(fd);
+   return buf;
+}
+
+static void
+front_store(const char *dir, const char *hex, const struct air_shader_info *info, const nir_shader *nir)
+{
+   struct blob b;
+   blob_init(&b);
+   blob_write_uint32(&b, FRONT_MAGIC);
+   front_write_info(&b, info);
+   nir_serialize(&b, nir, false);
+   if (b.out_of_memory) {
+      blob_finish(&b);
+      return;
+   }
+   char tmp[PATH_MAX], path[PATH_MAX];
+   snprintf(path, sizeof(path), "%s/%s.bin", dir, hex);
+   snprintf(tmp, sizeof(tmp), "%s/%s.%d.tmp", dir, hex, (int)getpid());
+   int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+   if (fd >= 0) {
+      size_t done = 0;
+      while (done < b.size) {
+         ssize_t n = write(fd, b.data + done, b.size - done);
+         if (n <= 0)
+            break;
+         done += n;
+      }
+      close(fd);
+      if (done == b.size && rename(tmp, path) == 0)
+         front_stores++;
+      else
+         unlink(tmp);
+   }
+   blob_finish(&b);
+}
+
+/* One stage's AIR -> NIR, through the cache: what air_to_nir would return, with `info` filled the same way. */
+static void
+front_say(const char *what, const char *hex, const char *entry)
+{
+   static int on = -1;
+   if (on < 0)
+      on = getenv("RWA_AIR_CACHE_LOG") && getenv("RWA_AIR_CACHE_LOG")[0] == '1';
+   if (on)
+      fprintf(stderr, "rwa: front cache %s %s (%s)\n", what, hex, entry ? entry : "-");
+}
+
+static nir_shader *
+front_to_nir(struct rwa_device *device, void *mem_ctx, unsigned stage, const void *bitcode, size_t size,
+             const char *entry, struct air_shader_info *info, const char **error)
+{
+   char dir[PATH_MAX], hex[41] = "-";
+   const bool cached = front_dir(dir, sizeof(dir));
+   if (cached) {
+      front_key(device, stage, bitcode, size, entry, hex);
+      char path[PATH_MAX];
+      snprintf(path, sizeof(path), "%s/%s.bin", dir, hex);
+      size_t len = 0;
+      void *buf = front_slurp(path, &len);
+      if (buf) {
+         struct blob_reader r;
+         blob_reader_init(&r, buf, len);
+         struct air_shader_info got = { 0 };
+         nir_shader *nir = NULL;
+         if (blob_read_uint32(&r) == FRONT_MAGIC && front_read_info(&r, mem_ctx, &got))
+            nir = nir_deserialize(mem_ctx, device->nir_options, &r);
+         free(buf);
+         if (nir && !r.overrun) {
+            *info = got;
+            front_hits++;
+            front_say("hit", hex, entry);
+            return nir;
+         }
+         front_bad++;   /* written by another build, or cut short: translated again and rewritten */
+         front_say("unreadable", hex, entry);
+      }
+   }
+   front_misses++;
+   front_say("miss", hex, entry);
+   struct air_constant_value *fc;
+   unsigned num_fc = air_module_function_constants(mem_ctx, bitcode, size, &fc);
+   apply_function_constants(device, stage, fc, num_fc);
+   const struct air_to_nir_options opts = { .constants = fc, .num_constants = num_fc };
+   nir_shader *nir = air_to_nir(mem_ctx, bitcode, size, entry, &opts, device->nir_options, info, error);
+   if (nir && cached)
+      front_store(dir, hex, info, nir);
+   return nir;
+}
+
 /* A04s (Metal track M6): see air_metal.h. */
 void
 rwa_set_function_constants(struct rwa_device *device, unsigned stage,
@@ -7005,15 +7299,10 @@ rwa_render_create(struct rwa_device *device,
     * error between the stages cannot surface until the draw, because ir3 compiles and
     * links at draw time (ir3_cache_lookup), so the two belong to two different calls.
     */
-   struct air_constant_value *ffc;
-   unsigned num_ffc =
-      air_module_function_constants(render->mem_ctx, fragment_bitcode, fragment_size, &ffc);
-   apply_function_constants(device, RWA_STAGE_FRAGMENT, ffc, num_ffc);   /* A04s (M6) */
-   const struct air_to_nir_options fopts = { .constants = ffc, .num_constants = num_ffc };
-   const char *error;
-   nir_shader *fs = air_to_nir(render->mem_ctx, fragment_bitcode, fragment_size,
-                               fragment_entry, &fopts, device->nir_options, &render->finfo,
-                               &error);
+   /* A04s (M6, M6b): the device's function constants applied, through the front end's cache */
+   const char *error = NULL;
+   nir_shader *fs = front_to_nir(device, render->mem_ctx, RWA_STAGE_FRAGMENT, fragment_bitcode,
+                                 fragment_size, fragment_entry, &render->finfo, &error);
    if (!fs) {
       say(why, why_size, "%s", error ? error : "the fragment module could not be translated");
       goto fail;
@@ -7067,13 +7356,8 @@ rwa_render_create(struct rwa_device *device,
          say(why, why_size, "%zu bytes is not a vertex shader module", vertex_size);
          goto fail;
       }
-      struct air_constant_value *vfc;
-      unsigned num_vfc =
-         air_module_function_constants(render->mem_ctx, vertex_bitcode, vertex_size, &vfc);
-      apply_function_constants(device, RWA_STAGE_VERTEX, vfc, num_vfc);   /* A04s (M6) */
-      const struct air_to_nir_options vopts = { .constants = vfc, .num_constants = num_vfc };
-      vs = air_to_nir(render->mem_ctx, vertex_bitcode, vertex_size, vertex_entry, &vopts,
-                      device->nir_options, &render->vinfo, &error);
+      vs = front_to_nir(device, render->mem_ctx, RWA_STAGE_VERTEX, vertex_bitcode, vertex_size,
+                        vertex_entry, &render->vinfo, &error);
       if (!vs) {
          say(why, why_size, "%s", error ? error : "the vertex module could not be translated");
          goto fail;

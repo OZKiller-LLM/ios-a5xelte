@@ -55,10 +55,16 @@ if [ "$(cat mesa/.a04s-m5 2>/dev/null)" != "$STAMP" ]; then
 	for p in "$METAL"/mesa-patches/*.patch; do
 		patch -s --no-backup-if-mismatch -d mesa -p1 < "$p"
 	done
-	# 4. M6: Panfrost's shader cache without an ELF build-id
-	python3 "$HERE/patch-pan-disk-cache.py" mesa
+	# 4. M6: Panfrost's shader cache without an ELF build-id. M6b: its identity is a hash of what decides Panfrost's
+	#    output (the release, the patches below and above, the cache patch), not the library file, so rebuilding
+	#    libhakiosair for its front end or runtime keeps the phone's cache
+	PAN_ID=$(cat "$GPU_MESA/patch-mesa.py" "$HK"/mesa/patches/*.patch "$METAL"/mesa-patches/*.patch \
+		"$HERE/patch-pan-disk-cache.py" | { cat; echo "$SHA256"; } | shasum -a 256 | cut -c1-32)
+	python3 "$HERE/patch-pan-disk-cache.py" mesa "a04s-pan-$PAN_ID"
 	rm -rf mesa/src/compiler/air
 	cp -R "$METAL/air" mesa/src/compiler/air   # M6: the merged front end and library (air/NOTICE.md)
+	# M6b: the front end's identity, for its cache of translated stages (air_metal.c, front_to_nir)
+	echo "#define A04S_AIR_FRONT_ID \"$(cat "$METAL"/air/* | shasum -a 256 | cut -c1-32)\"" > mesa/src/compiler/air/air_front_id.h
 	echo "$STAMP" > mesa/.a04s-m5
 fi
 
