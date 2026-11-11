@@ -1139,10 +1139,10 @@ index 0000000..61653da
 +#endif /* A04S_EMMC_GUARD_H */
 diff --git a/bsd/dev/a04s_gpu.c b/bsd/dev/a04s_gpu.c
 new file mode 100644
-index 0000000..7f4483b
+index 0000000..ba423df
 --- /dev/null
 +++ b/bsd/dev/a04s_gpu.c
-@@ -0,0 +1,3293 @@
+@@ -0,0 +1,3400 @@
 +/*
 + * Galaxy A04s, stage 7c-3: the temperatures that will limit the GPU, and the Mali-G52's first job.
 + *
@@ -3155,6 +3155,15 @@ index 0000000..7f4483b
 + * puts back v63's path (one job at a time under the GPU lock).
 + */
 +#define SCHED_POLL_US           100u
++#define SCHED_IRQ_POLL_US       10000u          /* v66: with interrupts, a look every 10 ms anyway */
++#define SCHED_IRQ_STORM         20000u          /* interrupts before the thread runs: a stuck line */
++#define A04S_GPU_INTID_FIRST    157u            /* GPU (SPI 125), JOB (SPI 126), MMU (SPI 127) */
++#define A04S_GPU_INTID_LAST     159u
++#define GPU_IRQ_STATUS          0x02cu
++#define JOB_IRQ_STATUS          0x100cu
++#define MMU_IRQ_STATUS          0x200cu
++#define SCHED_JOB_IRQS          0x00030003u     /* JS0 and JS1, done and failed */
++#define SCHED_MMU_IRQS          0x00fe00feu     /* AS1-AS7, page and bus faults */
 +#define SCHED_IDLE_POLL_US      1000u
 +#define SCHED_TIMEOUT_US        500000u
 +#define SCHED_LOG_MAX           40u
@@ -3571,21 +3580,116 @@ index 0000000..7f4483b
 +	}
 +}
 +
++/*
++ * v66 (7c-7c): the GPU's interrupts instead of polling every 100 us. The three SPIs (GPU 157, JOB 158,
++ * MMU 159) are routed to the boot CPU by pe_fiq.c's a04s_gic_gpu_spi(), and sleh_irq() offers them
++ * here. The handler only masks the GPU's interrupt sources (they are level interrupts: the line stays
++ * up until the scheduler clears RAWSTAT) and wakes the scheduler thread, which does everything else as
++ * before. The thread unmasks JOB (JS0/JS1 done or failed), MMU (AS1-AS7 faults) and GPU (fault) only
++ * while it has jobs on the GPU, after setting up its wait, so an interrupt from then on wakes it; it
++ * still looks every 10 ms, which also keeps the 500 ms timeout. With the scheduler idle the sources
++ * stay masked, so the present path and the boot tests never interrupt. A stuck line (20000 interrupts
++ * before the thread runs) turns the three SPIs off and goes back to polling. a04sgpu_irq=0: polling.
++ */
++extern int a04s_gic_gpu_spi(uint32_t intid, int on);   /* pexpert/arm/pe_fiq.c */
++static uint32_t sched_irq_mode;                         /* 0 polling, 1 interrupts, 2 off after a storm */
++static uint32_t sched_irq_burst, sched_irqs, sched_irq_spurious, sched_irq_logged, sched_irq_wakes;
++
++/* The interrupt handler, from sleh_irq() (interrupts off): true if it was the GPU's. */
++bool a04s_gpu_irq(uint32_t intid);
++bool
++a04s_gpu_irq(uint32_t intid)
++{
++	if (intid < A04S_GPU_INTID_FIRST || intid > A04S_GPU_INTID_LAST) {
++		return false;
++	}
++	__atomic_add_fetch(&sched_irqs, 1u, __ATOMIC_RELAXED);
++	if (gpu_va) {
++		if ((io_rd(gpu_va, JOB_IRQ_STATUS) | io_rd(gpu_va, MMU_IRQ_STATUS) | io_rd(gpu_va, GPU_IRQ_STATUS)) == 0) {
++			__atomic_add_fetch(&sched_irq_spurious, 1u, __ATOMIC_RELAXED);
++		}
++		gpu_wr(JOB_IRQ_MASK, 0);
++		gpu_wr(MMU_IRQ_MASK, 0);
++		gpu_wr(GPU_IRQ_MASK, 0);
++	}
++	if (__atomic_add_fetch(&sched_irq_burst, 1u, __ATOMIC_RELAXED) > SCHED_IRQ_STORM &&
++	    __atomic_load_n(&sched_irq_mode, __ATOMIC_RELAXED) == 1u) {
++		for (uint32_t id = A04S_GPU_INTID_FIRST; id <= A04S_GPU_INTID_LAST; id++) {
++			(void)a04s_gic_gpu_spi(id, 0);
++		}
++		__atomic_store_n(&sched_irq_mode, 2u, __ATOMIC_RELEASE);
++	}
++	thread_wakeup((event_t)&sched_wake);
++	return true;
++}
++
++/* The GPU's interrupt sources on (the scheduler waits for its jobs) or off. With a04s_gpu_mtx held. */
++static void
++sched_irq_sources_locked(bool on)
++{
++	if (!gpu_va) {
++		return;
++	}
++	gpu_wr(JOB_IRQ_MASK, on ? SCHED_JOB_IRQS : 0);
++	gpu_wr(MMU_IRQ_MASK, on ? SCHED_MMU_IRQS : 0);
++	gpu_wr(GPU_IRQ_MASK, on ? (IRQ_GPU_FAULT | IRQ_MULTIPLE_FAULT) : 0);
++}
++
++/* At the scheduler thread's start: route and enable the three SPIs, sources still masked. */
++static void
++sched_irq_setup(void)
++{
++	unsigned want = 1;
++	(void)PE_parse_boot_argn("a04sgpu_irq", &want, sizeof(want));
++	if (want == 0) {
++		kprintf("A04S GPU SCHED: polling (a04sgpu_irq=0)\n");
++		return;
++	}
++	lck_mtx_lock(&a04s_gpu_mtx);
++	sched_irq_sources_locked(false);
++	lck_mtx_unlock(&a04s_gpu_mtx);
++	for (uint32_t id = A04S_GPU_INTID_FIRST; id <= A04S_GPU_INTID_LAST; id++) {
++		if (!a04s_gic_gpu_spi(id, 1)) {
++			for (uint32_t k = A04S_GPU_INTID_FIRST; k <= A04S_GPU_INTID_LAST; k++) {
++				(void)a04s_gic_gpu_spi(k, 0);
++			}
++			kprintf("A04S GPU SCHED: no GIC route for INTID %u, polling\n", id);
++			return;
++		}
++	}
++	__atomic_store_n(&sched_irq_mode, 1u, __ATOMIC_RELEASE);
++	kprintf("A04S GPU SCHED: interrupts on (INTIDs %u-%u)\n", A04S_GPU_INTID_FIRST, A04S_GPU_INTID_LAST);
++}
++
 +static void
 +sched_thread(__unused void *arg, __unused wait_result_t wr)
 +{
++	sched_irq_setup();
 +	for (;;) {
 +		struct a04s_job *retire = NULL;
 +		lck_mtx_lock(&a04s_gpu_mtx);
 +		lck_mtx_lock(&sched_mtx);
++		__atomic_store_n(&sched_irq_burst, 0u, __ATOMIC_RELAXED);
++		if (__atomic_load_n(&sched_irq_mode, __ATOMIC_ACQUIRE) == 2u && sched_irq_logged == 0) {
++			sched_irq_logged = 1;
++			kprintf("A04S GPU SCHED: interrupt storm (%u), back to polling\n", sched_irqs);
++		}
 +		sched_poll_locked(&retire);
 +		sched_start_locked(&retire);
++		bool irq = __atomic_load_n(&sched_irq_mode, __ATOMIC_ACQUIRE) == 1u;
 +		if (retire == NULL) {
 +			if (sched_hw_busy != 0) {
-+				assert_wait_timeout((event_t)&sched_wake, THREAD_UNINT, SCHED_POLL_US, NSEC_PER_USEC);
++				assert_wait_timeout((event_t)&sched_wake, THREAD_UNINT, irq ? SCHED_IRQ_POLL_US : SCHED_POLL_US,
++				    NSEC_PER_USEC);
++				if (irq) {
++					sched_irq_wakes++;
++					sched_irq_sources_locked(true);       /* after the wait is set up: an interrupt now wakes us */
++				}
 +			} else if (sched_q[0].head != NULL || sched_q[1].head != NULL) {
++				sched_irq_sources_locked(false);
 +				assert_wait_timeout((event_t)&sched_wake, THREAD_UNINT, SCHED_IDLE_POLL_US, NSEC_PER_USEC);
 +			} else {
++				sched_irq_sources_locked(false);
 +				assert_wait((event_t)&sched_wake, THREAD_UNINT);
 +			}
 +		}
@@ -4390,6 +4494,9 @@ index 0000000..7f4483b
 +		}
 +	}
 +	kprintf("\n");
++	/* v66: the GPU's interrupts. */
++	kprintf("GPUIRQ %s N %u SPUR %u ARMED %u\n", sched_irq_mode == 1u ? "ON" : sched_irq_mode == 2u ? "STORM" : "POLL",
++	    sched_irqs, sched_irq_spurious, sched_irq_wakes);
 +	/* v64: the scheduler (a snapshot, no lock). */
 +	kprintf("GPUSCHED %s THREAD %u Q %u/%u RUN %x QUEUED %u DONE %u FAIL %u TMO %u FAULT %u REC %u HOT %u REF %u "
 +	    "MAXQ %u US AVG %u MAX %u WAITS %u LAST %x PID %d ASF %x@%x\n", sched_mode == 0 ? "OFF" : "ON",
@@ -10789,7 +10896,7 @@ index e01c124..48f3a43 100644
  /*
   * Coprocessor Access Control Register (CPACR)
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 87fb8a8..223f4ac 100644
+index 87fb8a8..c628026 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
 @@ -195,6 +195,33 @@ struct proc;
@@ -10864,6 +10971,30 @@ index 87fb8a8..223f4ac 100644
  #define handle_svc_kprintf(x...) /* kprintf("handle_svc: " x) */
  
  #define TRACE_SYSCALL 1
+@@ -1847,6 +1891,10 @@ handle_simd_trap(arm_saved_state_t *state, uint32_t esr)
+ 	__builtin_unreachable();
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_A04S)
++extern bool a04s_gpu_irq(uint32_t intid);       /* bsd/dev/a04s_gpu.c (v66) */
++#endif
++
+ void
+ sleh_irq(arm_saved_state_t *state)
+ {
+@@ -1898,6 +1946,12 @@ sleh_irq(arm_saved_state_t *state)
+ 		cpu_signal_handler();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
++#if defined(ARM64_BOARD_CONFIG_A04S)
++		/* A04s v66 (7c-7c): the Mali-G52's interrupts (INTIDs 157-159) go to bsd/dev/a04s_gpu.c. */
++		if (a04s_gpu_irq(intid)) {
++			/* handled: the GPU's sources are masked until its scheduler thread has run */
++		} else
++#endif
+ 		if (cdp->interrupt_handler) {
+ 			cdp->interrupt_handler(cdp->interrupt_target,
+ 			    cdp->interrupt_refCon,
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index 00b0198..f99c3ad 100644
 --- a/osfmk/arm64/start.s
@@ -11068,7 +11199,7 @@ index 25438c9..d478b02 100644
 +	kprintf("\n");
 +}
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
-index c37636f..3b3e639 100644
+index c37636f..36da34c 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
 @@ -259,7 +259,7 @@ a5xelte_send_self_ipi(void)
@@ -11080,7 +11211,54 @@ index c37636f..3b3e639 100644
  /* GIC CPU-interface bit of each logical CPU (banked ITARGETSR0). */
  static uint8_t a5_gic_cpu_masks[SWEET_SMP_MAX_CPUS];
  
-@@ -297,7 +297,7 @@ pe_init_fiq(void)
+@@ -275,6 +275,46 @@ a5xelte_send_ipi(unsigned int logical)
+ }
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_A04S)
++/*
++ * A04s v66 (7c-7c): the Mali-G52's three interrupts (device tree mali@11500000: GPU SPI 125, JOB SPI
++ * 126, MMU SPI 127, all level-high), INTIDs 157-159, for bsd/dev/a04s_gpu.c's scheduler. The only GIC
++ * distributor writes the port adds: every other INTID is refused, and for these three only their
++ * enable bit (ISENABLER/ICENABLER), their priority byte (0xa0, as the timer and SGIs) and their target
++ * byte (the boot CPU's interface) are written. Gated by tools/check_gic_source.py. 1: done, 0: refused.
++ */
++#define A04S_GIC_GPU_FIRST      157u
++#define A04S_GIC_GPU_LAST       159u
++int a04s_gic_gpu_spi(uint32_t intid, int on);
++int
++a04s_gic_gpu_spi(uint32_t intid, int on)
++{
++	if (intid < A04S_GIC_GPU_FIRST || intid > A04S_GIC_GPU_LAST || !a5_gicd_base) {
++		return 0;
++	}
++	uint32_t reg = 4U * (intid / 32U), bit = 1U << (intid % 32U);
++	if (!on) {
++		a5_gic_write32(a5_gicd_base, 0x180 + reg, bit);         /* GICD_ICENABLER */
++		__builtin_arm_dsb(DSB_SY);
++		return 1;
++	}
++#if defined(A5XELTE_SMP)
++	uint8_t target = a5_gic_cpu_masks[0];
++#else
++	uint8_t target = (uint8_t)(a5_gic_read32(a5_gicd_base, 0x800) & 0xff);
++#endif
++	if (target == 0) {
++		return 0;
++	}
++	*(volatile uint8_t *)(a5_gicd_base + 0x400 + intid) = 0xa0;      /* GICD_IPRIORITYR byte */
++	*(volatile uint8_t *)(a5_gicd_base + 0x800 + intid) = target;    /* GICD_ITARGETSR byte */
++	__builtin_arm_dsb(DSB_SY);
++	a5_gic_write32(a5_gicd_base, 0x100 + reg, bit);         /* GICD_ISENABLER */
++	__builtin_arm_dsb(DSB_SY);
++	return 1;
++}
++#endif /* ARM64_BOARD_CONFIG_A04S */
++
+ void
+ pe_init_fiq(void)
+ {
+@@ -297,7 +337,7 @@ pe_init_fiq(void)
  	if (!a5_gicd_base || !a5_gicc_base) {
  		panic("a5xelte: cannot map GICv2");
  	}
