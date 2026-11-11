@@ -28,6 +28,7 @@
 #define A04S_LOG_DIVERT_STRONG 1
 #import <Foundation/Foundation.h>
 #include <mach-o/dyld.h>
+#include <errno.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
 

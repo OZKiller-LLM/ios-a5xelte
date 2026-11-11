@@ -42,6 +42,7 @@
 #include <spawn.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/param.h>
 #include <sys/sysctl.h>
 #include <sys/wait.h>
 
