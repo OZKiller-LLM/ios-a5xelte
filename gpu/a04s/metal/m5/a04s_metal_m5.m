@@ -27,6 +27,8 @@
  * (seconds, default 150) limits each child and four times that the whole probe. A04S_CA_SCENES (a list
  * such as 0,5) picks the CoreAnimation scenes; unset, all seven run. Scene 5 is also compared with its
  * CPU reference blurred here, since -renderInContext: ignores layer filters (a04s_ca_scenes.m).
+ * A04S_DMESG_ROLL_S (default 120; 0: off): a child of its own session saves the kernel's log that often, for
+ * the whole boot, into /private/var/a04s/dmesg-roll-0.log and -1.log in turn (M6b boot 5).
  *
  * REMOVAL: with A04S_METAL_REMOVE=1 it only deletes what M4 and M5 installed --
  * /System/Library/Extensions/A04sMetal.bundle, /private/var/a04s/metal/,
@@ -36,6 +38,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <copyfile.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <mach-o/dyld.h>
 #include <signal.h>
@@ -632,11 +635,107 @@ run_child(const char *self, const char *mode)
 			 WTERMSIG(st) == SIGALRM ? " (its time limit)" : "");
 }
 
+/* ---- M6b boot 5: the kernel's log for the whole boot ------------------------------------------------- */
+
+/* The drop agent saves the kernel's message buffer at about 1, 2, 4, 8 and 15 minutes, then never again; M6b boot 4's
+ * backboardd died at about 20 minutes. A child of its own session (so it outlives this autorun and the agent) saves it
+ * every A04S_DMESG_ROLL_S seconds (default 120; 0: off) into /private/var/a04s/dmesg-roll-0.log and -1.log in turn,
+ * each through a .part file and a rename, so one complete file always survives a reboot mid-write. */
+#define DMESG_ROLL_PID "/private/var/a04s/dmesg-roll.pid"
+#define DMESG_MAX (1u << 20)
+
+static void
+dmesg_save(const char *path, char *buf)
+{
+	int (*kmsgbuf)(void *, uint32_t) = (int (*)(void *, uint32_t))dlsym(RTLD_DEFAULT, "proc_kmsgbuf");
+	int got = kmsgbuf ? kmsgbuf(buf, DMESG_MAX) : -1;
+	if (got <= 0)
+		return;
+	char part[96];
+	snprintf(part, sizeof(part), "%s.part", path);
+	int fd = open(part, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0)
+		return;
+	bool ok = write(fd, buf, (size_t)got) == got && fsync(fd) == 0;
+	close(fd);
+	if (!ok || rename(part, path) != 0)
+		unlink(part);
+}
+
+static int
+dmesg_roller(unsigned period)
+{
+	char *buf = malloc(DMESG_MAX);
+	if (!buf)
+		return 1;
+	for (unsigned i = 0;; i ^= 1) {
+		sleep(period);
+		dmesg_save(i ? "/private/var/a04s/dmesg-roll-1.log" : "/private/var/a04s/dmesg-roll-0.log", buf);
+	}
+	return 0;
+}
+
+static void
+start_dmesg_roller(const char *self)
+{
+	const char *e = getenv("A04S_DMESG_ROLL_S");
+	unsigned period = e && *e ? (unsigned)atoi(e) : 120;
+	if (!period) {
+		a04s_log("dmesg roll: off (A04S_DMESG_ROLL_S=0)");
+		return;
+	}
+	FILE *f = fopen(DMESG_ROLL_PID, "r");
+	int old = 0;
+	if (f) {
+		if (fscanf(f, "%d", &old) != 1)
+			old = 0;
+		fclose(f);
+	}
+	struct kinfo_proc kp;
+	size_t kl = sizeof(kp);
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, old };
+	const char *base = strrchr(self, '/') ? strrchr(self, '/') + 1 : self;
+	if (old > 0 && kill(old, 0) == 0 && sysctl(mib, 4, &kp, &kl, NULL, 0) == 0 && kl &&
+	    !strncmp(kp.kp_proc.p_comm, base, MAXCOMLEN)) {
+		a04s_log("dmesg roll: already running (pid %d)", old);
+		return;
+	}
+	char per[16];
+	snprintf(per, sizeof(per), "%u", period);
+	char *argv[] = { (char *)self, "--dmesg-roll", per, NULL };
+	posix_spawnattr_t at;
+	posix_spawnattr_init(&at);
+#ifdef POSIX_SPAWN_SETSID
+	posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSID);
+#endif
+	posix_spawn_file_actions_t fa;
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+	posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+	posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+	pid_t pid = 0;
+	int rc = posix_spawn(&pid, self, &fa, &at, argv, environ);
+	posix_spawn_file_actions_destroy(&fa);
+	posix_spawnattr_destroy(&at);
+	if (rc) {
+		a04s_log("dmesg roll: posix_spawn: %s", strerror(rc));
+		return;
+	}
+	f = fopen(DMESG_ROLL_PID, "w");
+	if (f) {
+		fprintf(f, "%d\n", pid);
+		fclose(f);
+	}
+	a04s_log("dmesg roll: pid %d saves the kernel's log every %u s into /private/var/a04s/dmesg-roll-{0,1}.log", pid, period);
+}
+
 int
 main(int argc, char **argv)
 {
 	@autoreleasepool {
 		pthread_t hb;
+		if (argc >= 3 && !strcmp(argv[1], "--dmesg-roll"))
+			return dmesg_roller((unsigned)atoi(argv[2]) ?: 120);
 		if (argc >= 3 && !strcmp(argv[1], "--child")) {
 			alarm(timeout_s());
 			pthread_create(&hb, NULL, heartbeat, NULL);
@@ -651,6 +750,12 @@ main(int argc, char **argv)
 			a04s_log("a04s-metal-probe: removal done");
 			return 0;
 		}
+		char self[PATH_MAX];
+		uint32_t size = sizeof(self);
+		if (_NSGetExecutablePath(self, &size) != 0)
+			strlcpy(self, argv[0], sizeof(self));
+		STEP("dmesg roll");
+		start_dmesg_roller(self);
 		STEP("install");
 		const bool installed = install_bundle();
 		NSError *err = nil;
@@ -661,10 +766,6 @@ main(int argc, char **argv)
 		STEP("backboardd");
 		bb_permissions();
 		bb_restart_if_needed(installed);
-		char self[PATH_MAX];
-		uint32_t size = sizeof(self);
-		if (_NSGetExecutablePath(self, &size) != 0)
-			strlcpy(self, argv[0], sizeof(self));
 		const char *only = getenv("A04S_M5_ONLY");
 		STEP("children");
 		if (!only || !strcmp(only, "softpipe"))

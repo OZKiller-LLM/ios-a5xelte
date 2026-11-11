@@ -26,13 +26,23 @@
  *   the first A04S_BB_DUMP_LINEAR (default 8) of up to 512 x 512 (at least 8 rows) written as stored, before any reversal,
  *   to bb-metal/linear-NN-WxH-fmtF-bprB.raw. Boot 1: labels are upright as stored, so backboardd no longer reverses
  *   them (bgmtl.m); the probe still does (M6a run 12).
+ * - Boot 5 (M6b boot 4: backboardd died twice with no line, its GPU buffers at 183 MB during Siri):
+ *     - memory: at start backboardd's footprint and its jetsam limit (if the kernel tells it), a line at once whenever the
+ *       footprint passes a new 32 MB step, and the footprint and its peak in every stats line;
+ *     - how it ends: a line, written straight from the handler, for each of SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGABRT,
+ *       SIGBUS, SIGSEGV, SIGILL, SIGFPE, SIGSYS and SIGTRAP (who sent it, or the fault address, PC and LR), then
+ *       backboardd's own handler or the default action; and one for exit(). A jetsam kill (SIGKILL) leaves no line;
+ *     - bgmtl.m's in-flight cap (A04S_MAX_INFLIGHT, 4 here): its waits and how long they took, in each stats line.
  */
 #define A04S_LOG_DIVERT_STRONG 1
 #import <Foundation/Foundation.h>
 #include <mach-o/dyld.h>
+#include <dlfcn.h>
 #include <errno.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
+#include <sys/ucontext.h>
 
 #include "a04s_metal_log.h"
 
@@ -454,6 +464,194 @@ bb_fall_back(int log_fd, const char *why)
       _exit(75);
 }
 
+/* ---- boot 5: the in-flight cap, memory, and how backboardd ends --------------------------------- */
+
+static uint64_t bb_cap_waits, bb_cap_ns, bb_cap_gave_up;     /* this window (bgmtl.m's A04S_MAX_INFLIGHT) */
+
+void
+bgmtl_note_inflight_wait(uint64_t ns, int gave_up)
+{
+   if (!atomic_load(&bb_on))
+      return;
+   pthread_mutex_lock(&bb_c_lock);
+   bb_cap_waits++;
+   bb_cap_ns += ns;
+   bool first_give_up = gave_up && bb_cap_gave_up++ == 0;
+   pthread_mutex_unlock(&bb_c_lock);
+   if (first_give_up)
+      bb_log("bb: a commit waited %.1f s for one of the A04S_MAX_INFLIGHT slots and went ahead without one", ns / 1e9);
+}
+
+/* phys_footprint (what jetsam weighs; it counts IOKit memory mapped into the process, so HeroGPU's buffers too) and its peak */
+static void
+bb_footprint(double *mb, double *peak_mb)
+{
+   task_vm_info_data_t vm;
+   mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+   *mb = *peak_mb = 0;
+   if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &n) != KERN_SUCCESS)
+      return;
+   *mb = vm.phys_footprint / 1048576.0;
+   *peak_mb = n >= TASK_VM_INFO_REV1_COUNT ? vm.ledger_phys_footprint_peak / 1048576.0 : *mb;
+}
+
+/* backboardd's jetsam limit, if the kernel tells a process its own (memorystatus_control, GET_MEMLIMIT_PROPERTIES) */
+static void
+bb_memlimit(char *out, size_t size)
+{
+   struct { int32_t active; uint32_t active_attr; int32_t inactive; uint32_t inactive_attr; } props = { 0, 0, 0, 0 };
+   int (*mc)(uint32_t, int32_t, uint32_t, void *, size_t) =
+      (int (*)(uint32_t, int32_t, uint32_t, void *, size_t))dlsym(RTLD_DEFAULT, "memorystatus_control");
+   if (!mc) {
+      snprintf(out, size, "unknown (no memorystatus_control)");
+      return;
+   }
+   if (mc(8 /* MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES */, getpid(), 0, &props, sizeof(props)) != 0) {
+      snprintf(out, size, "unknown (memorystatus_control: %s)", strerror(errno));
+      return;
+   }
+   snprintf(out, size, "%d MB active%s, %d MB inactive%s", props.active, props.active_attr & 1 ? " (fatal)" : "",
+            props.inactive, props.inactive_attr & 1 ? " (fatal)" : "");
+}
+
+/* A line written straight to the log from a signal handler: no locks, no stdio, no allocation. Lines still queued for
+ * the log thread may be lost; this one is not. A jetsam kill (SIGKILL) cannot be caught: then the last memory lines
+ * are the evidence. */
+static int bb_sig_fd = -1;
+static struct sigaction bb_sig_old[NSIG];
+static const int bb_sigs[] = { SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGABRT, SIGBUS, SIGSEGV, SIGILL, SIGFPE, SIGSYS, SIGTRAP };
+
+static size_t
+bb_put(char *b, size_t n, size_t cap, const char *s)
+{
+   while (*s && n < cap)
+      b[n++] = *s++;
+   return n;
+}
+
+static size_t
+bb_put_num(char *b, size_t n, size_t cap, unsigned long long v, unsigned base)
+{
+   char d[24];
+   size_t k = 0;
+   do {
+      d[k++] = "0123456789abcdef"[v % base];
+      v /= base;
+   } while (v && k < sizeof(d));
+   while (k && n < cap)
+      b[n++] = d[--k];
+   return n;
+}
+
+static void
+bb_sig_write(const char *what, int sig, siginfo_t *si, void *ucv)
+{
+   if (bb_sig_fd < 0)
+      return;
+   char b[400];
+   const size_t cap = sizeof(b) - 1;
+   size_t n = 0;
+   double t = a04s_now();
+   unsigned long long whole = (unsigned long long)t, ms = (unsigned long long)((t - (double)whole) * 1000);
+   n = bb_put(b, n, cap, "[backboardd ");
+   n = bb_put_num(b, n, cap, (unsigned long long)getpid(), 10);
+   n = bb_put(b, n, cap, " +");
+   n = bb_put_num(b, n, cap, whole, 10);
+   n = bb_put(b, n, cap, ms < 10 ? ".00" : ms < 100 ? ".0" : ".");
+   n = bb_put_num(b, n, cap, ms, 10);
+   n = bb_put(b, n, cap, "s] bb: ");
+   n = bb_put(b, n, cap, what);
+   if (sig) {
+      n = bb_put(b, n, cap, " ");
+      n = bb_put_num(b, n, cap, (unsigned long long)sig, 10);
+      n = bb_put(b, n, cap, " (SIG");
+      n = bb_put(b, n, cap, sig < NSIG && sys_signame[sig] ? sys_signame[sig] : "?");
+      n = bb_put(b, n, cap, ")");
+   }
+   if (si) {
+      n = bb_put(b, n, cap, ", code ");
+      n = bb_put_num(b, n, cap, (unsigned long long)(unsigned)si->si_code, 10);
+      if (si->si_code == SI_USER || si->si_code == SI_QUEUE) {
+         n = bb_put(b, n, cap, ", sent by pid ");
+         n = bb_put_num(b, n, cap, (unsigned long long)si->si_pid, 10);
+      } else {
+         n = bb_put(b, n, cap, ", address 0x");
+         n = bb_put_num(b, n, cap, (unsigned long long)(uintptr_t)si->si_addr, 16);
+      }
+   }
+#if defined(__arm64__)
+   ucontext_t *uc = (ucontext_t *)ucv;
+   if (uc && uc->uc_mcontext && si && si->si_code != SI_USER && si->si_code != SI_QUEUE) {
+#if defined(__darwin_arm_thread_state64_get_pc)
+      unsigned long long pc = (unsigned long long)__darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
+      unsigned long long lr = (unsigned long long)__darwin_arm_thread_state64_get_lr(uc->uc_mcontext->__ss);
+#else
+      unsigned long long pc = uc->uc_mcontext->__ss.__pc, lr = uc->uc_mcontext->__ss.__lr;
+#endif
+      n = bb_put(b, n, cap, ", pc 0x");
+      n = bb_put_num(b, n, cap, pc, 16);
+      n = bb_put(b, n, cap, ", lr 0x");
+      n = bb_put_num(b, n, cap, lr, 16);
+      n = bb_put(b, n, cap, " (IMAGE lines above)");
+   }
+#else
+   (void)ucv;
+#endif
+   b[n++] = '\n';
+   (void)!write(bb_sig_fd, b, n);
+   fsync(bb_sig_fd);
+}
+
+static void
+bb_on_signal(int sig, siginfo_t *si, void *uc)
+{
+   int saved = errno;
+   bb_sig_write("signal", sig, si, uc);
+   struct sigaction *o = sig > 0 && sig < NSIG ? &bb_sig_old[sig] : NULL;
+   if (o && (o->sa_flags & SA_SIGINFO) && o->sa_sigaction) {
+      o->sa_sigaction(sig, si, uc);
+   } else if (o && o->sa_handler == SIG_IGN) {
+      /* backboardd ignores it (it may watch it with a dispatch source instead) */
+   } else if (o && o->sa_handler != SIG_DFL && o->sa_handler) {
+      o->sa_handler(sig);
+   } else {
+      /* the default action: put it back and deliver the signal again (a fault re-runs the faulting instruction) */
+      struct sigaction dfl;
+      memset(&dfl, 0, sizeof(dfl));
+      dfl.sa_handler = SIG_DFL;
+      sigemptyset(&dfl.sa_mask);
+      sigaction(sig, &dfl, NULL);
+      if (!si || si->si_code == SI_USER || si->si_code == SI_QUEUE ||
+          (sig != SIGSEGV && sig != SIGBUS && sig != SIGILL && sig != SIGFPE && sig != SIGTRAP))
+         raise(sig);
+   }
+   errno = saved;
+}
+
+static void
+bb_on_exit(void)
+{
+   bb_sig_write("backboardd is exiting (exit() or a return from main)", 0, NULL, NULL);
+}
+
+static void
+bb_watch_exit(void)
+{
+   bb_sig_fd = open(getenv("A04S_METAL_LOG") ? getenv("A04S_METAL_LOG") : BB_DIR "/bb-metal.log", O_WRONLY | O_CREAT | O_APPEND,
+                    0666);
+   if (bb_sig_fd < 0)
+      return;
+   for (unsigned i = 0; i < sizeof(bb_sigs) / sizeof(bb_sigs[0]); i++) {
+      struct sigaction sa;
+      memset(&sa, 0, sizeof(sa));
+      sa.sa_sigaction = bb_on_signal;
+      sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+      sigemptyset(&sa.sa_mask);
+      sigaction(bb_sigs[i], &sa, &bb_sig_old[bb_sigs[i]]);
+   }
+   atexit(bb_on_exit);
+}
+
 static void *
 bb_main(void *arg)
 {
@@ -466,6 +664,13 @@ bb_main(void *arg)
    bool fell_back = false, healthy = false, told_idle = false;
    double last_stats = a04s_now();
    uint64_t w_committed = 0, w_completed = 0, w_failed = 0;
+   char limit[160];
+   bb_memlimit(limit, sizeof(limit));
+   double fp_mb, fp_peak, fp_told;
+   bb_footprint(&fp_mb, &fp_peak);
+   bb_log("bb: memory: footprint %.1f MB (peak %.1f MB); jetsam limit %s; a line whenever the footprint passes a new 32 MB step",
+          fp_mb, fp_peak, limit);
+   fp_told = fp_mb;
    for (;;) {
       struct timespec until;
       clock_gettime(CLOCK_REALTIME, &until);
@@ -510,6 +715,17 @@ bb_main(void *arg)
                 "pipelines, or drawing some other way)");
       }
 
+      bb_footprint(&fp_mb, &fp_peak);
+      if (fp_mb >= fp_told + 32) {
+         int lvl = 0;
+         size_t ln = sizeof(lvl);
+         if (sysctlbyname("kern.memorystatus_level", &lvl, &ln, NULL, 0) != 0)
+            lvl = -1;
+         bb_log("bb: memory: footprint %.1f MB, a new high (peak %.1f MB); %u command buffers outstanding; system memory %d%% free",
+                fp_mb, fp_peak, outstanding, lvl);
+         fp_told = fp_mb;
+      }
+
       double t = a04s_now();
       if (period && t - last_stats >= period) {
          pthread_mutex_lock(&bb_c_lock);
@@ -519,6 +735,8 @@ bb_main(void *arg)
          double ps = bb_pipe_secs;
          unsigned si = bb_surf_imported, sc = bb_surf_copied, sr = bb_surf_refused;
          size_t ss = bb_surf_smallest;
+         uint64_t cw = bb_cap_waits, cns = bb_cap_ns, cg = bb_cap_gave_up;
+         bb_cap_waits = bb_cap_ns = bb_cap_gave_up = 0;
          char threads[96] = "";
          for (unsigned i = 0; i < bb_commit_nthreads; i++) {
             char one[24];
@@ -539,11 +757,12 @@ bb_main(void *arg)
             bb_log("bb stats %.1f s: %llu committed, %llu completed (%.1f/s), %llu failed, %u outstanding (oldest %.2f s); "
                    "commit to completion avg %.1f ms, max %.1f ms; %llu presents; pipelines %u made, %u refused, %.1f s building; "
                    "textures refused %u, draws skipped %u, clears skipped %u, other refusals %u; IOSurfaces %u imported "
-                   "(smallest %zu bytes), %u copied, %u refused; committing threads %s",
+                   "(smallest %zu bytes), %u copied, %u refused; committing threads %s; in-flight cap: %llu waits, %.1f ms waiting, "
+                   "%llu gave up; footprint %.1f MB (peak %.1f MB)",
                    t - last_stats, (unsigned long long)dc, (unsigned long long)dd, dd / (t - last_stats),
                    (unsigned long long)df, outstanding, oldest, lat_n ? lat_sum / 1e6 / lat_n : 0, lat_max / 1e6,
                    (unsigned long long)presents, pm, pr, ps, tr, ds, cs, orf, si, si ? ss : 0, sc, sr,
-                   threads[0] ? threads : "-");
+                   threads[0] ? threads : "-", (unsigned long long)cw, cns / 1e6, (unsigned long long)cg, fp_mb, fp_peak);
          w_committed = committed;
          w_completed = completed;
          w_failed = failed;
@@ -568,6 +787,7 @@ a04s_bb_device_ready(const char *name, const char *cache_dir)
       return;
    }
    atomic_store(&bb_on, 1);
+   bb_watch_exit();
    bb_log("bb: backboardd composites on %s (launch %s this boot, uid %d); shader cache %s; watchdog: stall %u s, "
           "%u failures in a row; %s",
           name, getenv("A04S_BB_LAUNCH") ?: "?", getuid(), cache_dir ?: "off", bb_env_u("A04S_BB_STALL_S", 20),

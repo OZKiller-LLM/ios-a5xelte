@@ -155,6 +155,29 @@ __attribute__((weak)) void bgmtl_note_surface(unsigned id, size_t w, size_t h, s
 __attribute__((weak)) void bgmtl_note_cpu_rows(const char *what, unsigned w, unsigned h, unsigned fmt, const uint8_t *src, size_t bpr,
                                                int reversed)
 { (void)what; (void)w; (void)h; (void)fmt; (void)src; (void)bpr; (void)reversed; }
+// A04s (Metal track M6b boot 5, a04s_bb.m): a commit that waited for the in-flight cap below, how long, and whether it gave up
+__attribute__((weak)) void bgmtl_note_inflight_wait(uint64_t ns, int gave_up) { (void)ns; (void)gave_up; }
+
+// A04s (Metal track M6b boot 5): how many committed command buffers may wait for the GPU at once. M6b boot 4 (Siri): the GPU
+// fell behind, CoreAnimation kept up to 64 command buffers queued, each holding its batches' memory and the textures it drew
+// through, and backboardd's GPU buffers went from 65 MB to 183 MB (1,356 new in 5.4 s) with commit to completion at 2-4 s;
+// backboardd then died with no line. A commit now waits, before it is encoded, until fewer than this many are outstanding:
+// what Metal's queue does at maxCommandBufferCount, with a bound that suits a GPU this slow. A04S_MAX_INFLIGHT (0: no cap);
+// default 4 in backboardd, none elsewhere. A wait over 2 s gives up and commits anyway (logged), so a
+// completion that never comes cannot stop the render server.
+static dispatch_semaphore_t
+bg_inflight(void)
+{
+   static dispatch_semaphore_t sem;
+   static dispatch_once_t once;
+   dispatch_once(&once, ^{
+      const char *e = getenv("A04S_MAX_INFLIGHT");
+      long n = e && *e ? strtol(e, NULL, 10) : !strcmp(getprogname(), "backboardd") ? 4 : 0;
+      if (n > 0 && n <= 1024)
+         sem = dispatch_semaphore_create(n);
+   });
+   return sem;
+}
 
 @class BGMTLDevice;
 @class BGMTLComputePipeline;
@@ -334,6 +357,7 @@ bg_install_fallback(Class c)
    NSInteger _status;
    NSMutableArray *_completed, *_scheduled, *_presents;   // handlers; drawables to present once the work has completed
    dispatch_group_t _done;                                 // left when the completion (fence) has run: waitUntilCompleted
+   BOOL _inflightHeld;                                     // holds one of bg_inflight()'s slots until it completes
 }
 - (instancetype)initWithBGQueue:(BGMTLCommandQueue *)queue;
 - (void)bgRecord:(BGWork *)work;
@@ -1120,8 +1144,32 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    }
 }
 
+// the completion queue's mark: a commit made from a completed handler must not wait for the queue it runs on
+static char bg_completion_key;
+
+- (void)bgReleaseInflight
+{
+   if (_inflightHeld) {
+      _inflightHeld = NO;
+      dispatch_semaphore_signal(bg_inflight());
+   }
+}
+
 - (void)commit
 {
+   static int sync_commit = -1;     // BGMTL_SYNC=1 (the inject sets it when /private/var/tmp/bgmtl-bb.sync exists): wait inline, as before
+   if (sync_commit < 0)   // or /private/var/tmp/bgmtl.sync for every process (posters, plugin clients) launchd starts
+      sync_commit = (getenv("BGMTL_SYNC") && getenv("BGMTL_SYNC")[0] == '1') || access("/private/var/tmp/bgmtl.sync", F_OK) == 0;
+   dispatch_semaphore_t cap = bg_inflight();
+   if (cap && !bg_trace() && !sync_commit && !dispatch_get_specific(&bg_completion_key)) {
+      if (dispatch_semaphore_wait(cap, DISPATCH_TIME_NOW) == 0) {
+         _inflightHeld = YES;
+      } else {
+         uint64_t w0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+         _inflightHeld = dispatch_semaphore_wait(cap, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC)) == 0;
+         bgmtl_note_inflight_wait(clock_gettime_nsec_np(CLOCK_MONOTONIC) - w0, !_inflightHeld);
+      }
+   }
    bgmtl_note_committed();
    BG_TRACE("commit: %lu recorded commands\n", (unsigned long)[_work count]);
    uint64_t t_begin = clock_gettime_nsec_np(CLOCK_MONOTONIC);
@@ -1276,9 +1324,6 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
       for (void (^h)(id) in _scheduled) h(self);
       [_scheduled removeAllObjects];
    }
-   static int sync_commit = -1;     // BGMTL_SYNC=1 (the inject sets it when /private/var/tmp/bgmtl-bb.sync exists): wait inline, as before
-   if (sync_commit < 0)   // or /private/var/tmp/bgmtl.sync for every process (posters, plugin clients) launchd starts
-      sync_commit = (getenv("BGMTL_SYNC") && getenv("BGMTL_SYNC")[0] == '1') || access("/private/var/tmp/bgmtl.sync", F_OK) == 0;
    if (bg_trace() || sync_commit || _status == 5) {
       if (_status != 5 && bg_fence_wait(dev, fence, why, sizeof(why)) != 0)
          [self bgFailWith:[NSString stringWithUTF8String:why] code:3];
@@ -1294,12 +1339,16 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
       }
       rwa_fence_release([dev rwa], fence);
       [self bgCompleteFrom:t_begin];
+      [self bgReleaseInflight];
       dispatch_group_leave(_done);
       return;
    }
    static dispatch_queue_t completion;
    static dispatch_once_t once;
-   dispatch_once(&once, ^{ completion = dispatch_queue_create("chlorophyll.completion", DISPATCH_QUEUE_SERIAL); });
+   dispatch_once(&once, ^{
+      completion = dispatch_queue_create("chlorophyll.completion", DISPATCH_QUEUE_SERIAL);
+      dispatch_queue_set_specific(completion, &bg_completion_key, &bg_completion_key, NULL);
+   });
    [self retain];
    dispatch_async(completion, ^{
       char w2[512] = { 0 };
@@ -1309,6 +1358,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
          _status = 4;   // Completed: the fence has been paid
       rwa_fence_release([dev rwa], fence);
       [self bgCompleteFrom:t_begin];
+      [self bgReleaseInflight];
       dispatch_group_leave(_done);
       [self release];
    });
