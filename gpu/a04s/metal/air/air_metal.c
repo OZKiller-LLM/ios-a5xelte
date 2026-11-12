@@ -7509,6 +7509,19 @@ rwa_render_create(struct rwa_device *device,
     */
    if (render->generated_vertex)
       ralloc_free(vs);
+   /* A04s (M6b boot 7): and so are the front end's stages. Nothing reads either NIR once
+    * both are compiled (the driver compiles further variants from its own copy), but they
+    * sat under render->mem_ctx for as long as the pipeline lived, a front-end copy of each
+    * stage next to the driver's. Boot 6's backboardd grew by 2-3 MB with each
+    * fixed_vert + fixed_frag pipeline, 48 MB to 420 MB over about 150 of them. The
+    * pipeline's own tables (render->finfo and vinfo, from air_to_nir or the front cache)
+    * are separate allocations under mem_ctx, not children of either shader, and stay.
+    */
+   ralloc_free(fs);
+   fs = NULL;
+   if (!render->generated_vertex)
+      ralloc_free(vs);
+   vs = NULL;
    if (!render->vs_cso)
       goto fail;
 

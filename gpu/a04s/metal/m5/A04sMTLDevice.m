@@ -26,6 +26,8 @@
 void a04s_bb_device_ready(const char *name, const char *cache_dir);
 void a04s_bb_device_failed(const char *why);
 void a04s_bb_note_pipeline(double secs, int made);
+double a04s_bb_footprint_mb(void);
+void a04s_bb_memory(double *footprint_mb, double *in_use_mb, double *held_mb, double *relieved_mb);
 
 typedef mach_port_t a04s_io_registry_entry_t;
 extern kern_return_t IORegistryEntryGetRegistryEntryID(a04s_io_registry_entry_t entry, uint64_t *id);
@@ -243,21 +245,27 @@ a04s_cpu_now(void)
    bg_lock();
    a04s_apply_constants([self rwa], RWA_STAGE_VERTEX, d.vertexFunction);
    a04s_apply_constants([self rwa], RWA_STAGE_FRAGMENT, d.fragmentFunction);
+   const double fp0 = a04s_bb_footprint_mb();
    double t = a04s_now(), c = a04s_cpu_now();
    unsigned h0, m0, h1, m1;
    rwa_front_cache_counts(&h0, &m0, NULL, NULL);
    NSError *e = nil;
    id p = [super newRenderPipelineStateWithDescriptor:d error:&e];
    rwa_front_cache_counts(&h1, &m1, NULL, NULL);
+   const double secs = a04s_now() - t, cpu = a04s_cpu_now() - c;
    uint64_t tid = 0;
    pthread_threadid_np(NULL, &tid);
+   /* M6b boot 7: what the pipeline did to memory (a04s_bb.m), measured after the time so it is not counted in it */
+   double fp1, in_use, held, relieved;
+   a04s_bb_memory(&fp1, &in_use, &held, &relieved);
    /* M6b: which thread builds (against the threads that commit, in a04s_bb.m's stats), and whether the front end's
     * cache had the stages */
-   a04s_log("render pipeline %s + %s: %s in %.2f s (CPU %.2f s), thread %llu%s, front cache %u hit %u miss%s%s",
+   a04s_log("render pipeline %s + %s: %s in %.2f s (CPU %.2f s), thread %llu%s, front cache %u hit %u miss; footprint "
+            "%+.1f MB to %.1f MB, malloc %.1f MB in use of %.1f MB held, %.1f MB given back%s%s",
             d.vertexFunction.name.UTF8String ?: "-", d.fragmentFunction.name.UTF8String ?: "-", p ? "made" : "REFUSED",
-            a04s_now() - t, a04s_cpu_now() - c, (unsigned long long)tid, pthread_main_np() ? " (main)" : "", h1 - h0,
-            m1 - m0, !p && e ? ": " : "", !p && e ? e.localizedDescription.UTF8String : "");
-   a04s_bb_note_pipeline(a04s_now() - t, p != nil);
+            secs, cpu, (unsigned long long)tid, pthread_main_np() ? " (main)" : "", h1 - h0, m1 - m0, fp1 - fp0, fp1,
+            in_use, held, relieved, !p && e ? ": " : "", !p && e ? e.localizedDescription.UTF8String : "");
+   a04s_bb_note_pipeline(secs, p != nil);
    a04s_apply_constants([self rwa], RWA_STAGE_VERTEX, nil);
    a04s_apply_constants([self rwa], RWA_STAGE_FRAGMENT, nil);
    if (p)

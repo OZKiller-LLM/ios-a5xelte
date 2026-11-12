@@ -151,6 +151,13 @@ __attribute__((weak)) void bgmtl_note_present(const char *line) { (void)line; } 
 __attribute__((weak)) void bgmtl_note_surface(unsigned id, size_t w, size_t h, size_t bpr, size_t alloc, unsigned fmt, unsigned planes,
                                               unsigned plane, int render_target, const char *result)
 { (void)id; (void)w; (void)h; (void)bpr; (void)alloc; (void)fmt; (void)planes; (void)plane; (void)render_target; (void)result; }
+// A04s (Metal track M6b boot 7, a04s_bb.m in backboardd): where one command buffer's time went, in ns, from -commit to the
+// end of its completion work: [0] waiting for the device lock, [1] encoding and submitting under it, [2] the scheduled
+// handlers on the committing thread, [3] waiting for the serial completion queue (an earlier command buffer's completion
+// work), [4] waiting for the fence, [5] the completion work (surface sync, completed handlers). Boot 6 had two minutes of
+// 2.2 s command buffers and nothing to say which of these it was.
+#define BG_TIMING_PARTS 6
+__attribute__((weak)) void bgmtl_note_timing(const uint64_t parts[BG_TIMING_PARTS]) { (void)parts; }
 // A04s (Metal track M6b, a04s_bb.m in backboardd): the first refresh of each CPU-written texture, its rows as stored
 __attribute__((weak)) void bgmtl_note_cpu_rows(const char *what, unsigned w, unsigned h, unsigned fmt, const uint8_t *src, size_t bpr,
                                                int reversed)
@@ -1177,6 +1184,7 @@ static char bg_completion_key;
    _status = 2;   // Committed
    char why[512] = { 0 };
    bg_lock();
+   const uint64_t t_locked = clock_gettime_nsec_np(CLOCK_MONOTONIC);
    for (BGWork *w in _work) {
       if (w->kind == BG_WORK_DISPATCH) {
          struct rwa_buffer *bufs[BG_MAX_BINDINGS] = { NULL };
@@ -1324,11 +1332,13 @@ static char bg_completion_key;
       for (void (^h)(id) in _scheduled) h(self);
       [_scheduled removeAllObjects];
    }
+   const uint64_t t_sched = clock_gettime_nsec_np(CLOCK_MONOTONIC);
    if (bg_trace() || sync_commit || _status == 5) {
       if (_status != 5 && bg_fence_wait(dev, fence, why, sizeof(why)) != 0)
          [self bgFailWith:[NSString stringWithUTF8String:why] code:3];
       else if (_status != 5)
          _status = 4;
+      const uint64_t t_gpu = clock_gettime_nsec_np(CLOCK_MONOTONIC);
       if (_status == 4 && getenv("A04S_PASS_STATS"))
          [self a04sPassStats];
       {
@@ -1339,6 +1349,9 @@ static char bg_completion_key;
       }
       rwa_fence_release([dev rwa], fence);
       [self bgCompleteFrom:t_begin];
+      const uint64_t parts[BG_TIMING_PARTS] = { t_locked - t_begin, t_flushed - t_locked, t_sched - t_flushed, 0,
+                                                t_gpu - t_sched, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t_gpu };
+      bgmtl_note_timing(parts);
       [self bgReleaseInflight];
       dispatch_group_leave(_done);
       return;
@@ -1352,12 +1365,18 @@ static char bg_completion_key;
    [self retain];
    dispatch_async(completion, ^{
       char w2[512] = { 0 };
+      const uint64_t t_queued = clock_gettime_nsec_np(CLOCK_MONOTONIC);
       if (bg_fence_wait(dev, fence, w2, sizeof(w2)) != 0)
          [self bgFailWith:[NSString stringWithUTF8String:w2] code:3];
       else
          _status = 4;   // Completed: the fence has been paid
+      const uint64_t t_gpu = clock_gettime_nsec_np(CLOCK_MONOTONIC);
       rwa_fence_release([dev rwa], fence);
       [self bgCompleteFrom:t_begin];
+      const uint64_t parts[BG_TIMING_PARTS] = { t_locked - t_begin, t_flushed - t_locked, t_sched - t_flushed,
+                                                t_queued > t_sched ? t_queued - t_sched : 0, t_gpu - t_queued,
+                                                clock_gettime_nsec_np(CLOCK_MONOTONIC) - t_gpu };
+      bgmtl_note_timing(parts);
       [self bgReleaseInflight];
       dispatch_group_leave(_done);
       [self release];
@@ -1417,8 +1436,15 @@ static char bg_completion_key;
    // In the compositor (backboardd, BGMTL_BB) the IOSurfaces drawn into are its own framebuffers: the GPU writes DRAM, the display
    // reads DRAM, the CPU never touches them, so neither the cache clean nor the seed bump below is needed -- and each was a kernel
    // round trip per attachment per commit over 10 MB surfaces (the largest cost in the first Metal-compositor profiles).
+   // A04s (M6b boot 7): BGMTL_BB is never set on the A04s, so its backboardd has always done both, for every attachment of
+   // every command buffer (a cache sync of each 6 MB framebuffer, then a write lock and unlock of it). A04S_BB_SURFACE_SYNC=0
+   // in bb-metal.env skips them in backboardd as the compositor path intends; the default keeps what boots 1-6 ran, until a
+   // boot shows what they cost (the completion work in bb stats) and that the picture is the same without them.
    static int in_compositor = -1;
-   if (in_compositor < 0) in_compositor = getenv("BGMTL_BB") != NULL;
+   if (in_compositor < 0) {
+      const char *ss = getenv("A04S_BB_SURFACE_SYNC");
+      in_compositor = getenv("BGMTL_BB") != NULL || (ss && ss[0] == '0' && !strcmp(getprogname(), "backboardd"));
+   }
    if (_status == 4 && !in_compositor) {
       NSMutableSet *written = nil;
       for (BGWork *w in _work)

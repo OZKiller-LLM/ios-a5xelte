@@ -39,6 +39,7 @@
 #include <mach-o/dyld.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <malloc/malloc.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
@@ -482,6 +483,29 @@ bgmtl_note_inflight_wait(uint64_t ns, int gave_up)
       bb_log("bb: a commit waited %.1f s for one of the A04S_MAX_INFLIGHT slots and went ahead without one", ns / 1e9);
 }
 
+/* ---- boot 7: where a command buffer's time goes ------------------------------------------------------- */
+
+/* bgmtl.m's six parts of each command buffer (its bgmtl_note_timing comment), summed and maxed per stats window and
+ * logged as a "bb time" line after "bb stats". Boot 6 ran two minutes at 2.2 s per command buffer with no pipeline
+ * being built, and its stats could not say whether that was the CPU, the GPU or the completion queue. */
+#define BB_TIMING_PARTS 6
+static uint64_t bb_time_n, bb_time_sum[BB_TIMING_PARTS], bb_time_max[BB_TIMING_PARTS];
+
+void
+bgmtl_note_timing(const uint64_t parts[BB_TIMING_PARTS])
+{
+   if (!atomic_load(&bb_on))
+      return;
+   pthread_mutex_lock(&bb_c_lock);
+   bb_time_n++;
+   for (unsigned i = 0; i < BB_TIMING_PARTS; i++) {
+      bb_time_sum[i] += parts[i];
+      if (parts[i] > bb_time_max[i])
+         bb_time_max[i] = parts[i];
+   }
+   pthread_mutex_unlock(&bb_c_lock);
+}
+
 /* phys_footprint (what jetsam weighs; it counts IOKit memory mapped into the process, so HeroGPU's buffers too) and its peak */
 static void
 bb_footprint(double *mb, double *peak_mb)
@@ -493,6 +517,33 @@ bb_footprint(double *mb, double *peak_mb)
       return;
    *mb = vm.phys_footprint / 1048576.0;
    *peak_mb = n >= TASK_VM_INFO_REV1_COUNT ? vm.ledger_phys_footprint_peak / 1048576.0 : *mb;
+}
+
+/* A04sMTLDevice (M6b boot 7): what one pipeline did to memory. a04s_bb_footprint_mb before it; after it, the footprint,
+ * malloc's bytes in use and the bytes its zones hold (in use plus freed but still resident: the difference is
+ * fragmentation), and, unless A04S_PIPE_RELIEF=0, what malloc_zone_pressure_relief gave back first (-1 when off).
+ * Boot 6's footprint grew by 2-3 MB with each pipeline and never came down; these say whether that was live memory or
+ * freed memory malloc still held. */
+double
+a04s_bb_footprint_mb(void)
+{
+   double mb, peak;
+   bb_footprint(&mb, &peak);
+   return mb;
+}
+
+void
+a04s_bb_memory(double *footprint_mb, double *in_use_mb, double *held_mb, double *relieved_mb)
+{
+   static int relief = -1;
+   if (relief < 0)
+      relief = !(getenv("A04S_PIPE_RELIEF") && getenv("A04S_PIPE_RELIEF")[0] == '0');
+   *relieved_mb = relief ? malloc_zone_pressure_relief(NULL, 0) / 1048576.0 : -1;
+   malloc_statistics_t ms = { 0 };
+   malloc_zone_statistics(NULL, &ms);
+   *in_use_mb = ms.size_in_use / 1048576.0;
+   *held_mb = ms.size_allocated / 1048576.0;
+   *footprint_mb = a04s_bb_footprint_mb();
 }
 
 /* backboardd's jetsam limit, if the kernel tells a process its own (memorystatus_control, GET_MEMLIMIT_PROPERTIES) */
@@ -751,6 +802,13 @@ bb_main(void *arg)
          bb_pipe_secs = 0;
          bb_tex_refused = bb_draw_skipped = bb_clear_skipped = bb_other_refused = 0;
          bb_presents = 0;
+         const uint64_t tn = bb_time_n;
+         uint64_t tsum[BB_TIMING_PARTS], tmax[BB_TIMING_PARTS];
+         memcpy(tsum, bb_time_sum, sizeof(tsum));
+         memcpy(tmax, bb_time_max, sizeof(tmax));
+         bb_time_n = 0;
+         memset(bb_time_sum, 0, sizeof(bb_time_sum));
+         memset(bb_time_max, 0, sizeof(bb_time_max));
          pthread_mutex_unlock(&bb_c_lock);
          uint64_t dc = committed - w_committed, dd = completed - w_completed, df = failed - w_failed;
          if (dc || dd || df || pm || pr || outstanding || si || sc || sr)
@@ -763,6 +821,13 @@ bb_main(void *arg)
                    (unsigned long long)df, outstanding, oldest, lat_n ? lat_sum / 1e6 / lat_n : 0, lat_max / 1e6,
                    (unsigned long long)presents, pm, pr, ps, tr, ds, cs, orf, si, si ? ss : 0, sc, sr,
                    threads[0] ? threads : "-", (unsigned long long)cw, cns / 1e6, (unsigned long long)cg, fp_mb, fp_peak);
+         if (tn) {
+#define BB_T(i) tsum[i] / 1e6 / tn, tmax[i] / 1e6
+            bb_log("bb time %llu command buffers, avg/max ms: lock %.1f/%.1f, encode %.1f/%.1f, scheduled handlers %.1f/%.1f, "
+                   "completion queue %.1f/%.1f, fence %.1f/%.1f, completion work %.1f/%.1f",
+                   (unsigned long long)tn, BB_T(0), BB_T(1), BB_T(2), BB_T(3), BB_T(4), BB_T(5));
+#undef BB_T
+         }
          w_committed = committed;
          w_completed = completed;
          w_failed = failed;

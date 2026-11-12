@@ -638,28 +638,99 @@ run_child(const char *self, const char *mode)
 /* ---- M6b boot 5: the kernel's log for the whole boot ------------------------------------------------- */
 
 /* The drop agent saves the kernel's message buffer at about 1, 2, 4, 8 and 15 minutes, then never again; M6b boot 4's
- * backboardd died at about 20 minutes. A child of its own session (so it outlives this autorun and the agent) saves it
- * every A04S_DMESG_ROLL_S seconds (default 120; 0: off) into /private/var/a04s/dmesg-roll-0.log and -1.log in turn,
- * each through a .part file and a rename, so one complete file always survives a reboot mid-write. */
+ * backboardd died at about 20 minutes. A child of its own session (so it outlives this autorun and the agent) reads it
+ * every A04S_DMESG_ROLL_S seconds (default 120; 0: off).
+ *
+ * M6b boot 7: boot 5 and 6's roller kept two whole snapshots in turn, and the kernel's buffer is 1 MB, about ten
+ * minutes of this kernel's periodic lines -- so "the whole boot" was the last twelve minutes of it, and boot 6's
+ * 25-minute stall had no kernel log. Now each read APPENDS only what is new since the last one to
+ * /private/var/a04s/dmesg-boot.log (found by the last line saved; when the buffer no longer holds it, a marker line says
+ * lines may be missing, and the whole buffer follows). The previous boot's file becomes dmesg-boot.prev.log when the
+ * roller starts, and the file stops growing at 64 MB (about ten hours). */
 #define DMESG_ROLL_PID "/private/var/a04s/dmesg-roll.pid"
+#define DMESG_BOOT "/private/var/a04s/dmesg-boot.log"
+#define DMESG_BOOT_PREV "/private/var/a04s/dmesg-boot.prev.log"
 #define DMESG_MAX (1u << 20)
+#define DMESG_BOOT_CAP (64u << 20)
 
 static void
-dmesg_save(const char *path, char *buf)
+dmesg_write_all(int fd, const char *p, size_t n)
+{
+	while (n) {
+		ssize_t w = write(fd, p, n);
+		if (w < 0 && errno == EINTR)
+			continue;
+		if (w <= 0)
+			return;
+		p += w;
+		n -= (size_t)w;
+	}
+}
+
+/* One read of the kernel's buffer, appended from after `last` (a line saved last time, with the newline before and
+ * after it, so that it matches whole lines only); `last` becomes the last whole line appended. */
+static void
+dmesg_append(char *buf, char *last, size_t last_size, bool *capped)
 {
 	int (*kmsgbuf)(void *, uint32_t) = (int (*)(void *, uint32_t))dlsym(RTLD_DEFAULT, "proc_kmsgbuf");
 	int got = kmsgbuf ? kmsgbuf(buf, DMESG_MAX) : -1;
 	if (got <= 0)
 		return;
-	char part[96];
-	snprintf(part, sizeof(part), "%s.part", path);
-	int fd = open(part, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	size_t n = (size_t)got, end = n;
+	while (end && buf[end - 1] != '\n')
+		end--;                       /* a line still being written waits for the next read */
+	if (!end)
+		return;
+	size_t from = 0;
+	bool gap = false;
+	size_t ll = strlen(last);
+	if (ll) {
+		const char *hit = NULL;
+		for (const char *p = buf; p < buf + end;) {
+			const char *q = memmem(p, (size_t)(buf + end - p), last, ll);
+			if (!q)
+				break;
+			hit = q;
+			p = q + 1;
+		}
+		if (hit)
+			from = (size_t)(hit - buf) + ll;
+		else
+			gap = true;
+	}
+	if (from >= end)
+		return;
+	struct stat st;
+	if (stat(DMESG_BOOT, &st) == 0 && st.st_size >= (off_t)DMESG_BOOT_CAP) {
+		*capped = true;
+		return;
+	}
+	int fd = open(DMESG_BOOT, O_WRONLY | O_CREAT | O_APPEND, 0644);
 	if (fd < 0)
 		return;
-	bool ok = write(fd, buf, (size_t)got) == got && fsync(fd) == 0;
+	if (gap) {
+		static const char gap_line[] = "[a04s dmesg roll: the kernel's buffer no longer holds the last line saved; lines may be "
+					       "missing before this one]\n";
+		dmesg_write_all(fd, gap_line, sizeof(gap_line) - 1);
+	}
+	dmesg_write_all(fd, buf + from, end - from);
+	fsync(fd);
 	close(fd);
-	if (!ok || rename(part, path) != 0)
-		unlink(part);
+	/* the new `last`: the last whole line that starts with a timestamp, with its newlines */
+	size_t e = end - 1;              /* buf[e] is its newline */
+	for (;;) {
+		size_t s = e;
+		while (s > from && buf[s - 1] != '\n')
+			s--;
+		if (s > 0 && buf[s] == '[' && e - s + 2 < last_size) {
+			memcpy(last, buf + s - 1, e - s + 2);
+			last[e - s + 2] = 0;
+			return;
+		}
+		if (s <= from)
+			break;
+		e = s - 1;
+	}
 }
 
 static int
@@ -668,9 +739,27 @@ dmesg_roller(unsigned period)
 	char *buf = malloc(DMESG_MAX);
 	if (!buf)
 		return 1;
-	for (unsigned i = 0;; i ^= 1) {
+	if (access(DMESG_BOOT, F_OK) == 0)
+		rename(DMESG_BOOT, DMESG_BOOT_PREV);
+	char uuid[64] = "?";
+	size_t ul = sizeof(uuid);
+	if (sysctlbyname("kern.bootsessionuuid", uuid, &ul, NULL, 0) != 0)
+		strlcpy(uuid, "?", sizeof(uuid));
+	int fd = open(DMESG_BOOT, O_WRONLY | O_CREAT | O_APPEND, 0644);
+	if (fd >= 0) {
+		char head[192];
+		int hl = snprintf(head, sizeof(head), "[a04s dmesg roll: boot %s, pid %d, a read every %u s]\n", uuid, getpid(),
+				  period);
+		dmesg_write_all(fd, head, (size_t)hl);
+		close(fd);
+	}
+	char last[512] = "";
+	bool capped = false;
+	for (;;) {
+		dmesg_append(buf, last, sizeof(last), &capped);
+		if (capped)
+			break;
 		sleep(period);
-		dmesg_save(i ? "/private/var/a04s/dmesg-roll-1.log" : "/private/var/a04s/dmesg-roll-0.log", buf);
 	}
 	return 0;
 }
@@ -726,7 +815,8 @@ start_dmesg_roller(const char *self)
 		fprintf(f, "%d\n", pid);
 		fclose(f);
 	}
-	a04s_log("dmesg roll: pid %d saves the kernel's log every %u s into /private/var/a04s/dmesg-roll-{0,1}.log", pid, period);
+	a04s_log("dmesg roll: pid %d appends what is new in the kernel's log every %u s to %s (the previous boot's: %s)", pid,
+		 period, DMESG_BOOT, DMESG_BOOT_PREV);
 }
 
 int
