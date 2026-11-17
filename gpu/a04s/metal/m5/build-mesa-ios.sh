@@ -57,8 +57,12 @@ if [ "$(cat mesa/.a04s-m5 2>/dev/null)" != "$STAMP" ]; then
 	done
 	# 4. M6: Panfrost's shader cache without an ELF build-id. M6b: its identity is a hash of what decides Panfrost's
 	#    output (the release, the patches below and above, the cache patch), not the library file, so rebuilding
-	#    libhakiosair for its front end or runtime keeps the phone's cache
-	PAN_ID=$(cat "$GPU_MESA/patch-mesa.py" "$HK"/mesa/patches/*.patch "$METAL"/mesa-patches/*.patch \
+	#    libhakiosair for its front end or runtime keeps the phone's cache.
+	#    M6b boot 8: a04s-panfrost-pre-cache.patch is left out. It changes where the preprocessed NIR is kept, not
+	#    what is compiled from it (check.sh compares the chains with and without it), and its own cache entries
+	#    carry their own tag; hashing it would empty the phone's cache of binaries that are still right.
+	PAN_ID=$(cat "$GPU_MESA/patch-mesa.py" "$HK"/mesa/patches/*.patch \
+		$(ls "$METAL"/mesa-patches/*.patch | grep -v /a04s-panfrost-pre-cache.patch) \
 		"$HERE/patch-pan-disk-cache.py" | { cat; echo "$SHA256"; } | shasum -a 256 | cut -c1-32)
 	python3 "$HERE/patch-pan-disk-cache.py" mesa "a04s-pan-$PAN_ID"
 	rm -rf mesa/src/compiler/air

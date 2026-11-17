@@ -247,11 +247,17 @@ a04s_cpu_now(void)
    a04s_apply_constants([self rwa], RWA_STAGE_FRAGMENT, d.fragmentFunction);
    const double fp0 = a04s_bb_footprint_mb();
    double t = a04s_now(), c = a04s_cpu_now();
-   unsigned h0, m0, h1, m1;
+   unsigned h0, m0, h1, m1, ph0, ps0, pu0, ph1, ps1, pu1;
+   double f0, r0, v0, f1, r1, v1;
+   uint64_t kept;
    rwa_front_cache_counts(&h0, &m0, NULL, NULL);
+   rwa_build_cpu(&f0, &r0, &v0);
+   rwa_pan_pre_counts(&ph0, &ps0, &pu0, NULL);
    NSError *e = nil;
    id p = [super newRenderPipelineStateWithDescriptor:d error:&e];
    rwa_front_cache_counts(&h1, &m1, NULL, NULL);
+   rwa_build_cpu(&f1, &r1, &v1);
+   rwa_pan_pre_counts(&ph1, &ps1, &pu1, &kept);
    const double secs = a04s_now() - t, cpu = a04s_cpu_now() - c;
    uint64_t tid = 0;
    pthread_threadid_np(NULL, &tid);
@@ -260,10 +266,14 @@ a04s_cpu_now(void)
    a04s_bb_memory(&fp1, &in_use, &held, &relieved);
    /* M6b: which thread builds (against the threads that commit, in a04s_bb.m's stats), and whether the front end's
     * cache had the stages */
-   a04s_log("render pipeline %s + %s: %s in %.2f s (CPU %.2f s), thread %llu%s, front cache %u hit %u miss; footprint "
+   /* M6b boot 8: the CPU split (front end, this library's stage preparation, the driver) and Panfrost's pre-cache
+    * (stages found, preprocessed and stored, read back for a variant; serialized NIR live stages hold) */
+   a04s_log("render pipeline %s + %s: %s in %.2f s (CPU %.2f s: front %.2f, prepare %.2f, driver %.2f), thread %llu%s, "
+            "front cache %u hit %u miss, Panfrost NIR %u hit %u stored %u read back (%.1f MB kept); footprint "
             "%+.1f MB to %.1f MB, malloc %.1f MB in use of %.1f MB held, %.1f MB given back%s%s",
             d.vertexFunction.name.UTF8String ?: "-", d.fragmentFunction.name.UTF8String ?: "-", p ? "made" : "REFUSED",
-            secs, cpu, (unsigned long long)tid, pthread_main_np() ? " (main)" : "", h1 - h0, m1 - m0, fp1 - fp0, fp1,
+            secs, cpu, f1 - f0, r1 - r0, v1 - v0, (unsigned long long)tid, pthread_main_np() ? " (main)" : "",
+            h1 - h0, m1 - m0, ph1 - ph0, ps1 - ps0, pu1 - pu0, kept / 1048576.0, fp1 - fp0, fp1,
             in_use, held, relieved, !p && e ? ": " : "", !p && e ? e.localizedDescription.UTF8String : "");
    a04s_bb_note_pipeline(secs, p != nil);
    a04s_apply_constants([self rwa], RWA_STAGE_VERTEX, nil);

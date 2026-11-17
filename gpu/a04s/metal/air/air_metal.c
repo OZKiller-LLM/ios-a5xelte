@@ -870,6 +870,49 @@ rwa_front_cache_counts(unsigned *hits, unsigned *misses, unsigned *stores, unsig
    if (bad) *bad = front_bad;
 }
 
+/* A04s (M6b boot 8): where a pipeline's CPU goes. Boot 7's warm fixed_frag_lph_cph pipelines each spent about
+ * 0.4 s of CPU with both caches hitting; these split it into the front end (front_to_nir, cache read included),
+ * this library's own preparation of each stage (the clone and finalize_for_gallium) and the driver's
+ * create_vs_state/create_fs_state (Panfrost's preprocessing and its disk cache). Thread CPU time, summed since the
+ * library loaded; a caller takes differences. */
+#include <time.h>
+static double build_front_cpu, build_prepare_cpu, build_driver_cpu;
+
+static double
+thread_cpu_s(void)
+{
+   struct timespec ts;
+   if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0)
+      return 0;
+   return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+void
+rwa_build_cpu(double *front, double *prepare, double *driver)
+{
+   if (front) *front = build_front_cpu;
+   if (prepare) *prepare = build_prepare_cpu;
+   if (driver) *driver = build_driver_cpu;
+}
+
+/* Panfrost's pre-cache (mesa-patches/a04s-panfrost-pre-cache.patch, pan_shader.c) defines this; a library built
+ * without Panfrost, or with a Panfrost that lacks the patch, gets these zeros. */
+void a04s_panfrost_pre_counts(unsigned *hits, unsigned *stores, unsigned *unpacks, uint64_t *kept_bytes);
+__attribute__((weak)) void
+a04s_panfrost_pre_counts(unsigned *hits, unsigned *stores, unsigned *unpacks, uint64_t *kept_bytes)
+{
+   if (hits) *hits = 0;
+   if (stores) *stores = 0;
+   if (unpacks) *unpacks = 0;
+   if (kept_bytes) *kept_bytes = 0;
+}
+
+void
+rwa_pan_pre_counts(unsigned *hits, unsigned *stores, unsigned *unpacks, uint64_t *kept_bytes)
+{
+   a04s_panfrost_pre_counts(hits, stores, unpacks, kept_bytes);
+}
+
 /* the cache's folder, made if needed; false: no cache */
 static bool
 front_dir(char *out, size_t len)
@@ -1079,8 +1122,8 @@ front_say(const char *what, const char *hex, const char *entry)
 }
 
 static nir_shader *
-front_to_nir(struct rwa_device *device, void *mem_ctx, unsigned stage, const void *bitcode, size_t size,
-             const char *entry, struct air_shader_info *info, const char **error)
+front_to_nir_untimed(struct rwa_device *device, void *mem_ctx, unsigned stage, const void *bitcode, size_t size,
+                     const char *entry, struct air_shader_info *info, const char **error)
 {
    char dir[PATH_MAX], hex[41] = "-";
    const bool cached = front_dir(dir, sizeof(dir));
@@ -1117,6 +1160,17 @@ front_to_nir(struct rwa_device *device, void *mem_ctx, unsigned stage, const voi
    nir_shader *nir = air_to_nir(mem_ctx, bitcode, size, entry, &opts, device->nir_options, info, error);
    if (nir && cached)
       front_store(dir, hex, info, nir);
+   return nir;
+}
+
+/* front_to_nir_untimed, its thread CPU time counted (rwa_build_cpu) */
+static nir_shader *
+front_to_nir(struct rwa_device *device, void *mem_ctx, unsigned stage, const void *bitcode, size_t size,
+             const char *entry, struct air_shader_info *info, const char **error)
+{
+   const double t0 = thread_cpu_s();
+   nir_shader *nir = front_to_nir_untimed(device, mem_ctx, stage, bitcode, size, entry, info, error);
+   build_front_cpu += thread_cpu_s() - t0;
    return nir;
 }
 
@@ -6274,6 +6328,7 @@ struct rwa_render {
 static void *
 make_stage_cso(struct rwa_device *device, nir_shader *nir, char *why, size_t why_size)
 {
+   const double t0 = thread_cpu_s();   /* A04s (M6b boot 8): rwa_build_cpu */
    nir_shader *clone = nir_shader_clone(NULL, nir);
    if (!clone) {
       say(why, why_size, "out of memory compiling a shader stage");
@@ -6283,9 +6338,13 @@ make_stage_cso(struct rwa_device *device, nir_shader *nir, char *why, size_t why
 
    struct pipe_shader_state templ = { .type = PIPE_SHADER_IR_NIR, .ir.nir = clone };
    struct pipe_context *pipe = device->pipe;
+   const double t1 = thread_cpu_s();
    void *cso = nir->info.stage == MESA_SHADER_VERTEX
                   ? pipe->create_vs_state(pipe, &templ)
                   : pipe->create_fs_state(pipe, &templ);
+   const double t2 = thread_cpu_s();
+   build_prepare_cpu += t1 - t0;
+   build_driver_cpu += t2 - t1;
    if (!cso)
       say(why, why_size, "%s would not compile the %s stage",
           device->screen->get_name(device->screen),

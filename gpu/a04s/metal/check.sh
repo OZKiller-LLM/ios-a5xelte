@@ -112,7 +112,7 @@ export PATH=$B/venv/bin:$PATH
 	-Dplatforms= -Dgallium-drivers=softpipe,panfrost -Dvulkan-drivers= \
 	-Dglx=disabled -Degl=disabled -Dgbm=disabled -Dosmesa=true -Dllvm=disabled -Dshared-glapi=enabled \
 	-Dgles1=disabled -Dgles2=enabled -Dopengl=true -Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled \
-	-Dshader-cache=disabled -Dvalgrind=disabled -Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= \
+	-Dshader-cache=enabled -Dvalgrind=disabled -Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= \
 	-Dtools=drm-shim,panfrost -Dgallium-vdpau=disabled -Dgallium-va=disabled -Dgallium-xa=disabled \
 	-Dlmsensors=disabled -Dbuild-tests=false > "$OUT/meson-setup.log"
 ninja -C build src/gallium/targets/osmesa/libOSMesa.so.8.0.0 src/panfrost/drm-shim/libhakios_mali_drm_shim.so \
@@ -123,6 +123,9 @@ mkdir -p "$OUT/gl" "$OUT/air"
 cc -O1 -Wall -o "$OUT/gl_drmshim" "$HK/mali-drmshim/gl_drmshim.c" -I"$SRC/include" \
 	-L"$B/build/src/gallium/targets/osmesa" -lOSMesa
 export LD_LIBRARY_PATH=$B/build/src/gallium/targets/osmesa:$B/build/src/mapi/shared-glapi
+# M6b boot 8: Mesa's shader cache is built in (the phone's build has it) for the Panfrost pre-cache test below, and
+# off for everything else, which then runs as it did when it was not built at all.
+export MESA_SHADER_CACHE_DISABLE=true
 SHIM=$B/build/src/panfrost/drm-shim/libhakios_mali_drm_shim.so
 AMT=$B/build/src/gallium/targets/hakiosair/air_metal_test
 A2N=$B/build/src/compiler/air/air2nir
@@ -204,6 +207,41 @@ else
 	fail "Metal front-end cache: the chains differ between the translated and the cached stage, or none were dumped ($(diff fc-miss.dump fc-hit.dump | head -3 | tr '\n' ' '))"
 fi
 judge fc-hit "Metal front-end cache (cached run)"
+
+# M6b boot 8: Panfrost's pre-cache (mesa-patches/a04s-panfrost-pre-cache.patch). The same draw three times: twice with
+# Panfrost's disk cache on, in a fresh folder, and once with A04S_PAN_PRE=0 and no disk cache, which is Panfrost as
+# released. The first run must preprocess each stage, store it and compile from its serialization; the second must
+# find every stage it stored and compile nothing; the third must say nothing. All three must build the same chains,
+# shaders included (pandecode disassembles them).
+PC=$OUT/air/pan-cache
+rm -rf "$PC" pc-cold pc-warm pc-off
+mkdir -p "$PC"
+set +e
+(export MESA_SHADER_CACHE_DISABLE=false MESA_SHADER_CACHE_DIR=$PC A04S_PAN_PRE_LOG=1
+ on_mali pc-cold "$AMT" --draw fragpos.bc fragPos 125
+ on_mali pc-warm "$AMT" --draw fragpos.bc fragPos 125)
+(export A04S_PAN_PRE=0 A04S_PAN_PRE_LOG=1
+ on_mali pc-off "$AMT" --draw fragpos.bc fragPos 125)
+set -e
+count() { local n; n=$(grep -c "^panfrost: pre cache $1 " "$2/stderr.log" 2>/dev/null) || true; echo "${n:-0}"; }
+cold_stored=$(count stored pc-cold)
+cold_back=$(count unpacked pc-cold)
+warm_hits=$(count hit pc-warm)
+warm_other=$(($(count stored pc-warm) + $(count unpacked pc-warm)))
+off_lines=$(count '[a-z]*' pc-off)
+echo "Metal Panfrost pre-cache: first run $cold_stored stage(s) stored, $cold_back compiled from the serialization;" \
+	"second run $warm_hits found, $warm_other stored or compiled; A04S_PAN_PRE=0 $off_lines line(s)"
+[ "$cold_stored" -ge 2 ] && [ "$cold_back" -ge 2 ] && [ "$warm_hits" = "$cold_stored" ] && [ "$warm_other" = 0 ] &&
+	[ "$off_lines" = 0 ] || fail "Metal Panfrost pre-cache: expected stores and read-backs, then only hits, then nothing"
+for r in pc-cold pc-warm pc-off; do
+	cat $r/pandecode.dump* 2>/dev/null | sed -E 's/^Shader 0x[0-9a-f]+ \(/Shader <cpu> (/' > $r.dump || true
+done
+if [ -s pc-off.dump ] && cmp -s pc-off.dump pc-cold.dump && cmp -s pc-off.dump pc-warm.dump; then
+	echo "Metal Panfrost pre-cache: stored, found and released Panfrost built the same chains ($(wc -l < pc-off.dump) lines of pandecode, identical)"
+else
+	fail "Metal Panfrost pre-cache: the chains differ, or none were dumped ($(diff pc-off.dump pc-cold.dump | head -3 | tr '\n' ' ') / $(diff pc-off.dump pc-warm.dump | head -3 | tr '\n' ' '))"
+fi
+judge pc-warm "Metal Panfrost pre-cache (found run)"
 
 # M6b boot 6: a texture overwritten whole again and again (backboardd's linear textures over buffers, at every commit).
 # Panfrost turns such a texture linear in place after eight writes; a 416x258 A8 texture's linear layout does not fit

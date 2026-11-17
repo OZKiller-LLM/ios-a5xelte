@@ -1,0 +1,357 @@
+A04s (Metal track M6b boot 8): Panfrost's preprocessing, cached, and the preprocessed NIR kept only serialized.
+
+panfrost_create_shader_state runs pan_shader_preprocess (the optimisation loop and the I/O lowering) on every
+shader, and only then asks the disk cache for the compiled default variant, so a hit skips the backend but not
+the preprocessing. backboardd on the A04s makes a pipeline for each of CoreAnimation's fixed_frag_lph_cph
+specialisations (about forty in its first minutes of use); with every cache warm each still spent about 0.4 s of
+CPU, on the thread that commits CoreAnimation's frames, against 0.02 s for its small shaders (M6b boot 7). Each
+also kept the preprocessed NIR of both stages for the pipeline's life: about 2 MB of malloc per pipeline, for
+variants the disk cache almost always has.
+
+Keyed on so->nir_sha1 (the hash of the NIR as given, which the disk cache's binary keys already use) and the GPU,
+the disk cache now also keeps the preprocessed NIR, serialized, with its shader_info, noperspective_varyings and
+fragcolor_lowered. A shader found there is not preprocessed: so->nir becomes an empty shell with that
+shader_info (all this driver reads of it after creation) and the serialization is kept as bytes. A shader not
+found is preprocessed as before and then stored and kept the same way. panfrost_shader_get reads the bytes back
+into NIR only to compile a variant the disk cache does not have.
+
+Compiled binaries do not change: they come from the same preprocessed NIR, read back from its serialization, and
+are stored under the same keys (check.sh compares the job chains, shaders included, with and without the
+patch). That is why build-mesa-ios.sh leaves this file out of Panfrost's cache identity: the phone's cache stays
+warm. Its entries carry their own tag (A04S_PRE_TAG), raised when their layout changes. Transform feedback keeps
+the old path. A04S_PAN_PRE=0 turns it off; A04S_PAN_PRE_LOG=1 writes a line per shader to stderr;
+a04s_panfrost_pre_counts() reports hits, stores, read-backs and the bytes kept. Mesa 25.0.7. Ours, under Mesa's
+licence for the files it changes (MIT).
+
+--- a/src/gallium/drivers/panfrost/pan_context.h
++++ b/src/gallium/drivers/panfrost/pan_context.h
+@@ -432,6 +432,13 @@
+ 
+    /* If gl_FragColor was lowered, we need to optimize the stores later */
+    bool fragcolor_lowered;
++
++   /* A04s: the preprocessed NIR, serialized (pan_shader.c, a04s_pre_*). When
++    * set, `nir` is a shell that holds only the preprocessed shader's
++    * shader_info, and a variant the disk cache does not have is compiled
++    * from this. Owned by this shader (ralloc). */
++   void *a04s_nir_blob;
++   size_t a04s_nir_blob_size;
+ };
+ 
+ /* The binary artefacts of compiling a shader. This differs from
+--- a/src/gallium/drivers/panfrost/pan_shader.c
++++ b/src/gallium/drivers/panfrost/pan_shader.c
+@@ -36,6 +36,237 @@
+ #include "nir_serialize.h"
+ #include "pan_bo.h"
+ #include "pan_context.h"
++#include "util/disk_cache.h"
++#include "util/u_atomic.h"
++#include <stdio.h>
++#include <stdlib.h>
++
++/*
++ * A04s (Metal track M6b boot 8): Panfrost's preprocessing, cached, and the
++ * preprocessed NIR let go once it is serialized.
++ *
++ * panfrost_create_shader_state runs pan_shader_preprocess -- the optimisation
++ * loop and the I/O lowering -- on every shader it is given, and only then asks
++ * the disk cache for the compiled default variant. A hit there skips the
++ * backend, not the preprocessing. backboardd on the Galaxy A04s (Mali-G52)
++ * makes one pipeline for each of CoreAnimation's fixed_frag_lph_cph
++ * specialisations, about forty in its first minutes of use, and each one
++ * spent about 0.4 s of CPU here with every cache warm (M6b boot 7, on the
++ * thread that commits CoreAnimation's frames). It then kept the preprocessed
++ * NIR of both stages for as long as the pipeline lived, for variants that
++ * the disk cache almost always has: about 2 MB of malloc per pipeline.
++ *
++ * So, keyed on the hash of the NIR as given (so->nir_sha1, which the disk
++ * cache's own key already uses) and the GPU:
++ *  - the disk cache keeps the preprocessed NIR, serialized, with the
++ *    preprocessed shader_info and the two values derived from it
++ *    (noperspective_varyings, fragcolor_lowered);
++ *  - a shader found there is not preprocessed again: its shader_info goes into
++ *    an empty shell (all that is read of so->nir after creation in this
++ *    driver), and the serialized NIR is kept as bytes;
++ *  - a shader not found is preprocessed as before, then stored the same way;
++ *  - panfrost_shader_get reads the bytes back into a NIR only to compile a
++ *    variant the disk cache does not have.
++ *
++ * The compiled binaries do not change: they are compiled from the same
++ * preprocessed NIR, read back from its serialization, and stored under the
++ * same keys as before. Transform feedback (none on the A04s) keeps the old
++ * path, since its program is compiled at creation from so->nir. Entries carry
++ * A04S_PRE_TAG, raised when their layout changes. A04S_PAN_PRE=0 turns all of
++ * it off; A04S_PAN_PRE_LOG=1 writes a line for each shader to stderr.
++ */
++#define A04S_PRE_TAG   "a04s-pan-pre 1"
++#define A04S_PRE_MAGIC 0x41505231u /* "APR1" */
++
++static unsigned a04s_pre_hits, a04s_pre_stores, a04s_pre_unpacks;
++static uint64_t a04s_pre_kept;
++
++/* What the pre-cache did since the library loaded: shaders found, shaders
++ * preprocessed and kept serialized, serializations read back for a variant,
++ * and the bytes of serialized NIR held by live shaders. Any pointer may be
++ * NULL. Read by libhakiosair's front end (air_metal.c) for its pipeline log. */
++void a04s_panfrost_pre_counts(unsigned *hits, unsigned *stores,
++                              unsigned *unpacks, uint64_t *kept_bytes);
++void
++a04s_panfrost_pre_counts(unsigned *hits, unsigned *stores, unsigned *unpacks,
++                         uint64_t *kept_bytes)
++{
++   if (hits)
++      *hits = p_atomic_read(&a04s_pre_hits);
++   if (stores)
++      *stores = p_atomic_read(&a04s_pre_stores);
++   if (unpacks)
++      *unpacks = p_atomic_read(&a04s_pre_unpacks);
++   if (kept_bytes)
++      *kept_bytes = p_atomic_read(&a04s_pre_kept);
++}
++
++static bool
++a04s_pre_env(const char *name, bool otherwise)
++{
++   const char *v = getenv(name);
++   return v && *v ? v[0] != '0' : otherwise;
++}
++
++static bool
++a04s_pre_on(void)
++{
++   static int on = -1;
++   if (on < 0)
++      on = a04s_pre_env("A04S_PAN_PRE", true);
++   return on;
++}
++
++static void
++a04s_pre_say(const char *what, const struct panfrost_uncompiled_shader *so,
++             size_t bytes)
++{
++   static int on = -1;
++   if (on < 0)
++      on = a04s_pre_env("A04S_PAN_PRE_LOG", false);
++   if (on) {
++      char hex[41];
++      _mesa_sha1_format(hex, so->nir_sha1);
++      fprintf(stderr, "panfrost: pre cache %s %s %s, %zu bytes\n", what,
++              gl_shader_stage_name(so->nir->info.stage), hex, bytes);
++   }
++}
++
++static void
++a04s_pre_key(struct disk_cache *cache, const struct panfrost_uncompiled_shader *so,
++             unsigned gpu_id, cache_key key)
++{
++   uint8_t data[sizeof(A04S_PRE_TAG) + sizeof(so->nir_sha1) + sizeof(gpu_id)];
++   memcpy(data, A04S_PRE_TAG, sizeof(A04S_PRE_TAG));
++   memcpy(data + sizeof(A04S_PRE_TAG), so->nir_sha1, sizeof(so->nir_sha1));
++   memcpy(data + sizeof(A04S_PRE_TAG) + sizeof(so->nir_sha1), &gpu_id,
++          sizeof(gpu_id));
++   disk_cache_compute_key(cache, data, sizeof(data), key);
++}
++
++/* The shell that stands in for the preprocessed NIR: no variables, no code,
++ * the preprocessed shader's shader_info. */
++static nir_shader *
++a04s_pre_shell(struct panfrost_uncompiled_shader *so, shader_info *info,
++               const nir_shader_compiler_options *options)
++{
++   info->name = NULL;
++   info->label = NULL;
++   return nir_shader_create(so, info->stage, options, info);
++}
++
++/* A shader the pre-cache has: so->nir becomes the shell, the serialized NIR is
++ * kept, and the NIR as given is freed. False (nothing changed) otherwise. */
++static bool
++a04s_pre_load(struct disk_cache *cache, const cache_key key,
++              struct panfrost_uncompiled_shader *so)
++{
++   size_t size = 0;
++   void *buf = disk_cache_get(cache, key, &size);
++   if (!buf)
++      return false;
++
++   struct blob_reader r;
++   blob_reader_init(&r, buf, size);
++   const bool magic = blob_read_uint32(&r) == A04S_PRE_MAGIC;
++   const uint32_t noperspective = blob_read_uint32(&r);
++   const uint8_t fragcolor = blob_read_uint8(&r);
++   shader_info info;
++   blob_copy_bytes(&r, &info, sizeof(info));
++   const uint64_t nir_size = blob_read_uint64(&r);
++   const void *nir_bytes = NULL;
++   if (magic && !r.overrun && nir_size && nir_size <= (uint64_t)(r.end - r.current))
++      nir_bytes = blob_read_bytes(&r, nir_size);
++   if (!nir_bytes || r.overrun || r.current != r.end ||
++       info.stage != so->nir->info.stage) {
++      free(buf);
++      return false;
++   }
++
++   void *kept = ralloc_size(so, nir_size);
++   if (!kept) {
++      free(buf);
++      return false;
++   }
++   memcpy(kept, nir_bytes, nir_size);
++   free(buf);
++
++   nir_shader *shell = a04s_pre_shell(so, &info, so->nir->options);
++   ralloc_free((void *)so->nir);
++   so->nir = shell;
++   so->noperspective_varyings = noperspective;
++   so->fragcolor_lowered = fragcolor;
++   so->a04s_nir_blob = kept;
++   so->a04s_nir_blob_size = nir_size;
++   p_atomic_inc(&a04s_pre_hits);
++   p_atomic_add(&a04s_pre_kept, nir_size);
++   a04s_pre_say("hit", so, nir_size);
++   return true;
++}
++
++/* A shader just preprocessed: serialized, stored in the pre-cache (when there
++ * is a disk cache), kept as bytes, and so->nir becomes the shell. Out of
++ * memory, so->nir stays as it is. */
++static void
++a04s_pre_pack(struct disk_cache *cache, const cache_key key,
++              struct panfrost_uncompiled_shader *so)
++{
++   nir_shader *nir = (nir_shader *)so->nir;
++   struct blob full;
++   blob_init(&full);
++   nir_serialize(&full, nir, false);
++   void *kept = full.out_of_memory ? NULL : ralloc_size(so, full.size);
++   if (!kept) {
++      blob_finish(&full);
++      return;
++   }
++   memcpy(kept, full.data, full.size);
++
++   shader_info info = nir->info;
++   info.name = NULL;
++   info.label = NULL;
++   if (cache) {
++      struct blob e;
++      blob_init(&e);
++      blob_write_uint32(&e, A04S_PRE_MAGIC);
++      blob_write_uint32(&e, so->noperspective_varyings);
++      blob_write_uint8(&e, so->fragcolor_lowered);
++      blob_write_bytes(&e, &info, sizeof(info));
++      blob_write_uint64(&e, full.size);
++      blob_write_bytes(&e, full.data, full.size);
++      if (!e.out_of_memory)
++         disk_cache_put(cache, key, e.data, e.size, NULL);
++      blob_finish(&e);
++   }
++
++   so->nir = a04s_pre_shell(so, &info, nir->options);
++   so->a04s_nir_blob = kept;
++   so->a04s_nir_blob_size = full.size;
++   ralloc_free(nir);
++   p_atomic_inc(&a04s_pre_stores);
++   p_atomic_add(&a04s_pre_kept, full.size);
++   a04s_pre_say("stored", so, full.size);
++   blob_finish(&full);
++}
++
++/* The preprocessed NIR, read back to compile a variant; the caller frees it. */
++static nir_shader *
++a04s_pre_unpack(const struct panfrost_uncompiled_shader *so)
++{
++   struct blob_reader r;
++   blob_reader_init(&r, so->a04s_nir_blob, so->a04s_nir_blob_size);
++   nir_shader *nir = nir_deserialize(NULL, so->nir->options, &r);
++   if (!nir || r.overrun) {
++      /* bytes this process wrote; only an allocation can fail here */
++      fprintf(stderr, "panfrost: a04s: the preprocessed NIR (%zu bytes) could "
++                      "not be read back to compile a variant\n",
++              so->a04s_nir_blob_size);
++      abort();
++   }
++   p_atomic_inc(&a04s_pre_unpacks);
++   a04s_pre_say("unpacked", so, so->a04s_nir_blob_size);
++   return nir;
++}
+ 
+ static struct panfrost_uncompiled_shader *
+ panfrost_alloc_shader(const nir_shader *nir)
+@@ -241,9 +472,13 @@
+     */
+    if (!panfrost_disk_cache_retrieve(screen->disk_cache, uncompiled,
+                                      &state->key, &res)) {
+-      panfrost_shader_compile(screen, uncompiled->nir, dbg, &state->key,
+-                              req_local_mem, uncompiled->fixed_varying_mask,
+-                              &res);
++      /* A04s: so->nir may be a shell; the serialized NIR is what compiles */
++      nir_shader *unpacked =
++         uncompiled->a04s_nir_blob ? a04s_pre_unpack(uncompiled) : NULL;
++      panfrost_shader_compile(screen, unpacked ? unpacked : uncompiled->nir,
++                              dbg, &state->key, req_local_mem,
++                              uncompiled->fixed_varying_mask, &res);
++      ralloc_free(unpacked);
+ 
+       panfrost_disk_cache_store(screen->disk_cache, uncompiled, &state->key,
+                                 &res);
+@@ -475,6 +710,21 @@
+          ~VARYING_BIT_POS & ~VARYING_BIT_PSIZ;
+    }
+ 
++   struct panfrost_device *dev = pan_device(pctx->screen);
++
++   /* A04s: the pre-cache (above, a04s_pre_*), when there is no transform
++    * feedback to compile from so->nir here */
++   struct disk_cache *a04s_cache = pan_screen(pctx->screen)->disk_cache;
++   const bool a04s_pre = a04s_pre_on() && !nir->xfb_info;
++   cache_key a04s_key = {0};
++   if (a04s_pre && a04s_cache)
++      a04s_pre_key(a04s_cache, so, panfrost_device_gpu_id(dev), a04s_key);
++   const bool a04s_loaded =
++      a04s_pre && a04s_cache && a04s_pre_load(a04s_cache, a04s_key, so);
++   if (a04s_loaded)
++      nir = NULL; /* freed; so->nir is the shell */
++
++   if (!a04s_loaded) {
+    /* gl_FragColor needs to be lowered before lowering I/O, do that now */
+    if (nir->info.stage == MESA_SHADER_FRAGMENT &&
+        nir->info.outputs_written & BITFIELD_BIT(FRAG_RESULT_COLOR)) {
+@@ -485,7 +735,6 @@
+    }
+ 
+    /* Then run the suite of lowering and optimization, including I/O lowering */
+-   struct panfrost_device *dev = pan_device(pctx->screen);
+    pan_shader_preprocess(nir, panfrost_device_gpu_id(dev));
+ 
+    if (nir->info.stage == MESA_SHADER_FRAGMENT)
+@@ -500,6 +749,7 @@
+       NIR_PASS(_, nir, pan_lower_image_index,
+                util_bitcount64(nir->info.inputs_read));
+    }
++   }
+ 
+    /* If this shader uses transform feedback, compile the transform
+     * feedback program. This is a special shader variant.
+@@ -519,6 +769,10 @@
+       nir->info.has_transform_feedback_varyings = false;
+    }
+ 
++   /* A04s: kept serialized from here on (a shader just preprocessed) */
++   if (a04s_pre && !a04s_loaded)
++      a04s_pre_pack(a04s_cache, a04s_key, so);
++
+    /* Compile the program. We don't use vertex shader keys, so there will
+     * be no further vertex shader variants. We do have fragment shader
+     * keys, but we can still compile with a default key that will work most
+@@ -551,6 +805,9 @@
+    struct panfrost_uncompiled_shader *cso =
+       (struct panfrost_uncompiled_shader *)so;
+ 
++   if (cso->a04s_nir_blob)
++      p_atomic_add(&a04s_pre_kept, -(int64_t)cso->a04s_nir_blob_size);
++
+    util_dynarray_foreach(&cso->variants, struct panfrost_compiled_shader, so) {
+       panfrost_bo_unreference(so->bin.bo);
+       panfrost_bo_unreference(so->state.bo);

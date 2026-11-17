@@ -614,6 +614,14 @@ int rwa_shader_cache_sync(struct rwa_device *device);
 /* A04s (Metal track M6b): the front end's cache of translated stages (air_metal.c, front_to_nir), counted since the
  * library loaded: stages found, translated, written, and files that did not read back. Any pointer may be NULL. */
 void rwa_front_cache_counts(unsigned *hits, unsigned *misses, unsigned *stores, unsigned *bad);
+/* A04s (Metal track M6b boot 8): the thread CPU time pipelines have spent, summed since the library loaded, in the
+ * front end (front_to_nir), in this library's preparation of each stage (clone, finalize_for_gallium) and in the
+ * driver's create_vs_state/create_fs_state. Any pointer may be NULL. */
+void rwa_build_cpu(double *front, double *prepare, double *driver);
+/* A04s (M6b boot 8): Panfrost's pre-cache (mesa-patches/a04s-panfrost-pre-cache.patch): stages found preprocessed,
+ * stages preprocessed and stored, serializations read back to compile a variant, and the bytes of serialized NIR
+ * live stages hold. Zeros without the patch. Any pointer may be NULL. */
+void rwa_pan_pre_counts(unsigned *hits, unsigned *stores, unsigned *unpacks, uint64_t *kept_bytes);
 void rwa_set_function_constants(struct rwa_device *device, unsigned stage,
 				const struct rwa_constant *values, unsigned count);
 struct rwa_fence;
